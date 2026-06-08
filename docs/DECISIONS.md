@@ -68,3 +68,32 @@
   mandate; the multi-stage Dockerfile already compiles Go internally.
 - **Consequences.** Slightly slower iterative Go builds (container overhead) but fully
   reproducible and aligned with the deployment target.
+
+## D-005 — VM providers: pure-Go default build, real-SDK paths behind build tags
+
+- **Context.** The 4 hypervisor SDKs have very different runtime constraints:
+  - VMware: `govmomi` is pure Go; `vcsim` simulator runs in-process in CI. ✅ clean.
+  - Xen: XAPI is an HTTP/XML-RPC API; a pure-Go client + a mock server run in CI. ✅ clean.
+  - KVM: the common libvirt Go binding (`libvirt.org/go/libvirt`) needs cgo + libvirt
+    system libraries; the `test://` driver needs libvirtd. This breaks Castor's locked
+    CGO_ENABLED=0 distroless build. An alternative pure-Go path exists: talk to libvirt
+    over its RPC socket (`digitalocean/go-libvirt`, pure Go, no cgo).
+  - Hyper-V: WMI/CIM is Windows-only; it cannot execute inside a Linux container at all.
+- **Decision.** Every provider normalizes hypervisor-native data into the contract via a
+  pure-Go, dependency-light core that is unit/conformance-tested against a **simulator or
+  recorded fixtures** in the default (CGO-free, Linux) build. Live-SDK transport code that
+  cannot run CGO-free/cross-platform is isolated behind Go build tags
+  (`//go:build libvirt_cgo`, `//go:build windows`) so the default image stays distroless
+  and CI stays hardware-free. KVM uses the pure-Go `go-libvirt` socket client by default
+  (no cgo). The conformance suite (§3.3) is the acceptance gate for all four.
+- **Alternatives rejected.**
+  - *Require cgo + libvirt libs + libvirtd in the runtime image.* Breaks distroless,
+    multi-arch, and the single-static-binary story; needs privileged CI.
+  - *Skip Hyper-V because it's Windows-only.* The contract + normalization + conformance
+    (against a WMI fixture/mock) are implementable and testable cross-platform; only the
+    live WMI transport is `//go:build windows`. The provider is real; its live transport
+    is OS-gated, which is correct and honest.
+- **Consequences.** Default build & CI: CGO-free, Linux, hardware-free, all four providers
+  pass conformance against simulators/fixtures. Production against a live hypervisor uses
+  the same normalization with the tagged transport compiled in (KVM live = pure-Go socket,
+  no special build). Each provider documents how to exercise it against the real backend.
