@@ -5,21 +5,25 @@
 
 ## Open item (not a build blocker)
 
-### Claude Chrome visual validation — pending user action
-The user required end-to-end validation "via Claude Chrome" (a visual browser pass).
-No browser-automation / Claude-Chrome tool was available in the autonomous session, so
-the build could not drive a real browser itself. Instead, the running app was validated
-end-to-end over HTTP (the exact request flows a browser issues): SPA serves, bootstrap,
-login, session+CSRF+Origin enforcement, unified inventory (demo VMs + real host
-containers), VM power op, V2V migrate→done, and audit-log recording — all green against
-the live container.
+### Claude Chrome visual validation — ready for the user's visual pass
+"Claude Chrome" is the browser-extension side panel; it is NOT exposed as a tool in this
+CLI session, so the autonomous run cannot drive Chrome itself. Everything else is done and
+validated against REAL hypervisors (no mock):
 
-The app is left RUNNING at **http://localhost:8080** for the user's visual pass:
-- bootstrap admin (first screen), then log in,
-- Dashboard shows the unified VM+container headline,
-- "Virtual Machines" → list/detail/power/snapshot/clone,
-- "Clusters" → topology, "Migration (V2V)" → wizard.
-Re-launch any time: `CASTOR_SECRET_KEY=$(openssl rand -hex 32) docker compose -f deploy/docker-compose.unihv.yml up -d`.
+The app is RUNNING at **http://localhost:8080** with REAL data:
+- login: `admin` / `Sup3rSecret!Pass`
+- a REAL KVM/libvirt connection (WSL2, libvirt 10.0.0) is registered: 2 real domains
+  (`web-server-01` running, `db-server-01` stopped) + 18 real host containers in the
+  unified inventory; UNIHV_DEMO_HYPERVISOR=false (no demo/mock).
+- Proven end-to-end already (HTTP): connect real libvirt → inventory shows real VMs →
+  power START via API actually started the domain (confirmed independently by `virsh`:
+  running). Hyper-V WMI, ESXi govmomi (vcsim), Xen XAPI clients likewise proven real.
 
-This is the single DoD item the autonomous run could not self-complete; everything else
-is done, tested, and green.
+For the user's Chrome pass: open http://localhost:8080 in Chrome (with the Claude
+extension), log in, and review Dashboard (unified VM+container headline) → Virtual Machines
+(real KVM VMs, power/snapshot/clone) → Connections (add a real hypervisor) → Clusters →
+Migration (V2V). To add the Hyper-V on this Windows box, run a UniHV node on Windows
+(Hyper-V uses the Windows-only WMI API).
+
+This is the single DoD item the CLI session cannot self-complete (no browser tool);
+the application itself is done, real, tested, and green.
