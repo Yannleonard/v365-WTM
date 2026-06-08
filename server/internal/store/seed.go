@@ -44,11 +44,12 @@ var AllReadPermissions = []string{
 	"vm.read",
 	"vm.metrics.read",
 	"vm.cluster.read",
-	"vm.storage.read",
 	"vm.network.read",
 	"vm.storage.read",
 	"inventory.read",
 	"v2v.read",
+	// UniHV pluggable storage backends (read). Write is admin-grade (via "*").
+	"storage.backend.read",
 	"audit.read",
 	"settings.read",
 }
@@ -124,6 +125,7 @@ var operatorExtraPermissions = []string{
 	"vm.console",      // open graphical console (VNC/SPICE/RDP)
 	"vm.network.write",// create/delete virtual networks/switches
 	"vm.storage.write",// create/delete volumes, upload ISOs
+	"vm.hotplug",      // live hot-attach/detach disk & NIC, mount/eject ISO (no reboot)
 	"v2v.migrate",     // run a cross-hypervisor V2V migration
 }
 

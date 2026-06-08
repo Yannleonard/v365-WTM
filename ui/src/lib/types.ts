@@ -1117,6 +1117,51 @@ export interface HvConnInput {
   enabled?: boolean;
 }
 
+// StorageBackendType selects which pluggable storage backend a row targets:
+// SAN/NAS (nfs|iscsi|smb, realized as a libvirt pool) or a cloud object store
+// (azureblob|s3, for images/ISO/backups).
+export type StorageBackendType = "nfs" | "iscsi" | "smb" | "azureblob" | "s3";
+
+// StorageBackendStatus reflects the last connectivity probe result.
+export type StorageBackendStatus = "pending" | "connected" | "error";
+
+// StorageBackend is the SAFE projection from GET /storage/backends: it carries
+// hasSecret (whether a credential is stored) but NEVER the secret itself. Field
+// names match the api storageBackendView json tags.
+export interface StorageBackend {
+  id: string;
+  name: string;
+  type: StorageBackendType;
+  endpoint: string;
+  target: string;
+  username: string;
+  hasSecret: boolean;
+  region?: string;
+  providerId?: string;
+  options?: string;
+  enabled: boolean;
+  status: StorageBackendStatus;
+  lastError?: string;
+  lastSeenAt?: string;
+  createdAt: string;
+}
+
+// StorageBackendInput is the body for POST /storage/backends (create) and
+// POST /storage/backends/test (probe). `secret` is the plaintext credential sent
+// once; it is sealed server-side and never returned.
+export interface StorageBackendInput {
+  name: string;
+  type: StorageBackendType;
+  endpoint: string;
+  target: string;
+  username: string;
+  secret: string;
+  region: string;
+  providerId: string;
+  options: string;
+  enabled: boolean;
+}
+
 // VM provider capability tokens. Open string union so an unknown token from a
 // newer backend still type-checks (we only branch on known ones).
 export type VMCapability =
@@ -1145,6 +1190,7 @@ export type VMCapability =
   | "console"
   | "network_write"
   | "storage_write"
+  | "hotplug"
   | "readonly"
   | (string & {});
 

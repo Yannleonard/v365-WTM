@@ -187,3 +187,137 @@ func (s *Server) VMISOUpload(w http.ResponseWriter, r *http.Request) {
 	created(w, vol)
 }
 
+// --- hot-plug device management (DeviceManager) ---
+
+// vmDeviceManager resolves the request's provider and, if it implements
+// DeviceManager + advertises CapHotPlug, returns it. Otherwise it writes a 405 and
+// returns false (so the caller returns immediately) — never a silent failure.
+func (s *Server) vmDeviceManager(w http.ResponseWriter, r *http.Request) (vprovider.DeviceManager, string, bool) {
+	p, found := s.resolveVMProvider(w, r)
+	if !found {
+		return nil, "", false
+	}
+	dm, impl := p.(vprovider.DeviceManager)
+	if !impl || !p.Capabilities().Has(vprovider.CapHotPlug) {
+		authz.WriteError(w, r, authz.ErrMethodNotAllowed)
+		return nil, "", false
+	}
+	return dm, chi.URLParam(r, "vmID"), true
+}
+
+// VMDiskAttach hot-attaches a disk to a RUNNING VM (no reboot).
+func (s *Server) VMDiskAttach(w http.ResponseWriter, r *http.Request) {
+	dm, vmID, okp := s.vmDeviceManager(w, r)
+	if !okp {
+		return
+	}
+	var spec vprovider.DiskSpec
+	if err := decodeJSON(w, r, &spec); err != nil {
+		authz.WriteError(w, r, err)
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 60*time.Second)
+	defer cancel()
+	task, err := dm.AttachDisk(ctx, vmID, spec)
+	if err != nil {
+		authz.WriteError(w, r, vmProviderError(err))
+		return
+	}
+	created(w, task)
+}
+
+// VMDiskDetach hot-removes a disk from a RUNNING VM.
+func (s *Server) VMDiskDetach(w http.ResponseWriter, r *http.Request) {
+	dm, vmID, okp := s.vmDeviceManager(w, r)
+	if !okp {
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 30*time.Second)
+	defer cancel()
+	task, err := dm.DetachDisk(ctx, vmID, chi.URLParam(r, "diskID"))
+	if err != nil {
+		authz.WriteError(w, r, vmProviderError(err))
+		return
+	}
+	ok(w, task)
+}
+
+// VMNICAttach hot-attaches a virtual NIC to a RUNNING VM.
+func (s *Server) VMNICAttach(w http.ResponseWriter, r *http.Request) {
+	dm, vmID, okp := s.vmDeviceManager(w, r)
+	if !okp {
+		return
+	}
+	var spec vprovider.NICSpec
+	if err := decodeJSON(w, r, &spec); err != nil {
+		authz.WriteError(w, r, err)
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 30*time.Second)
+	defer cancel()
+	task, err := dm.AttachNIC(ctx, vmID, spec)
+	if err != nil {
+		authz.WriteError(w, r, vmProviderError(err))
+		return
+	}
+	created(w, task)
+}
+
+// VMNICDetach hot-removes a NIC from a RUNNING VM.
+func (s *Server) VMNICDetach(w http.ResponseWriter, r *http.Request) {
+	dm, vmID, okp := s.vmDeviceManager(w, r)
+	if !okp {
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 30*time.Second)
+	defer cancel()
+	task, err := dm.DetachNIC(ctx, vmID, chi.URLParam(r, "nicID"))
+	if err != nil {
+		authz.WriteError(w, r, vmProviderError(err))
+		return
+	}
+	ok(w, task)
+}
+
+// vmISOBody is the mount-ISO request body.
+type vmISOBody struct {
+	ISOPath string `json:"isoPath"`
+}
+
+// VMISOMount inserts an ISO into a RUNNING VM's CD-ROM (no reboot).
+func (s *Server) VMISOMount(w http.ResponseWriter, r *http.Request) {
+	dm, vmID, okp := s.vmDeviceManager(w, r)
+	if !okp {
+		return
+	}
+	var body vmISOBody
+	if err := decodeJSON(w, r, &body); err != nil {
+		authz.WriteError(w, r, err)
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 30*time.Second)
+	defer cancel()
+	task, err := dm.MountISO(ctx, vmID, body.ISOPath)
+	if err != nil {
+		authz.WriteError(w, r, vmProviderError(err))
+		return
+	}
+	created(w, task)
+}
+
+// VMISOUnmount ejects the media from a RUNNING VM's CD-ROM.
+func (s *Server) VMISOUnmount(w http.ResponseWriter, r *http.Request) {
+	dm, vmID, okp := s.vmDeviceManager(w, r)
+	if !okp {
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 30*time.Second)
+	defer cancel()
+	task, err := dm.UnmountISO(ctx, vmID)
+	if err != nil {
+		authz.WriteError(w, r, vmProviderError(err))
+		return
+	}
+	ok(w, task)
+}
+

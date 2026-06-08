@@ -71,6 +71,7 @@ const GROUPS: NavGroup[] = [
       { to: "/vm-clusters", label: "VM Clusters", icon: <IconNetworks size={18} />, perms: ["vm.cluster.read", "vm.read"] },
       { to: "/vm-networks", label: "VM Networks", icon: <IconNetworks size={18} />, perms: ["vm.network.read", "vm.network.write", "vm.read"] },
       { to: "/vm-storage", label: "VM Storage", icon: <IconVolumes size={18} />, perms: ["vm.storage.read", "vm.storage.write", "vm.read"] },
+      { to: "/storage-backends", label: "Storage Backends", icon: <IconVolumes size={18} />, perms: ["storage.backend.read", "storage.backend.write"] },
       { to: "/migration", label: "Migration (V2V)", icon: <IconMigrate size={18} />, perms: ["v2v.read"] },
     ],
   },

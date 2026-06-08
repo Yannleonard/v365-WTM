@@ -101,6 +101,8 @@ import type {
   VMProvider,
   HvConn,
   HvConnInput,
+  StorageBackend,
+  StorageBackendInput,
   VMSnapshot,
   VMHost,
   VMCluster,
@@ -114,6 +116,8 @@ import type {
   VMMigrateRequest,
   VMReconfigureRequest,
   VMSpec,
+  VMSpecDisk,
+  VMSpecNic,
   VMNetworkCreateRequest,
   Volume,
   VolumeCreateRequest,
@@ -736,6 +740,13 @@ export const api = {
   vmConnectionTest: (body: HvConnInput) => post<{ ok: boolean }>("/vm/connections/test", body),
   vmConnectionCreate: (body: HvConnInput) => post<HvConn>("/vm/connections", body),
   vmConnectionDelete: (id: string) => del<void>(`/vm/connections/${encId(id)}`),
+
+  // Pluggable storage backends (SAN/NAS + cloud object stores). Secrets are
+  // sealed server-side; reads only ever carry hasSecret.
+  storageBackends: () => get<StorageBackend[]>("/storage/backends"),
+  storageBackendTest: (body: StorageBackendInput) => post<{ ok: boolean }>("/storage/backends/test", body),
+  storageBackendCreate: (body: StorageBackendInput) => post<StorageBackend>("/storage/backends", body),
+  storageBackendDelete: (id: string) => del<void>(`/storage/backends/${encId(id)}`),
   // All VMs for one provider.
   vms: (pid: string) => get<VM[]>(`/vm/providers/${encId(pid)}/vms`),
   // One VM (normalized + hypervisor-native raw).
@@ -800,6 +811,22 @@ export const api = {
     file: File | Blob,
     onProgress?: (fraction: number) => void,
   ) => uploadIso(`/vm/providers/${encId(pid)}/storage/${encId(storageId)}/iso?name=${encodeURIComponent(name)}`, file, onProgress),
+
+  /* ---- hot-plug device management (live, no reboot) ---- */
+  // Attach/detach a disk or NIC and mount/eject an ISO on a RUNNING VM. Gated on
+  // the "hotplug" cap + vm.hotplug perm. Each returns a Task.
+  vmDiskAttach: (pid: string, vmId: string, body: VMSpecDisk) =>
+    post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/disks`, body),
+  vmDiskDetach: (pid: string, vmId: string, diskId: string) =>
+    del<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/disks/${encId(diskId)}`),
+  vmNicAttach: (pid: string, vmId: string, body: VMSpecNic) =>
+    post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/nics`, body),
+  vmNicDetach: (pid: string, vmId: string, nicId: string) =>
+    del<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/nics/${encId(nicId)}`),
+  vmIsoMount: (pid: string, vmId: string, isoPath: string) =>
+    post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/iso`, { isoPath }),
+  vmIsoUnmount: (pid: string, vmId: string) =>
+    del<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/iso`),
 
   /* ---- graphical console ---- */
   // Resolve a one-shot console endpoint (vnc/spice/rdp). Gated on the "console"

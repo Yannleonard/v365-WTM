@@ -99,6 +99,16 @@ type extBackend interface {
 	// qemu-img convert from the on-disk source). Returns the stream + byte size.
 	// This is what makes V2V a REAL disk export, not a placeholder.
 	exportDisk(uuid string, format vp.DiskFormat) (io.ReadCloser, int64, error)
+
+	// hot-plug device management (DeviceManager): live attach/detach on a RUNNING
+	// domain via DomainAttachDeviceFlags/DomainDetachDeviceFlags (LIVE|CONFIG) and
+	// ISO mount/eject via DomainUpdateDeviceFlags.
+	attachDisk(uuid string, spec vp.DiskSpec) error
+	detachDisk(uuid, diskID string) error
+	attachNIC(uuid string, spec vp.NICSpec) error
+	detachNIC(uuid, nicID string) error
+	mountISO(uuid, isoPath string) error
+	unmountISO(uuid string) error
 }
 
 // Provider is the KVM/libvirt HypervisorProvider. The core is CGO-free; the
@@ -828,6 +838,131 @@ func (p *Provider) UploadISO(ctx context.Context, storageID, name string, size i
 	return e.uploadISO(storageID, name, size, r)
 }
 
+// --- extension: hot-plug device management (DeviceManager) ---
+//
+// Each method gates on CapHotPlug + a live extBackend (the sim backend does NOT
+// implement extBackend, so the default sim-backed provider returns ErrUnsupported
+// — it never advertises CapHotPlug either). The real work is a live libvirt
+// DomainAttachDeviceFlags / DomainDetachDeviceFlags / DomainUpdateDeviceFlags with
+// the LIVE|CONFIG flags so the change applies to the running domain AND persists.
+
+func (p *Provider) AttachDisk(ctx context.Context, vmID string, spec vp.DiskSpec) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapHotPlug) {
+		return nil, vp.ErrUnsupported
+	}
+	e, ok := p.ext()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if _, ok := p.backend.getDomain(vmID); !ok {
+		return nil, vp.ErrNotFound
+	}
+	if spec.SourcePath == "" && spec.CapacityGB <= 0 {
+		return nil, vp.ErrInvalidSpec
+	}
+	if err := e.attachDisk(vmID, spec); err != nil {
+		return nil, err
+	}
+	return p.finishTask("attachDisk", vmID), nil
+}
+
+func (p *Provider) DetachDisk(ctx context.Context, vmID, diskID string) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapHotPlug) {
+		return nil, vp.ErrUnsupported
+	}
+	e, ok := p.ext()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if _, ok := p.backend.getDomain(vmID); !ok {
+		return nil, vp.ErrNotFound
+	}
+	if strings.TrimSpace(diskID) == "" {
+		return nil, vp.ErrInvalidSpec
+	}
+	if err := e.detachDisk(vmID, diskID); err != nil {
+		return nil, err
+	}
+	return p.finishTask("detachDisk", vmID), nil
+}
+
+func (p *Provider) AttachNIC(ctx context.Context, vmID string, spec vp.NICSpec) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapHotPlug) {
+		return nil, vp.ErrUnsupported
+	}
+	e, ok := p.ext()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if _, ok := p.backend.getDomain(vmID); !ok {
+		return nil, vp.ErrNotFound
+	}
+	if strings.TrimSpace(spec.NetworkID) == "" {
+		return nil, vp.ErrInvalidSpec
+	}
+	if err := e.attachNIC(vmID, spec); err != nil {
+		return nil, err
+	}
+	return p.finishTask("attachNIC", vmID), nil
+}
+
+func (p *Provider) DetachNIC(ctx context.Context, vmID, nicID string) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapHotPlug) {
+		return nil, vp.ErrUnsupported
+	}
+	e, ok := p.ext()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if _, ok := p.backend.getDomain(vmID); !ok {
+		return nil, vp.ErrNotFound
+	}
+	if strings.TrimSpace(nicID) == "" {
+		return nil, vp.ErrInvalidSpec
+	}
+	if err := e.detachNIC(vmID, nicID); err != nil {
+		return nil, err
+	}
+	return p.finishTask("detachNIC", vmID), nil
+}
+
+func (p *Provider) MountISO(ctx context.Context, vmID, isoPath string) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapHotPlug) {
+		return nil, vp.ErrUnsupported
+	}
+	e, ok := p.ext()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if _, ok := p.backend.getDomain(vmID); !ok {
+		return nil, vp.ErrNotFound
+	}
+	if strings.TrimSpace(isoPath) == "" {
+		return nil, vp.ErrInvalidSpec
+	}
+	if err := e.mountISO(vmID, isoPath); err != nil {
+		return nil, err
+	}
+	return p.finishTask("mountISO", vmID), nil
+}
+
+func (p *Provider) UnmountISO(ctx context.Context, vmID string) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapHotPlug) {
+		return nil, vp.ErrUnsupported
+	}
+	e, ok := p.ext()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if _, ok := p.backend.getDomain(vmID); !ok {
+		return nil, vp.ErrNotFound
+	}
+	if err := e.unmountISO(vmID); err != nil {
+		return nil, err
+	}
+	return p.finishTask("unmountISO", vmID), nil
+}
+
 // compile-time assertion: *Provider satisfies the contract.
 var _ vp.HypervisorProvider = (*Provider)(nil)
 
@@ -837,4 +972,5 @@ var (
 	_ vp.ConsoleProvider = (*Provider)(nil)
 	_ vp.NetworkWriter   = (*Provider)(nil)
 	_ vp.StorageProvider = (*Provider)(nil)
+	_ vp.DeviceManager   = (*Provider)(nil)
 )

@@ -24,7 +24,7 @@ import { DataTable, type Column } from "../components/DataTable";
 import { StatsChart } from "../components/StatsChart";
 import { ConsolePanel } from "../components/ConsolePanel";
 import { InspectTab } from "./workload/InspectTab";
-import { gateVMAction, gateVMConsole } from "../lib/rbac";
+import { gateVMAction, gateVMConsole, gateVMHotPlug } from "../lib/rbac";
 import { formatBytes, formatDateTime, shortId, timeAgo } from "../lib/format";
 import {
   IconRefresh,
@@ -37,6 +37,10 @@ import {
   IconMigrate,
   IconRestart,
   IconTerminal,
+  IconPlus,
+  IconNetworks,
+  IconTrash,
+  IconClose,
 } from "../components/icons";
 import { toast, toastError } from "../lib/toast";
 import { api } from "../lib/api";
@@ -155,6 +159,53 @@ export function VirtualMachineDetail() {
                 </ActionButton>
               )}
             </CapabilityGate>
+            <CapabilityGate gate={gateVMHotPlug(caps, permissions)}>
+              {(allowed, reason) => (
+                <>
+                  <ActionButton
+                    variant="ghost"
+                    iconOnly
+                    disabled={!allowed}
+                    tooltip={allowed ? "Add disk (live)" : reason}
+                    aria-label="Add disk"
+                    onClick={() => actions.triggerAddDisk(detail)}
+                  >
+                    <IconPlus size={16} />
+                  </ActionButton>
+                  <ActionButton
+                    variant="ghost"
+                    iconOnly
+                    disabled={!allowed}
+                    tooltip={allowed ? "Add network adapter (live)" : reason}
+                    aria-label="Add network adapter"
+                    onClick={() => actions.triggerAddNic(detail)}
+                  >
+                    <IconNetworks size={16} />
+                  </ActionButton>
+                  <ActionButton
+                    variant="ghost"
+                    iconOnly
+                    disabled={!allowed}
+                    tooltip={allowed ? "Mount ISO (live)" : reason}
+                    aria-label="Mount ISO"
+                    onClick={() => actions.triggerMountIso(detail)}
+                  >
+                    <IconTerminal size={16} />
+                  </ActionButton>
+                  <ActionButton
+                    variant="ghost"
+                    iconOnly
+                    disabled={!allowed}
+                    tooltip={allowed ? "Eject ISO (live)" : reason}
+                    aria-label="Eject ISO"
+                    loading={actions.detachBusyId === detail.id + "-iso"}
+                    onClick={() => actions.ejectIso(detail)}
+                  >
+                    <IconClose size={16} />
+                  </ActionButton>
+                </>
+              )}
+            </CapabilityGate>
             <ActionButton variant="ghost" iconOnly tooltip="Refresh" aria-label="Refresh" onClick={() => query.refetch()}>
               <IconRefresh size={16} />
             </ActionButton>
@@ -174,7 +225,15 @@ export function VirtualMachineDetail() {
       </div>
 
       <div>
-        {tab === "overview" && <VMOverview detail={detail} />}
+        {tab === "overview" && (
+          <VMOverview
+            detail={detail}
+            hotPlug={gateVMHotPlug(caps, permissions)}
+            onDetachDisk={(id) => actions.detachDisk(detail, id)}
+            onDetachNic={(id) => actions.detachNic(detail, id)}
+            detachBusyId={actions.detachBusyId}
+          />
+        )}
         {tab === "snapshots" && (
           <SnapshotsPanel
             pid={pid}
@@ -197,7 +256,19 @@ export function VirtualMachineDetail() {
 
 /* ============================ Overview ============================ */
 
-function VMOverview({ detail }: { detail: import("../lib/types").VMDetail }) {
+function VMOverview({
+  detail,
+  hotPlug,
+  onDetachDisk,
+  onDetachNic,
+  detachBusyId,
+}: {
+  detail: import("../lib/types").VMDetail;
+  hotPlug: import("../lib/rbac").GateResult;
+  onDetachDisk: (diskId: string) => void;
+  onDetachNic: (nicId: string) => void;
+  detachBusyId: string | null;
+}) {
   const disks = detail.disks ?? [];
   const nics = detail.nics ?? [];
   const labels = Object.entries(detail.labels ?? {});
@@ -208,6 +279,28 @@ function VMOverview({ detail }: { detail: import("../lib/types").VMDetail }) {
     { key: "format", header: "Format", cell: (d) => (d.format ? <span className="chip">{d.format}</span> : <span className="muted">—</span>) },
     { key: "storage", header: "Storage", cell: (d) => (d.storageId ? <span className="mono text-xs muted">{d.storageId}</span> : <span className="muted">—</span>) },
     { key: "path", header: "Path", cell: (d) => (d.path ? <span className="mono text-xs muted truncate" style={{ maxWidth: 280, display: "inline-block" }} title={d.path}>{d.path}</span> : <span className="muted">—</span>) },
+    ...(hotPlug.allowed
+      ? [
+          {
+            key: "actions",
+            header: "",
+            align: "right" as const,
+            width: "90px",
+            cell: (d: VMDisk) => (
+              <ActionButton
+                size="sm"
+                variant="ghost"
+                tooltip="Detach disk (live)"
+                aria-label="Detach disk"
+                loading={detachBusyId === d.id}
+                onClick={() => onDetachDisk(d.id)}
+              >
+                <IconTrash size={14} />
+              </ActionButton>
+            ),
+          },
+        ]
+      : []),
   ];
 
   const nicColumns: Column<VMNic>[] = [
@@ -216,6 +309,28 @@ function VMOverview({ detail }: { detail: import("../lib/types").VMDetail }) {
     { key: "model", header: "Model", cell: (n) => (n.model ? <span className="text-xs">{n.model}</span> : <span className="muted">—</span>) },
     { key: "mac", header: "MAC", cell: (n) => (n.mac ? <span className="mono text-xs">{n.mac}</span> : <span className="muted">—</span>) },
     { key: "connected", header: "Connected", cell: (n) => <span className="text-xs">{n.connected ? "Yes" : "No"}</span> },
+    ...(hotPlug.allowed
+      ? [
+          {
+            key: "actions",
+            header: "",
+            align: "right" as const,
+            width: "90px",
+            cell: (n: VMNic) => (
+              <ActionButton
+                size="sm"
+                variant="ghost"
+                tooltip="Detach adapter (live)"
+                aria-label="Detach adapter"
+                loading={detachBusyId === n.id}
+                onClick={() => onDetachNic(n.id)}
+              >
+                <IconTrash size={14} />
+              </ActionButton>
+            ),
+          },
+        ]
+      : []),
   ];
 
   return (

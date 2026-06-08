@@ -85,4 +85,20 @@ func (s *Server) mountVMRoutes(pr chi.Router) {
 		Delete("/vm/providers/{providerID}/storage/{storageID}/volumes/{volumeID}", s.VMVolumeDelete)
 	pr.With(az.AuditWrap("vm.iso.upload"), az.RequireAAL, az.RequirePermission("vm.storage.write", scopeFromProvider)).
 		Post("/vm/providers/{providerID}/storage/{storageID}/iso", s.VMISOUpload)
+
+	// --- hot-plug device management (DeviceManager): live attach/detach on a
+	// RUNNING VM (disk, NIC, ISO). Operator-grade, gated by vm.hotplug. The handler
+	// type-asserts DeviceManager + CapHotPlug, else 405. ---
+	pr.With(az.AuditWrap("vm.disk.attach"), az.RequireAAL, az.RequirePermission("vm.hotplug", scopeFromProvider)).
+		Post("/vm/providers/{providerID}/vms/{vmID}/disks", s.VMDiskAttach)
+	pr.With(az.AuditWrap("vm.disk.detach"), az.RequireAAL, az.RequirePermission("vm.hotplug", scopeFromProvider)).
+		Delete("/vm/providers/{providerID}/vms/{vmID}/disks/{diskID}", s.VMDiskDetach)
+	pr.With(az.AuditWrap("vm.nic.attach"), az.RequireAAL, az.RequirePermission("vm.hotplug", scopeFromProvider)).
+		Post("/vm/providers/{providerID}/vms/{vmID}/nics", s.VMNICAttach)
+	pr.With(az.AuditWrap("vm.nic.detach"), az.RequireAAL, az.RequirePermission("vm.hotplug", scopeFromProvider)).
+		Delete("/vm/providers/{providerID}/vms/{vmID}/nics/{nicID}", s.VMNICDetach)
+	pr.With(az.AuditWrap("vm.iso.mount"), az.RequireAAL, az.RequirePermission("vm.hotplug", scopeFromProvider)).
+		Post("/vm/providers/{providerID}/vms/{vmID}/iso", s.VMISOMount)
+	pr.With(az.AuditWrap("vm.iso.unmount"), az.RequireAAL, az.RequirePermission("vm.hotplug", scopeFromProvider)).
+		Delete("/vm/providers/{providerID}/vms/{vmID}/iso", s.VMISOUnmount)
 }

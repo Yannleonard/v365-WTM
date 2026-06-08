@@ -90,6 +90,7 @@ func (s *Server) Router() http.Handler {
 			s.mountVMRoutes(pr)
 			s.mountMigrateRoutes(pr)
 			s.mountHypervisorConnRoutes(pr)
+			s.mountStorageBackendRoutes(pr)
 		})
 	})
 

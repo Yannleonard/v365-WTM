@@ -87,8 +87,9 @@ func NewLiveWithID(id, endpoint string) (*Provider, error) {
 
 // LiveCaps is FullCaps plus the extension capability bits the REAL libvirt backend
 // fulfils: graphical console (<graphics> in domain XML), virtual-network write
-// (NetworkDefineXML/Create/Destroy/Undefine) and storage/ISO write (StorageVol*).
-const LiveCaps = FullCaps | vp.CapConsole | vp.CapNetworkWrite | vp.CapStorageWrite
+// (NetworkDefineXML/Create/Destroy/Undefine), storage/ISO write (StorageVol*) and
+// hot-plug device management (DomainAttach/Detach/UpdateDeviceFlags, LIVE|CONFIG).
+const LiveCaps = FullCaps | vp.CapConsole | vp.CapNetworkWrite | vp.CapStorageWrite | vp.CapHotPlug
 
 // newLiveBackend dials libvirt and runs the RPC handshake (the official
 // New(conn)+Connect() sequence).
@@ -1328,6 +1329,326 @@ func (b *liveBackend) uploadISO(storageID, name string, size int64, r io.Reader)
 	}, nil
 }
 
+// =============================================================================
+// hot-plug device management (DeviceManager) over the REAL libvirt API.
+//
+// All operations use the LIVE|CONFIG modify flags so the change is applied to the
+// RUNNING domain AND persisted to the domain config (survives a power cycle):
+//   - attach : DomainAttachDeviceFlags(<device xml>, LIVE|CONFIG)
+//   - detach : DomainDetachDeviceFlags(<device xml>, LIVE|CONFIG)
+//   - ISO    : DomainUpdateDeviceFlags(<cdrom xml>, LIVE|CONFIG) — update-device
+//              semantics swap the media inside the EXISTING cdrom (insert/eject)
+//              rather than adding/removing the cdrom device itself.
+// =============================================================================
+
+// hotPlugFlags is the LIVE|CONFIG flag pair used for every hot-plug op so the
+// change hits the running instance and the persistent config. Attach/Detach take a
+// raw uint32; UpdateDevice takes the typed DomainDeviceModifyFlags.
+const hotPlugFlags = uint32(libvirt.DomainDeviceModifyLive | libvirt.DomainDeviceModifyConfig)
+
+func (b *liveBackend) attachDisk(uuid string, spec vp.DiskSpec) error {
+	l, dom, ok := b.domainHandle(uuid)
+	if !ok {
+		if l == nil {
+			return errNoConn
+		}
+		return vp.ErrNotFound
+	}
+	// Resolve a backing source: an explicit SourcePath, else provision a fresh
+	// qcow2/raw volume of the requested size (reusing provisionVolume).
+	source := spec.SourcePath
+	format := string(normalizeDiskFormat(string(spec.Format)))
+	if source == "" {
+		poolName := spec.StorageID
+		if poolName == "" {
+			poolName = "default"
+		}
+		volName := fmt.Sprintf("%s-hotdisk-%d.%s", sanitizeBridge(uuid), time.Now().UnixNano(), format)
+		path, err := b.provisionVolume(poolName, volName, int64(spec.CapacityGB*bytesPerGB), format)
+		if err != nil {
+			return err
+		}
+		source = path
+	}
+	// Pick the next free virtio target (vdb, vdc, ...) from the live domain XML.
+	target := b.nextDiskTarget(l, dom)
+	xmlDesc := renderDiskDeviceXML(target, format, source)
+	if err := l.DomainAttachDeviceFlags(dom, xmlDesc, hotPlugFlags); err != nil {
+		b.fail(err)
+		return mapLibvirtErr(err)
+	}
+	return nil
+}
+
+func (b *liveBackend) detachDisk(uuid, diskID string) error {
+	l, dom, ok := b.domainHandle(uuid)
+	if !ok {
+		if l == nil {
+			return errNoConn
+		}
+		return vp.ErrNotFound
+	}
+	dk, found := b.findDisk(l, dom, diskID)
+	if !found {
+		return vp.ErrNotFound
+	}
+	xmlDesc := renderDiskDeviceXML(dk.target, dk.driver, dk.source)
+	if err := l.DomainDetachDeviceFlags(dom, xmlDesc, hotPlugFlags); err != nil {
+		b.fail(err)
+		return mapLibvirtErr(err)
+	}
+	return nil
+}
+
+func (b *liveBackend) attachNIC(uuid string, spec vp.NICSpec) error {
+	l, dom, ok := b.domainHandle(uuid)
+	if !ok {
+		if l == nil {
+			return errNoConn
+		}
+		return vp.ErrNotFound
+	}
+	model := spec.Model
+	if model == "" {
+		model = "virtio"
+	}
+	xmlDesc := renderNICDeviceXML(spec.NetworkID, model, spec.MAC)
+	if err := l.DomainAttachDeviceFlags(dom, xmlDesc, hotPlugFlags); err != nil {
+		b.fail(err)
+		return mapLibvirtErr(err)
+	}
+	return nil
+}
+
+func (b *liveBackend) detachNIC(uuid, nicID string) error {
+	l, dom, ok := b.domainHandle(uuid)
+	if !ok {
+		if l == nil {
+			return errNoConn
+		}
+		return vp.ErrNotFound
+	}
+	nic, found := b.findNIC(l, dom, nicID)
+	if !found {
+		return vp.ErrNotFound
+	}
+	xmlDesc := renderNICDeviceXML(nic.network, nic.model, nic.mac)
+	if err := l.DomainDetachDeviceFlags(dom, xmlDesc, hotPlugFlags); err != nil {
+		b.fail(err)
+		return mapLibvirtErr(err)
+	}
+	return nil
+}
+
+// mountISO inserts media into the domain's EXISTING cdrom via update-device. If the
+// domain has no cdrom yet, one is hot-attached carrying the media.
+func (b *liveBackend) mountISO(uuid, isoPath string) error {
+	l, dom, ok := b.domainHandle(uuid)
+	if !ok {
+		if l == nil {
+			return errNoConn
+		}
+		return vp.ErrNotFound
+	}
+	target, exists := b.cdromTarget(l, dom)
+	if !exists {
+		// No cdrom present -> hot-attach a fresh sata cdrom carrying the media.
+		xmlDesc := renderCDROMDeviceXML(target, isoPath)
+		if err := l.DomainAttachDeviceFlags(dom, xmlDesc, hotPlugFlags); err != nil {
+			b.fail(err)
+			return mapLibvirtErr(err)
+		}
+		return nil
+	}
+	// Update-device swaps the media inside the existing cdrom (no reboot).
+	xmlDesc := renderCDROMDeviceXML(target, isoPath)
+	if err := l.DomainUpdateDeviceFlags(dom, xmlDesc, libvirt.DomainDeviceModifyLive|libvirt.DomainDeviceModifyConfig); err != nil {
+		b.fail(err)
+		return mapLibvirtErr(err)
+	}
+	return nil
+}
+
+// unmountISO ejects the media from the domain's cdrom (update-device with an empty
+// <source>), leaving the empty cdrom in place.
+func (b *liveBackend) unmountISO(uuid string) error {
+	l, dom, ok := b.domainHandle(uuid)
+	if !ok {
+		if l == nil {
+			return errNoConn
+		}
+		return vp.ErrNotFound
+	}
+	target, exists := b.cdromTarget(l, dom)
+	if !exists {
+		return vp.ErrNotFound
+	}
+	xmlDesc := renderCDROMDeviceXML(target, "") // empty source -> eject
+	if err := l.DomainUpdateDeviceFlags(dom, xmlDesc, libvirt.DomainDeviceModifyLive|libvirt.DomainDeviceModifyConfig); err != nil {
+		b.fail(err)
+		return mapLibvirtErr(err)
+	}
+	return nil
+}
+
+// --- hot-plug helpers: resolve targets / locate devices from the live XML ---
+
+// liveDisk / liveNIC are the resolved device coordinates needed to render a detach
+// XML that libvirt can match against the running domain.
+type liveDisk struct{ target, driver, source string }
+type liveNIC struct{ network, model, mac string }
+
+// domXMLDevices parses the live domain XML into the disk/NIC subset.
+func (b *liveBackend) domXMLDevices(l *libvirt.Libvirt, dom libvirt.Domain) (domainXML, bool) {
+	var dx domainXML
+	raw, err := l.DomainGetXMLDesc(dom, 0)
+	if err != nil {
+		b.fail(err)
+		return dx, false
+	}
+	if err := xml.Unmarshal([]byte(raw), &dx); err != nil {
+		return dx, false
+	}
+	return dx, true
+}
+
+// nextDiskTarget returns the next free virtio disk target (vdb, vdc, ...) for the
+// domain, skipping targets already in use.
+func (b *liveBackend) nextDiskTarget(l *libvirt.Libvirt, dom libvirt.Domain) string {
+	dx, _ := b.domXMLDevices(l, dom)
+	used := map[string]bool{}
+	for _, dk := range dx.Devices.Disks {
+		used[dk.Target.Dev] = true
+	}
+	for c := 'a'; c <= 'z'; c++ {
+		t := "vd" + string(c)
+		if !used[t] {
+			return t
+		}
+	}
+	return "vdz"
+}
+
+// findDisk locates a disk on the domain by the normalized device id (uuid-target,
+// as surfaced by GetVM/normalizeDomain), or by bare target dev, or by source path.
+func (b *liveBackend) findDisk(l *libvirt.Libvirt, dom libvirt.Domain, diskID string) (liveDisk, bool) {
+	dx, ok := b.domXMLDevices(l, dom)
+	if !ok {
+		return liveDisk{}, false
+	}
+	uuid := uuidString(dom.UUID)
+	for _, dk := range dx.Devices.Disks {
+		if dk.Device == "cdrom" {
+			continue
+		}
+		src := dk.Source.File
+		if src == "" {
+			src = dk.Source.Dev
+		}
+		driver := dk.Driver.Type
+		if driver == "" {
+			driver = "qcow2"
+		}
+		normID := uuid + "-" + dk.Target.Dev
+		if diskID == normID || diskID == dk.Target.Dev || (src != "" && diskID == src) {
+			return liveDisk{target: dk.Target.Dev, driver: driver, source: src}, true
+		}
+	}
+	return liveDisk{}, false
+}
+
+// findNIC locates a NIC by normalized id (uuid-nic<index>), by MAC, or by network.
+func (b *liveBackend) findNIC(l *libvirt.Libvirt, dom libvirt.Domain, nicID string) (liveNIC, bool) {
+	dx, ok := b.domXMLDevices(l, dom)
+	if !ok {
+		return liveNIC{}, false
+	}
+	uuid := uuidString(dom.UUID)
+	for i, n := range dx.Devices.Interfaces {
+		net := n.Source.Network
+		if net == "" {
+			net = n.Source.Bridge
+		}
+		normID := fmt.Sprintf("%s-nic%d", uuid, i)
+		if nicID == normID || (n.MAC.Address != "" && nicID == n.MAC.Address) || nicID == net {
+			return liveNIC{network: net, model: n.Model.Type, mac: n.MAC.Address}, true
+		}
+	}
+	return liveNIC{}, false
+}
+
+// cdromTarget returns the target dev of the domain's first cdrom (and whether one
+// exists). When absent it proposes a free sata target so a fresh cdrom can be added.
+func (b *liveBackend) cdromTarget(l *libvirt.Libvirt, dom libvirt.Domain) (string, bool) {
+	dx, _ := b.domXMLDevices(l, dom)
+	used := map[string]bool{}
+	for _, dk := range dx.Devices.Disks {
+		if dk.Device == "cdrom" {
+			return dk.Target.Dev, true
+		}
+		used[dk.Target.Dev] = true
+	}
+	for c := 'a'; c <= 'z'; c++ {
+		t := "sd" + string(c)
+		if !used[t] {
+			return t, false
+		}
+	}
+	return "sdz", false
+}
+
+// renderDiskDeviceXML builds a single <disk device='disk'> element for attach/detach.
+func renderDiskDeviceXML(target, format, source string) string {
+	if format == "" {
+		format = "qcow2"
+	}
+	if target == "" {
+		target = "vdb"
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "<disk type='file' device='disk'>\n")
+	fmt.Fprintf(&sb, "  <driver name='qemu' type='%s'/>\n", xmlEscape(format))
+	fmt.Fprintf(&sb, "  <source file='%s'/>\n", xmlEscape(source))
+	fmt.Fprintf(&sb, "  <target dev='%s' bus='virtio'/>\n", xmlEscape(target))
+	fmt.Fprintf(&sb, "</disk>\n")
+	return sb.String()
+}
+
+// renderNICDeviceXML builds a single <interface type='network'> element.
+func renderNICDeviceXML(network, model, mac string) string {
+	if model == "" {
+		model = "virtio"
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "<interface type='network'>\n")
+	fmt.Fprintf(&sb, "  <source network='%s'/>\n", xmlEscape(network))
+	if mac != "" {
+		fmt.Fprintf(&sb, "  <mac address='%s'/>\n", xmlEscape(mac))
+	}
+	fmt.Fprintf(&sb, "  <model type='%s'/>\n", xmlEscape(model))
+	fmt.Fprintf(&sb, "</interface>\n")
+	return sb.String()
+}
+
+// renderCDROMDeviceXML builds a <disk device='cdrom'> element. An empty isoPath
+// renders an EMPTY cdrom (no <source>), which is exactly an eject when used with
+// update-device.
+func renderCDROMDeviceXML(target, isoPath string) string {
+	if target == "" {
+		target = "sda"
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "<disk type='file' device='cdrom'>\n")
+	fmt.Fprintf(&sb, "  <driver name='qemu' type='raw'/>\n")
+	if isoPath != "" {
+		fmt.Fprintf(&sb, "  <source file='%s'/>\n", xmlEscape(isoPath))
+	}
+	fmt.Fprintf(&sb, "  <target dev='%s' bus='sata'/>\n", xmlEscape(target))
+	fmt.Fprintf(&sb, "  <readonly/>\n")
+	fmt.Fprintf(&sb, "</disk>\n")
+	return sb.String()
+}
+
 // --- extension XML rendering / parsing helpers ---
 
 // renderNetworkXML builds libvirt <network> XML from a NetworkSpec. Supports nat
@@ -1730,7 +2051,20 @@ func renderDomainXML(d *libvirtDomain) string {
 	} else {
 		fmt.Fprintf(&sb, "  <os><type arch='x86_64' machine='pc'>hvm</type></os>\n")
 	}
+	// ACPI is required by UEFI on x86_64 ("UEFI requires ACPI on this architecture")
+	// and is expected by every modern guest; APIC enables SMP/IO interrupt routing.
+	fmt.Fprintf(&sb, "  <features><acpi/><apic/></features>\n")
 	fmt.Fprintf(&sb, "  <devices>\n")
+	// On q35/PCIe (UEFI), pre-provision spare pcie-root-ports so devices can be
+	// HOT-PLUGGED later (CapHotPlug). Without free root ports a PCIe machine reports
+	// "No more available PCI slots" on attach. i440fx (pc) hotplugs onto pci.0 and
+	// needs none. libvirt assigns the controller index/addresses automatically.
+	if d.Firmware == vp.FirmwareUEFI {
+		// index 0 is the implicit pcie-root; spare root ports start at index 1.
+		for i := 1; i <= 6; i++ {
+			fmt.Fprintf(&sb, "    <controller type='pci' index='%d' model='pcie-root-port'/>\n", i)
+		}
+	}
 	for _, dk := range d.Disks {
 		driver := dk.Driver
 		if driver == "" {
@@ -1748,17 +2082,21 @@ func renderDomainXML(d *libvirtDomain) string {
 			fmt.Fprintf(&sb, "    </disk>\n")
 		}
 	}
-	// Boot CD-ROM from an ISO (the wizard's bootIso maps to d.BootISO). Placed
-	// before NICs; marked bootable so an empty disk boots the installer.
+	// CD-ROM: always present so media can be MOUNTED LATER via update-device
+	// (CapHotPlug MountISO/UnmountISO). A sata cdrom cannot be hot-ADDED, so it must
+	// exist from creation. When BootISO is set it carries that ISO and is bootable;
+	// otherwise it is an empty (no <source>) cdrom ready to receive media.
+	fmt.Fprintf(&sb, "    <disk type='file' device='cdrom'>\n")
+	fmt.Fprintf(&sb, "      <driver name='qemu' type='raw'/>\n")
 	if d.BootISO != "" {
-		fmt.Fprintf(&sb, "    <disk type='file' device='cdrom'>\n")
-		fmt.Fprintf(&sb, "      <driver name='qemu' type='raw'/>\n")
 		fmt.Fprintf(&sb, "      <source file='%s'/>\n", xmlEscape(d.BootISO))
-		fmt.Fprintf(&sb, "      <target dev='sda' bus='sata'/>\n")
-		fmt.Fprintf(&sb, "      <readonly/>\n")
-		fmt.Fprintf(&sb, "      <boot order='1'/>\n")
-		fmt.Fprintf(&sb, "    </disk>\n")
 	}
+	fmt.Fprintf(&sb, "      <target dev='sda' bus='sata'/>\n")
+	fmt.Fprintf(&sb, "      <readonly/>\n")
+	if d.BootISO != "" {
+		fmt.Fprintf(&sb, "      <boot order='1'/>\n")
+	}
+	fmt.Fprintf(&sb, "    </disk>\n")
 	for _, nic := range d.NICs {
 		if nic.Network == "" {
 			continue

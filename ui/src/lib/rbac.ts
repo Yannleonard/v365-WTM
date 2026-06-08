@@ -326,6 +326,22 @@ export function gateVMStorageWrite(
   return { allowed: true, reason: "" };
 }
 
+/**
+ * Gate live hot-plug device management — attach/detach disk & NIC, mount/eject ISO
+ * on a RUNNING VM (cap "hotplug" + vm.hotplug). A read-only provider disables it.
+ */
+export function gateVMHotPlug(
+  caps: VMCapability[] | undefined,
+  permissions: string[] | undefined,
+): GateResult {
+  if (hasVMCap(caps, "readonly")) return { allowed: false, reason: "This hypervisor is read-only" };
+  if (!hasVMCap(caps, "hotplug"))
+    return { allowed: false, reason: "Provider does not support live device hot-plug" };
+  if (!can(permissions, "vm.hotplug"))
+    return { allowed: false, reason: "You lack the vm.hotplug permission" };
+  return { allowed: true, reason: "" };
+}
+
 /** Gate opening the graphical console (cap "console" + vm.console). */
 export function gateVMConsole(
   caps: VMCapability[] | undefined,

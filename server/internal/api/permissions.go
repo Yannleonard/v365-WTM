@@ -115,9 +115,17 @@ var permissionCatalog = []string{
 	"vm.network.write",
 	"vm.storage.read",
 	"vm.storage.write",
+	// Hot-plug device management: live attach/detach disk & NIC, mount/eject ISO on
+	// a RUNNING VM (no reboot). Operator-grade.
+	"vm.hotplug",
 	// UniHV V2V cross-hypervisor migration: read job status / run a migration.
 	"v2v.read",
 	"v2v.migrate",
+	// UniHV pluggable storage backends (SAN/NAS + cloud object stores). Read lists
+	// registered backends (secrets redacted); write covers create/test/delete +
+	// credential management — admin-grade infrastructure configuration.
+	"storage.backend.read",
+	"storage.backend.write",
 	// audit & settings
 	"audit.read",
 	"settings.read",

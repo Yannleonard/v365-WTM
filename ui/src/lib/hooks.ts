@@ -48,6 +48,7 @@ import type {
   VMDetail,
   VMProvider,
   HvConn,
+  StorageBackend,
   VMCapability,
   VMSnapshot,
   VMCluster,
@@ -114,6 +115,7 @@ export const qk = {
   inventory: ["inventory"] as const,
   vmProviders: ["vmProviders"] as const,
   hvConnections: ["hvConnections"] as const,
+  storageBackends: ["storageBackends"] as const,
   vms: (pid: string) => ["vms", pid] as const,
   vm: (pid: string, id: string) => ["vm", pid, id] as const,
   vmSnapshots: (pid: string, id: string) => ["vm", "snapshots", pid, id] as const,
@@ -535,6 +537,17 @@ export function useHvConnections(opts?: Partial<UseQueryOptions<HvConn[]>>) {
   return useQuery<HvConn[]>({
     queryKey: qk.hvConnections,
     queryFn: () => api.vmConnections(),
+    refetchInterval: POLL,
+    ...opts,
+  });
+}
+
+/** Registered pluggable storage backends (admin; secrets never present). Live-ish
+ *  so the connect/probe status settles in the list shortly after a create. */
+export function useStorageBackends(opts?: Partial<UseQueryOptions<StorageBackend[]>>) {
+  return useQuery<StorageBackend[]>({
+    queryKey: qk.storageBackends,
+    queryFn: () => api.storageBackends(),
     refetchInterval: POLL,
     ...opts,
   });

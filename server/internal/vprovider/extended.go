@@ -100,6 +100,33 @@ type StorageProvider interface {
 	UploadISO(ctx context.Context, storageID, name string, size int64, r io.Reader) (*Volume, error)
 }
 
+// --- hot-plug device management (live attach/detach on a RUNNING VM) ---
+
+// DeviceManager is implemented by providers that can hot-add / hot-remove devices
+// (disks, NICs) and insert/eject ISO media on a RUNNING VM with NO reboot. The
+// changes apply to the live instance AND persist to the domain config so they
+// survive a power cycle. Requires CapHotPlug.
+//
+// Disks/NICs are described with the SAME normalized DiskSpec/NICSpec the create
+// path uses. Detach is by the normalized device id (Disk.ID / NIC.ID as surfaced
+// by GetVM). MountISO inserts media into the VM's existing CD-ROM; UnmountISO
+// ejects it (leaving the empty CD-ROM in place).
+type DeviceManager interface {
+	// AttachDisk hot-attaches a disk to a running VM. A size-only spec (no
+	// SourcePath) provisions a backing volume first.
+	AttachDisk(ctx context.Context, vmID string, spec DiskSpec) (*Task, error)
+	// DetachDisk hot-removes the disk identified by diskID.
+	DetachDisk(ctx context.Context, vmID, diskID string) (*Task, error)
+	// AttachNIC hot-attaches a virtual NIC to a running VM.
+	AttachNIC(ctx context.Context, vmID string, spec NICSpec) (*Task, error)
+	// DetachNIC hot-removes the NIC identified by nicID.
+	DetachNIC(ctx context.Context, vmID, nicID string) (*Task, error)
+	// MountISO inserts the ISO at isoPath into the VM's CD-ROM (no reboot).
+	MountISO(ctx context.Context, vmID, isoPath string) (*Task, error)
+	// UnmountISO ejects the media from the VM's CD-ROM.
+	UnmountISO(ctx context.Context, vmID string) (*Task, error)
+}
+
 // Capability bits for the optional interfaces (continue the CapabilityMatrix).
 // They are defined here (not in capability.go) to keep the extension self-contained;
 // being in the same package they share the same iota space is NOT required because
@@ -109,6 +136,9 @@ const (
 	CapConsole      CapabilityMatrix = 1 << 32
 	CapNetworkWrite CapabilityMatrix = 1 << 33
 	CapStorageWrite CapabilityMatrix = 1 << 34
+	// CapHotPlug declares live hot-add/hot-remove of disks/NICs and ISO mount/eject
+	// on a RUNNING VM (DeviceManager).
+	CapHotPlug CapabilityMatrix = 1 << 35
 )
 
 // extTokens maps the extension capability bits to wire tokens (appended to the
@@ -120,6 +150,7 @@ var extTokens = []struct {
 	{CapConsole, "console"},
 	{CapNetworkWrite, "network_write"},
 	{CapStorageWrite, "storage_write"},
+	{CapHotPlug, "hotplug"},
 }
 
 // ExtStrings returns the active EXTENSION capability tokens (console/network_write/
