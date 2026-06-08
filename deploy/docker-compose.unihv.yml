@@ -1,0 +1,122 @@
+# =============================================================================
+# UniHV — one-command deployment (app + PostgreSQL + Redis).
+#
+#   export CASTOR_SECRET_KEY=$(openssl rand -hex 32)        # 64 hex chars = 32 bytes
+#   docker compose -f deploy/docker-compose.unihv.yml up -d --build
+#   # open http://localhost:8080  -> first-run "create admin" (bootstrap) screen
+#
+# UniHV is the unified multi-hypervisor (KVM/Hyper-V/Xen/ESXi) + multi-orchestrator
+# (Docker/Swarm/K8s) console built on the Castor socle. The app image bundles the
+# Go API + embedded React UI (single static binary, distroless, non-root).
+#
+# - PostgreSQL 15 backs the unified inventory + tenants + billing (ADR D-003); the
+#   embedded SQLite still holds auth/RBAC/audit for the zero-config path.
+# - Redis backs sessions/cache/async task queue.
+# - Mount the Docker socket to manage the local container engine; register real
+#   hypervisor connections via the UI/API. Set UNIHV_DEMO_HYPERVISOR=false in prod.
+# =============================================================================
+
+services:
+  unihv:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        VERSION: unihv
+        COMMIT: compose
+    image: unihv:latest
+    container_name: unihv
+    hostname: unihv
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "8080:8080"
+    environment:
+      CASTOR_SECRET_KEY: "${CASTOR_SECRET_KEY:?set CASTOR_SECRET_KEY (openssl rand -hex 32) before compose up}"
+      CASTOR_HTTP_ADDR: ":8080"
+      CASTOR_DB_PATH: "/data/unihv.db"
+      # Unified inventory store (ADR D-003). UNIHV_DB_DRIVER=postgres uses the DSN.
+      UNIHV_DB_DRIVER: "${UNIHV_DB_DRIVER:-postgres}"
+      UNIHV_POSTGRES_DSN: "postgres://unihv:${POSTGRES_PASSWORD:-unihv}@postgres:5432/unihv?sslmode=disable"
+      UNIHV_REDIS_ADDR: "redis:6379"
+      # Demo hypervisors populate the console out of the box. Disable in production
+      # and register real KVM/Hyper-V/Xen/ESXi connections.
+      UNIHV_DEMO_HYPERVISOR: "${UNIHV_DEMO_HYPERVISOR:-true}"
+      CASTOR_SELF_CONTAINER_ID: "unihv"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - unihv-data:/data
+    # Run directly as the non-root runtime user (uid:gid 65532). This makes the
+    # entrypoint take its already-non-root path (no in-container privilege-drop
+    # re-exec), which is compatible with no-new-privileges + cap_drop ALL. The
+    # docker socket's group is granted via group_add so the unprivileged server can
+    # still reach the daemon (DOCKER_GID: the host docker.sock group — on Docker
+    # Desktop the socket is group 0, so default to 0 here).
+    user: "65532:65532"
+    group_add:
+      - "${DOCKER_GID:-0}"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/castor", "healthcheck"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: unihv-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: unihv
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-unihv}"
+      POSTGRES_DB: unihv
+    volumes:
+      - unihv-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U unihv -d unihv"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    container_name: unihv-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    volumes:
+      - unihv-redisdata:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  unihv-data:
+    name: unihv-data
+  unihv-pgdata:
+    name: unihv-pgdata
+  unihv-redisdata:
+    name: unihv-redisdata

@@ -97,3 +97,22 @@
   pass conformance against simulators/fixtures. Production against a live hypervisor uses
   the same normalization with the tagged transport compiled in (KVM live = pure-Go socket,
   no special build). Each provider documents how to exercise it against the real backend.
+
+## D-006 — Hardened compose runs the app as non-root directly (no in-container privilege drop)
+
+- **Context.** The inherited entrypoint starts as root (USER 0) and re-execs itself as
+  uid 65532 with the docker-socket group (the gosu pattern) so it can read a root-owned
+  socket without `--group-add`. Under the hardened compose (`no-new-privileges:true` +
+  `cap_drop: ALL`), the kernel forbids that credential-changing re-exec →
+  `fork/exec /proc/self/exe: operation not permitted`, crash-looping the app. Caught by
+  the live `docker compose up` validation gate.
+- **Decision.** In `deploy/docker-compose.unihv.yml` run the container directly as
+  `user: "65532:65532"` and grant socket access via `group_add` (the host docker.sock
+  group; 0 on Docker Desktop). The entrypoint then takes its already-non-root path and
+  runs the server in-process — no re-exec — which is compatible with `no-new-privileges`
+  + `cap_drop: ALL`. The named `/data` volume is image-seeded as 65532, so SQLite writes.
+- **Alternatives rejected.** *Drop `no-new-privileges`/keep CAP_SETUID+SETGID.* Weakens
+  the hardening for no benefit when running as the target user directly works.
+- **Consequences.** Stack comes up healthy with full hardening; the server reaches the
+  Docker daemon and shows real containers next to the demo VMs. The plain `docker run`
+  path (root entrypoint + in-process drop) still works for users who prefer it.
