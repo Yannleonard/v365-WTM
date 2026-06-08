@@ -95,6 +95,10 @@ type extBackend interface {
 	createVolume(spec vp.VolumeSpec) error
 	deleteVolume(storageID, volumeID string) error
 	uploadISO(storageID, name string, size int64, r io.Reader) (*vp.Volume, error)
+	// exportDisk streams the domain's primary disk converted to `format` (real
+	// qemu-img convert from the on-disk source). Returns the stream + byte size.
+	// This is what makes V2V a REAL disk export, not a placeholder.
+	exportDisk(uuid string, format vp.DiskFormat) (io.ReadCloser, int64, error)
 }
 
 // Provider is the KVM/libvirt HypervisorProvider. The core is CGO-free; the
@@ -546,17 +550,39 @@ func (p *Provider) ExportVM(ctx context.Context, vmID string, format vp.DiskForm
 	if !ok {
 		return nil, nil, vp.ErrNotFound
 	}
-	// Stand in for qemu-img convert streaming the domain's disk(s).
-	payload := fmt.Sprintf("KVMEXPORT\x00provider=%s\x00domain=%s\x00format=%s\n", p.id, vmID, format)
 	info := &vp.ExportInfo{
 		Format:     format,
-		SizeBytes:  int64(len(payload)),
 		DiskCount:  len(d.Disks),
 		SourceVMID: vmID,
 		GuestOS:    d.OSType,
 		Firmware:   d.Firmware,
 	}
+	// When the backend can export the REAL disk (live libvirt), stream the actual
+	// disk image converted to the requested format via qemu-img. This makes V2V a
+	// genuine disk migration. The sim backend has no real disk, so it falls back to
+	// a small placeholder stream (used only in hardware-free conformance tests).
+	if eb, ok := p.backend.(extBackend); ok {
+		if rc, size, err := eb.exportDisk(vmID, format); err == nil {
+			info.SizeBytes = size
+			return rc, info, nil
+		} else if err != errNoRealDisk {
+			return nil, nil, mapExportErr(err)
+		}
+	}
+	payload := fmt.Sprintf("KVMEXPORT\x00provider=%s\x00domain=%s\x00format=%s\n", p.id, vmID, format)
+	info.SizeBytes = int64(len(payload))
 	return io.NopCloser(strings.NewReader(payload)), info, nil
+}
+
+// errNoRealDisk signals the backend has no real disk to export (sim path).
+var errNoRealDisk = fmt.Errorf("kvm: no real disk to export")
+
+// mapExportErr maps an export failure to a contract sentinel.
+func mapExportErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %v", vp.ErrInvalidSpec, err)
 }
 
 // --- cluster & HA ---

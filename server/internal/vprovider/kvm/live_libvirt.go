@@ -34,6 +34,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1092,6 +1094,108 @@ func (b *liveBackend) createVolume(spec vp.VolumeSpec) error {
 		return mapLibvirtErr(err)
 	}
 	return nil
+}
+
+// exportDisk streams the domain's primary disk image converted to `format` using a
+// real `qemu-img convert`. The source path comes from the live domain XML's first
+// <disk><source file>. Returns a reader of the converted image + its byte size.
+// This is the REAL disk export that powers cross-hypervisor V2V.
+func (b *liveBackend) exportDisk(uuid string, format vp.DiskFormat) (io.ReadCloser, int64, error) {
+	// Resolve the domain's first disk source path from its XML.
+	l, dom, ok := b.domainHandle(uuid)
+	if !ok {
+		return nil, 0, vp.ErrNotFound
+	}
+	raw, err := l.DomainGetXMLDesc(dom, 0)
+	if err != nil {
+		b.fail(err)
+		return nil, 0, mapLibvirtErr(err)
+	}
+	var dx struct {
+		Devices struct {
+			Disks []struct {
+				Device string `xml:"device,attr"`
+				Source struct {
+					File string `xml:"file,attr"`
+				} `xml:"source"`
+			} `xml:"disk"`
+		} `xml:"devices"`
+	}
+	if err := xml.Unmarshal([]byte(raw), &dx); err != nil {
+		return nil, 0, vp.ErrInvalidSpec
+	}
+	srcPath := ""
+	for _, dk := range dx.Devices.Disks {
+		if dk.Device == "disk" && dk.Source.File != "" {
+			srcPath = dk.Source.File
+			break
+		}
+	}
+	if srcPath == "" {
+		// No real backing disk -> let the Provider fall back to the placeholder.
+		return nil, 0, errNoRealDisk
+	}
+	qemuImg, err := exec.LookPath("qemu-img")
+	if err != nil {
+		return nil, 0, fmt.Errorf("qemu-img not available for disk export: %w", err)
+	}
+	tmpDir, err := os.MkdirTemp("", "unihv-export-*")
+	if err != nil {
+		return nil, 0, err
+	}
+	toTok := qemuExportFormat(format)
+	outPath := filepath.Join(tmpDir, "disk."+toTok)
+	// qemu-img convert -U -O <fmt> <src> <out>
+	//   -U forces a SHARED lock so a RUNNING VM's disk can be exported (otherwise
+	//      libvirt's exclusive write lock makes qemu-img fail "Failed to get lock").
+	//      This is the standard live-export approach; the snapshot is crash-consistent.
+	//   -O selects the target format; the source format is auto-detected.
+	cmd := exec.Command(qemuImg, "convert", "-U", "-O", toTok, srcPath, outPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		os.RemoveAll(tmpDir)
+		return nil, 0, fmt.Errorf("qemu-img export convert failed: %v: %s", err, string(out))
+	}
+	f, err := os.Open(outPath)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		return nil, 0, err
+	}
+	fi, _ := f.Stat()
+	size := int64(0)
+	if fi != nil {
+		size = fi.Size()
+	}
+	// Wrap so closing the reader also removes the temp dir.
+	return &cleanupReadCloser{f: f, dir: tmpDir}, size, nil
+}
+
+// qemuExportFormat maps a DiskFormat to a qemu-img -O token.
+func qemuExportFormat(f vp.DiskFormat) string {
+	switch f {
+	case vp.DiskVMDK:
+		return "vmdk"
+	case vp.DiskRaw:
+		return "raw"
+	case vp.DiskVHDX:
+		return "vhdx"
+	case vp.DiskVHD:
+		return "vpc"
+	default:
+		return "qcow2"
+	}
+}
+
+// cleanupReadCloser removes a temp dir when the underlying file is closed.
+type cleanupReadCloser struct {
+	f   *os.File
+	dir string
+}
+
+func (c *cleanupReadCloser) Read(p []byte) (int, error) { return c.f.Read(p) }
+func (c *cleanupReadCloser) Close() error {
+	err := c.f.Close()
+	_ = os.RemoveAll(c.dir)
+	return err
 }
 
 // provisionVolume creates a backing volume in poolName and returns its on-disk

@@ -94,12 +94,19 @@ RUN test -s /out/castor
 RUN install -d -o 65532 -g 65532 -m 0750 /data
 
 # ============================================================================
-# STAGE 3 — final (distroless static, non-root, no shell, no package manager)
+# STAGE 3 — final (debian-slim + qemu-utils, non-root)
 # ============================================================================
-# gcr.io/distroless/static:nonroot == debian12 base, runs as uid:gid 65532:65532,
-# ships CA certificates + tzdata, contains no shell and no libc. Perfect for a
-# fully static CGO-free Go binary.
-FROM gcr.io/distroless/static:nonroot AS final
+# UniHV ships qemu-img (qemu-utils) so the V2V engine can do REAL cross-hypervisor
+# disk-format conversion (VMDK <-> qcow2 <-> raw <-> VHDX) server-side. That needs
+# libs, so we use a slim Debian base (not distroless/static). Still runs non-root
+# (uid:gid 65532) with a read-only rootfs in compose. The Go binary is the same
+# CGO-free static artifact.
+FROM debian:12-slim AS final
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends qemu-utils ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd -g 65532 nonroot \
+ && useradd -u 65532 -g 65532 -M -s /usr/sbin/nologin nonroot
 
 LABEL org.opencontainers.image.title="Castor" \
       org.opencontainers.image.description="Castor by Leonard — multi-host container orchestration platform (Docker, Swarm, Kubernetes)." \
