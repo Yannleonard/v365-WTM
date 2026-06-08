@@ -98,6 +98,27 @@
   the same normalization with the tagged transport compiled in (KVM live = pure-Go socket,
   no special build). Each provider documents how to exercise it against the real backend.
 
+## D-007 — Providers use each hypervisor's OFFICIAL API; no mocks in the production path
+
+- **Context.** The user requires real hypervisor management (standalone hosts AND clusters),
+  with NO mock in the production path. Ref: Microsoft Virtualization API
+  (learn.microsoft.com/virtualization/api/). Each hypervisor exposes an official API.
+- **Decision.** Every provider's LIVE backend talks to the hypervisor's official API:
+  - **Hyper-V** → WMI namespace `root\virtualization\v2` (`Msvm_*` classes) accessed DIRECTLY
+    via COM from Go using `github.com/go-ole/go-ole` (the official management surface; this is
+    what the Hyper-V PowerShell cmdlets wrap). Manages standalone host AND Failover Cluster
+    (`MSCluster_*`). Build tag `//go:build windows`.
+  - **KVM** → libvirt RPC API via the pure-Go `github.com/digitalocean/go-libvirt`.
+  - **VMware ESXi/vSphere** → vSphere SOAP/REST API via `github.com/vmware/govmomi`.
+  - **Xen** → XAPI XML-RPC/JSON-RPC over HTTP.
+  Simulators remain ONLY for the CI conformance suite (no hardware); never the real path.
+- **CGO note (refines D-005).** go-ole/COM may require cgo. We accept that the **Windows /
+  Hyper-V** build target may be cgo-enabled (Hyper-V is Windows-only regardless). The default
+  Linux image (KVM/ESXi/Xen + the whole container domain) stays CGO-free and distroless.
+- **Consequences.** Real, verifiable management against actual hypervisor APIs. The Hyper-V
+  provider is compiled for/run on Windows; the Linux server registers KVM/ESXi/Xen live
+  providers. Conformance (sim) still gates correctness in hardware-free CI.
+
 ## D-006 — Hardened compose runs the app as non-root directly (no in-container privilege drop)
 
 - **Context.** The inherited entrypoint starts as root (USER 0) and re-execs itself as

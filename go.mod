@@ -8,10 +8,12 @@ require (
 	github.com/coder/websocket v1.8.14
 	github.com/containerd/errdefs v1.0.0
 	github.com/coreos/go-oidc/v3 v3.11.0
+	github.com/digitalocean/go-libvirt v0.0.0-20260217163227-273eaa321819
 	github.com/docker/docker v28.5.2+incompatible
 	github.com/docker/go-connections v0.7.0
 	github.com/go-chi/chi/v5 v5.3.0
 	github.com/go-ldap/ldap/v3 v3.4.6
+	github.com/go-ole/go-ole v1.3.0
 	github.com/pquerna/otp v1.4.0
 	golang.org/x/crypto v0.52.0
 	golang.org/x/oauth2 v0.36.0
