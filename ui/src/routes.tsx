@@ -17,6 +17,7 @@ import { WorkloadDetail } from "./views/WorkloadDetail";
 import { VirtualMachines } from "./views/VirtualMachines";
 import { VirtualMachineDetail } from "./views/VirtualMachineDetail";
 import { VMClusters } from "./views/VMClusters";
+import { HypervisorConnections } from "./views/HypervisorConnections";
 import { Migration } from "./views/Migration";
 import { Stacks } from "./views/Stacks";
 import { StackEditor } from "./views/StackEditor";
@@ -69,6 +70,14 @@ export const router = createBrowserRouter([
         element: (
           <RequirePerm anyOf={["vm.read", "*"]}>
             <VirtualMachineDetail />
+          </RequirePerm>
+        ),
+      },
+      {
+        path: "vm/connections",
+        element: (
+          <RequirePerm anyOf={["vm.create", "*"]}>
+            <HypervisorConnections />
           </RequirePerm>
         ),
       },

@@ -99,6 +99,8 @@ import type {
   VM,
   VMDetail,
   VMProvider,
+  HvConn,
+  HvConnInput,
   VMSnapshot,
   VMHost,
   VMCluster,
@@ -663,6 +665,15 @@ export const api = {
   /* ---- virtual machines / hypervisors ---- */
   // Hypervisor providers + their capability lists (mirrors /providers for VMs).
   vmProviders: () => get<VMProvider[]>("/vm/providers"),
+  // Hypervisor connections (registered credentials → live providers). The list
+  // projection carries hasSecret but never the secret. Test runs a live connect
+  // (a failed test is a 422 with error.message, surfaced as an ApiError). Create
+  // seals the secret + connects/registers when enabled; delete deregisters the
+  // live provider and deletes the row.
+  vmConnections: () => get<HvConn[]>("/vm/connections"),
+  vmConnectionTest: (body: HvConnInput) => post<{ ok: boolean }>("/vm/connections/test", body),
+  vmConnectionCreate: (body: HvConnInput) => post<HvConn>("/vm/connections", body),
+  vmConnectionDelete: (id: string) => del<void>(`/vm/connections/${encId(id)}`),
   // All VMs for one provider.
   vms: (pid: string) => get<VM[]>(`/vm/providers/${encId(pid)}/vms`),
   // One VM (normalized + hypervisor-native raw).

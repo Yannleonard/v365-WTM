@@ -1077,6 +1077,46 @@ export type VMState =
   | "paused"
   | "unknown";
 
+// ----- Hypervisor connections (register/connect a live provider) -----
+
+// HvConnKind selects which hypervisor a connection targets.
+export type HvConnKind = "kvm" | "hyperv" | "vmware" | "xen";
+
+// HvConnStatus reflects the live connect/register state of a connection.
+export type HvConnStatus = "pending" | "connected" | "error";
+
+// HvConn is the SAFE projection from GET /vm/connections: it carries hasSecret
+// (whether a credential is stored) but NEVER the secret itself. Field names match
+// the api hvConnView json tags.
+export interface HvConn {
+  id: string;
+  name: string;
+  kind: HvConnKind;
+  endpoint: string;
+  username: string;
+  hasSecret: boolean;
+  insecureTls: boolean;
+  enabled: boolean;
+  status: HvConnStatus;
+  lastError?: string;
+  lastSeenAt?: string; // RFC3339
+  createdAt: string; // RFC3339
+}
+
+// HvConnInput is the body for POST /vm/connections (create) and
+// POST /vm/connections/test (probe). `secret` is the plaintext credential sent
+// once; it is sealed server-side and never returned. `enabled` is omitted by the
+// test probe (it does not persist anything).
+export interface HvConnInput {
+  name: string;
+  kind: HvConnKind;
+  endpoint: string;
+  username: string;
+  secret: string;
+  insecureTls: boolean;
+  enabled?: boolean;
+}
+
 // VM provider capability tokens. Open string union so an unknown token from a
 // newer backend still type-checks (we only branch on known ones).
 export type VMCapability =

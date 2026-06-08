@@ -67,6 +67,7 @@ const GROUPS: NavGroup[] = [
     label: "Virtual Machines",
     items: [
       { to: "/vms", label: "Virtual Machines", icon: <IconVM size={18} />, perms: ["vm.read"] },
+      { to: "/vm/connections", label: "Connections", icon: <IconShield size={18} />, perms: ["vm.read"] },
       { to: "/vm-clusters", label: "Clusters", icon: <IconNetworks size={18} />, perms: ["vm.cluster.read", "vm.read"] },
       { to: "/migration", label: "Migration (V2V)", icon: <IconMigrate size={18} />, perms: ["v2v.read"] },
     ],

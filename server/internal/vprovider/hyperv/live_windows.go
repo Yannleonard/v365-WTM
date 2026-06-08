@@ -362,7 +362,7 @@ func (l *liveBackend) populateSettings(vm *hypervVM, vmID string) {
 	// The VM's realized Msvm_VirtualSystemSettingData (ConfigurationID == vm GUID).
 	vssd := l.query(fmt.Sprintf(
 		"SELECT * FROM Msvm_VirtualSystemSettingData WHERE ConfigurationID='%s' AND VirtualSystemType='%s'",
-		vmID, vmTypeRealized))
+		wqlEscape(vmID), vmTypeRealized))
 	var vssdPath string
 	for _, s := range vssd {
 		vssdPath = path(s)
@@ -475,7 +475,7 @@ func (l *liveBackend) getVM(vmID string) (*hypervVM, bool) {
 	var vm *hypervVM
 	l.withCOM(func() {
 		objs := l.query(fmt.Sprintf(
-			"SELECT Name,ElementName,EnabledState FROM Msvm_ComputerSystem WHERE Name='%s'", vmID))
+			"SELECT Name,ElementName,EnabledState FROM Msvm_ComputerSystem WHERE Name='%s'", wqlEscape(vmID)))
 		for _, o := range objs {
 			vm = l.loadVM(o)
 			o.Release()
@@ -624,7 +624,7 @@ func (l *liveBackend) destroyVM(vmID string) {
 		}
 		defer svc.Release()
 		var vmPath string
-		objs := l.query(fmt.Sprintf("SELECT * FROM Msvm_ComputerSystem WHERE Name='%s'", vmID))
+		objs := l.query(fmt.Sprintf("SELECT * FROM Msvm_ComputerSystem WHERE Name='%s'", wqlEscape(vmID)))
 		for _, o := range objs {
 			vmPath = path(o)
 			o.Release()
@@ -659,7 +659,7 @@ func (l *liveBackend) destroyVM(vmID string) {
 func (l *liveBackend) waitGone(vmID string, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		objs := l.query(fmt.Sprintf("SELECT Name FROM Msvm_ComputerSystem WHERE Name='%s'", vmID))
+		objs := l.query(fmt.Sprintf("SELECT Name FROM Msvm_ComputerSystem WHERE Name='%s'", wqlEscape(vmID)))
 		n := len(objs)
 		for _, o := range objs {
 			o.Release()
@@ -693,7 +693,7 @@ func (l *liveBackend) setState(vmID string, s enabledState) {
 		requested = 32768
 	}
 	l.withCOM(func() {
-		objs := l.query(fmt.Sprintf("SELECT * FROM Msvm_ComputerSystem WHERE Name='%s'", vmID))
+		objs := l.query(fmt.Sprintf("SELECT * FROM Msvm_ComputerSystem WHERE Name='%s'", wqlEscape(vmID)))
 		for _, o := range objs {
 			res, err := oleutil.CallMethod(o, "RequestStateChange", requested, nil)
 			if err == nil {
@@ -713,7 +713,7 @@ func (l *liveBackend) listSnapshots(vmID string) []vp.Snapshot {
 		// "...Snapshot" whose ConfigurationID matches the VM (best effort by
 		// associators of the VM's computer system).
 		var vmPath string
-		objs := l.query(fmt.Sprintf("SELECT * FROM Msvm_ComputerSystem WHERE Name='%s'", vmID))
+		objs := l.query(fmt.Sprintf("SELECT * FROM Msvm_ComputerSystem WHERE Name='%s'", wqlEscape(vmID)))
 		for _, o := range objs {
 			vmPath = path(o)
 			o.Release()
@@ -746,7 +746,7 @@ func (l *liveBackend) listSnapshots(vmID string) []vp.Snapshot {
 // createSnapshot uses Msvm_VirtualSystemSnapshotService.CreateSnapshot.
 func (l *liveBackend) createSnapshot(vmID string, snap vp.Snapshot) {
 	l.withCOM(func() {
-		objs := l.query(fmt.Sprintf("SELECT * FROM Msvm_ComputerSystem WHERE Name='%s'", vmID))
+		objs := l.query(fmt.Sprintf("SELECT * FROM Msvm_ComputerSystem WHERE Name='%s'", wqlEscape(vmID)))
 		if len(objs) == 0 {
 			return
 		}
@@ -773,7 +773,7 @@ func (l *liveBackend) setCurrentSnapshot(vmID, snapID string) bool {
 	found := false
 	l.withCOM(func() {
 		objs := l.query(fmt.Sprintf(
-			"SELECT * FROM Msvm_VirtualSystemSettingData WHERE ConfigurationID='%s'", snapID))
+			"SELECT * FROM Msvm_VirtualSystemSettingData WHERE ConfigurationID='%s'", wqlEscape(snapID)))
 		if len(objs) == 0 {
 			return
 		}
@@ -811,6 +811,18 @@ func (l *liveBackend) snapshotService() *ole.IDispatch {
 }
 
 // --- helpers ---
+
+// wqlEscape escapes a string for safe inclusion inside a single-quoted WQL string
+// literal. WQL treats backslash as an escape character and single quote as the
+// string delimiter, so both must be escaped to prevent WQL injection via
+// attacker-controlled identifiers (e.g. a VM/snapshot id from a URL param). Without
+// this, an id such as `x' OR Name LIKE '%` would broaden the query's target set —
+// dangerous on the lifecycle paths (DestroySystem / RequestStateChange / snapshot).
+func wqlEscape(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `'`, `\'`)
+	return s
+}
 
 // parseCIMDate parses a WMI CIM_DATETIME ("yyyymmddHHMMSS.mmmmmm+UUU") to unix seconds.
 func parseCIMDate(s string) int64 {
