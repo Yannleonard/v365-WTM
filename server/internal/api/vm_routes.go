@@ -65,6 +65,10 @@ func (s *Server) mountVMRoutes(pr chi.Router) {
 	// Graphical console (VNC/SPICE/RDP). Read-grade ticket, gated by vm.console.
 	pr.With(az.AuditWrap("vm.console"), az.RequirePermission("vm.console", scopeFromProvider)).
 		Get("/vm/providers/{providerID}/vms/{vmID}/console", s.VMConsole)
+	// Integrated interactive console websocket: bridges the browser (guacamole-
+	// common-js) to guacd to VNC/RDP. Gated by vm.console; Origin re-checked at upgrade.
+	pr.With(az.RequirePermission("vm.console", scopeFromProvider)).
+		Get("/vm/providers/{providerID}/vms/{vmID}/console/ws", s.VMConsoleWS)
 
 	// Virtual network create/delete.
 	pr.With(az.AuditWrap("vm.network.create"), az.RequireAAL, az.RequirePermission("vm.network.write", scopeFromProvider)).

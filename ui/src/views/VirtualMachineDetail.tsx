@@ -22,7 +22,7 @@ import { ActionButton } from "../components/ActionButton";
 import { CapabilityGate } from "../components/CapabilityGate";
 import { DataTable, type Column } from "../components/DataTable";
 import { StatsChart } from "../components/StatsChart";
-import { VMConsoleModal } from "../components/VMConsoleModal";
+import { ConsolePanel } from "../components/ConsolePanel";
 import { InspectTab } from "./workload/InspectTab";
 import { gateVMAction, gateVMConsole } from "../lib/rbac";
 import { formatBytes, formatDateTime, shortId, timeAgo } from "../lib/format";
@@ -43,7 +43,7 @@ import { api } from "../lib/api";
 import { useQueryClient } from "@tanstack/react-query";
 import type { VMDisk, VMNic, VMSnapshot } from "../lib/types";
 
-type TabKey = "overview" | "snapshots" | "metrics" | "inspect";
+type TabKey = "overview" | "snapshots" | "metrics" | "console" | "inspect";
 
 export function VirtualMachineDetail() {
   const params = useParams<{ pid: string; id: string }>();
@@ -60,7 +60,6 @@ export function VirtualMachineDetail() {
 
   const actions = useVMActions();
   const [tab, setTab] = useState<TabKey>("overview");
-  const [consoleOpen, setConsoleOpen] = useState(false);
 
   if (query.isLoading) return <LoadingFill label="Loading virtual machine…" />;
 
@@ -82,10 +81,17 @@ export function VirtualMachineDetail() {
     );
   }
 
+  // The graphical console tab is shown only when the provider exposes a console
+  // AND the user holds vm.console (same gate as the old modal button).
+  const consoleGate = gateVMConsole(caps, permissions);
+
   const tabs: { key: TabKey; label: string; icon: JSX.Element }[] = [
     { key: "overview", label: "Overview", icon: <IconDashboard size={15} /> },
     { key: "snapshots", label: "Snapshots", icon: <IconSnapshot size={15} /> },
     { key: "metrics", label: "Metrics", icon: <IconStats size={15} /> },
+    ...(consoleGate.allowed
+      ? [{ key: "console" as const, label: "Console", icon: <IconTerminal size={15} /> }]
+      : []),
     { key: "inspect", label: "Inspect", icon: <IconInspect size={15} /> },
   ];
 
@@ -149,20 +155,6 @@ export function VirtualMachineDetail() {
                 </ActionButton>
               )}
             </CapabilityGate>
-            <CapabilityGate gate={gateVMConsole(caps, permissions)}>
-              {(allowed, reason) => (
-                <ActionButton
-                  variant="ghost"
-                  disabled={!allowed}
-                  tooltip={allowed ? "Open the graphical console" : reason}
-                  aria-label="Open console"
-                  onClick={() => setConsoleOpen(true)}
-                >
-                  <IconTerminal size={16} />
-                  Console
-                </ActionButton>
-              )}
-            </CapabilityGate>
             <ActionButton variant="ghost" iconOnly tooltip="Refresh" aria-label="Refresh" onClick={() => query.refetch()}>
               <IconRefresh size={16} />
             </ActionButton>
@@ -193,14 +185,12 @@ export function VirtualMachineDetail() {
           />
         )}
         {tab === "metrics" && <MetricsPanel pid={pid} vmId={vmId} />}
+        {/* Mounted only when active so no console socket opens in the background. */}
+        {tab === "console" && consoleGate.allowed && <ConsolePanel pid={pid} vmId={vmId} />}
         {tab === "inspect" && <InspectTab raw={detail.raw} />}
       </div>
 
       {actions.dialogs}
-
-      {consoleOpen ? (
-        <VMConsoleModal pid={pid} vmId={vmId} vmName={detail.name} onClose={() => setConsoleOpen(false)} />
-      ) : null}
     </div>
   );
 }

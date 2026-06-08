@@ -123,6 +123,25 @@ func newLiveBackend(endpoint string) (*liveBackend, error) {
 	return be, nil
 }
 
+// endpointHost extracts the reachable host from a libvirt endpoint for use as the
+// console host (so guacd dials a host it can actually reach). Returns "" for unix
+// sockets / local connections (the caller then uses loopback/nodeID).
+func endpointHost(endpoint string) string {
+	network, addr := parseEndpoint(endpoint)
+	if network != "tcp" {
+		return "" // unix socket: VNC is local to the libvirt host
+	}
+	host := addr
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		host = addr[:i]
+	}
+	host = strings.TrimSpace(host)
+	if host == "" || host == "127.0.0.1" || host == "localhost" {
+		return ""
+	}
+	return host
+}
+
 // parseEndpoint maps an endpoint string to a net.Dial (network, address) pair.
 // "" or an absolute path -> unix socket; "tcp://h:p" or "h:p" -> tcp.
 func parseEndpoint(endpoint string) (network, addr string) {
@@ -712,10 +731,18 @@ func (b *liveBackend) console(uuid string) (*vp.ConsoleEndpoint, error) {
 		}
 	}
 	if host == "" || host == "0.0.0.0" || host == "::" {
-		// libvirt listens on all interfaces; surface the hypervisor host instead.
-		b.mu.RLock()
-		host = b.nodeID
-		b.mu.RUnlock()
+		// libvirt listens on all interfaces. Surface a host that is actually
+		// REACHABLE by the console bridge (guacd). The libvirt RPC endpoint we
+		// connected on is the right answer for a TCP endpoint (e.g.
+		// host.docker.internal) because guacd shares that network view; libvirt's
+		// internal hostname (b.nodeID) is often NOT resolvable from the bridge
+		// container. Fall back to nodeID, then loopback.
+		host = endpointHost(b.endpoint)
+		if host == "" {
+			b.mu.RLock()
+			host = b.nodeID
+			b.mu.RUnlock()
+		}
 		if host == "" {
 			host = "127.0.0.1"
 		}

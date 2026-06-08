@@ -46,6 +46,8 @@ services:
       # Demo hypervisors populate the console out of the box. Disable in production
       # and register real KVM/Hyper-V/Xen/ESXi connections.
       UNIHV_DEMO_HYPERVISOR: "${UNIHV_DEMO_HYPERVISOR:-true}"
+      # Integrated VM console bridge (VNC for KVM/ESXi/Xen, RDP for Hyper-V) via guacd.
+      UNIHV_GUACD_ADDR: "guacd:4822"
       CASTOR_SELF_CONTAINER_ID: "unihv"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -107,6 +109,22 @@ services:
     command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
     volumes:
       - unihv-redisdata:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # guacd bridges the in-app interactive console to the VM's VNC (KVM/ESXi/Xen) or
+  # RDP (Hyper-V). The UniHV backend speaks the Guacamole protocol to guacd:4822 and
+  # tunnels it to the browser (guacamole-common-js). guacd must be able to reach the
+  # hypervisor's console host/port (same Docker network + host-gateway).
+  guacd:
+    image: guacamole/guacd:1.5.5
+    container_name: unihv-guacd
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     logging:
       driver: json-file
       options:
