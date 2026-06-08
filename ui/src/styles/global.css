@@ -1204,5 +1204,8 @@ li { list-style: none; }
   .app-tree { flex-basis: 240px; }
 }
 @media (max-width: 820px) {
-  .app-workspace.with-tree .app-tree { flex-basis: 200px; }
+  /* On narrow viewports the inventory tree would squeeze its labels behind the
+     collapsed sidebar rail; hide it entirely so the main content stays clean and
+     usable (the tree returns at wider widths). */
+  .app-workspace.with-tree .app-tree { display: none; }
 }
