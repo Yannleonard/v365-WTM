@@ -4,6 +4,15 @@
   <vcpu>2</vcpu>
   <os><type arch="x86_64" machine="pc">hvm</type></os>
   <devices>
+    <disk type="file" device="disk">
+      <driver name="qemu" type="qcow2"/>
+      <source file="/var/lib/libvirt/images/web-server-01.qcow2"/>
+      <target dev="vda" bus="virtio"/>
+    </disk>
+    <interface type="network">
+      <source network="default"/>
+      <model type="virtio"/>
+    </interface>
     <graphics type="vnc" port="-1" autoport="yes" listen="0.0.0.0"/>
     <video><model type="cirrus"/></video>
   </devices>

@@ -48,12 +48,10 @@ try {
   cf(); (await act('Start', wrow())) || (await act('Resume', wrow())); await sleep(3500);
   rec('power START', ok(), fails.join(',')||'ok');
 
-  // SNAPSHOT (on web-server-01 — diskless, so expect a clean ERROR surfaced, NOT silent ok)
+  // SNAPSHOT (web-server-01 now has a real disk -> must SUCCEED, no API error)
   cf(); await act('Snapshot', wrow()); await sleep(800);
-  await fillLabel('Name','e2e-snap'); await clickBtn('Create snapshot'); await sleep(2500);
-  // diskless -> the app MUST show an error (no silent success). A 4xx is the correct outcome.
-  const snapErrShown = fails.some(f=>f.startsWith('4'));
-  rec('snapshot on diskless surfaces error (no fake success)', snapErrShown, fails.join(',')||'no error shown!'); await shot('snap-err');
+  await fillLabel('Name','e2e-snap'); await clickBtn('Create snapshot'); await sleep(2800);
+  rec('snapshot CREATE on disked VM (UI->API->libvirt)', ok(), fails.join(',')||'ok'); await shot('snap');
   await page.keyboard.press('Escape').catch(()=>{});
 
   // RECONFIGURE (detail) memory to a valid value on a stopped VM
