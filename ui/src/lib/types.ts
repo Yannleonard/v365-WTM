@@ -1529,6 +1529,8 @@ export interface VMSpecDisk {
   format?: string;
   storageId?: string;
   sourcePath?: string;
+  provisioning?: string; // "thin" | "thick"
+  discard?: boolean;     // TRIM/UNMAP passthrough
 }
 
 // One NIC in a VMSpec (wizard). networkId references a GET /networks entry.

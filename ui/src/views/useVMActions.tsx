@@ -74,6 +74,8 @@ interface AddDiskForm {
   capacityGb: string;
   format: string;
   storageId: string;
+  provisioning: string; // "thin" | "thick"
+  discard: boolean;     // TRIM/UNMAP passthrough
 }
 interface AddNicForm {
   vm: VM;
@@ -210,7 +212,7 @@ export function useVMActions() {
     setMigrate({ vm, targetHost: "", live: true, targetStorage: "" });
   const triggerDelete = (vm: VM) => setDel(vm);
   const triggerAddDisk = (vm: VM) =>
-    setAddDisk({ vm, capacityGb: "10", format: "qcow2", storageId: "" });
+    setAddDisk({ vm, capacityGb: "10", format: "qcow2", storageId: "", provisioning: "thin", discard: false });
   const triggerAddNic = (vm: VM) => setAddNic({ vm, networkId: "", model: "virtio" });
   const triggerMountIso = (vm: VM) => setMountIso({ vm, storageId: "", isoPath: "" });
   // Pre-fill the resize input one GB above the current size (grow-only nudge).
@@ -325,12 +327,14 @@ export function useVMActions() {
   /* ---- hot-plug (live, no reboot) ---- */
   // diskFromForm/nicFromForm centralize the attach payload so the rich
   // reconfigure editor and the standalone "Add disk/NIC" drawers share code.
-  const attachDisk = async (vm: VM, form: { capacityGb: string; format: string; storageId: string }) => {
+  const attachDisk = async (vm: VM, form: { capacityGb: string; format: string; storageId: string; provisioning?: string; discard?: boolean }) => {
     const cap = Number(form.capacityGb);
     await api.vmDiskAttach(vm.providerId, vm.id, {
       capacityGb: Number.isFinite(cap) && cap > 0 ? cap : 1,
       format: form.format || undefined,
       storageId: form.storageId.trim() || undefined,
+      provisioning: form.provisioning || undefined,
+      discard: form.discard || undefined,
     });
   };
   const attachNic = async (vm: VM, form: { networkId: string; model: string }) => {
@@ -716,8 +720,16 @@ export function useVMActions() {
                 value={addDisk.format}
                 onChange={(e) => setAddDisk({ ...addDisk, format: e.target.value })}
               >
-                <option value="qcow2">qcow2 (thin)</option>
-                <option value="raw">raw (thick)</option>
+                <option value="qcow2">qcow2</option>
+                <option value="raw">raw</option>
+              </SelectField>
+              <SelectField
+                label="Provisioning"
+                value={addDisk.provisioning}
+                onChange={(e) => setAddDisk({ ...addDisk, provisioning: e.target.value })}
+              >
+                <option value="thin">Thin (sparse, grows on demand)</option>
+                <option value="thick">Thick (preallocated)</option>
               </SelectField>
             </div>
             <StoragePoolSelect
@@ -727,6 +739,14 @@ export function useVMActions() {
               label="Storage pool"
               allowEmpty
             />
+            <label className="row" style={{ gap: "var(--sp-2)", marginTop: "var(--sp-2)", cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={addDisk.discard}
+                onChange={(e) => setAddDisk({ ...addDisk, discard: e.target.checked })}
+              />
+              <span>Enable TRIM / discard (reclaim freed blocks — UNMAP passthrough)</span>
+            </label>
           </div>
         ) : null}
       </Drawer>
@@ -1026,7 +1046,7 @@ function ReconfigureDrawer({
   onChange: (f: ReconfigureForm) => void;
   onClose: () => void;
   onApply: () => void;
-  attachDisk: (vm: VM, f: { capacityGb: string; format: string; storageId: string }) => Promise<void>;
+  attachDisk: (vm: VM, f: { capacityGb: string; format: string; storageId: string; provisioning?: string; discard?: boolean }) => Promise<void>;
   attachNic: (vm: VM, f: { networkId: string; model: string }) => Promise<void>;
   detachDisk: (vm: VM, diskId: string) => void;
   detachNic: (vm: VM, nicId: string) => void;
@@ -1072,7 +1092,7 @@ function ReconfigureBody({
   onChange: (f: ReconfigureForm) => void;
   onClose: () => void;
   onApply: () => void;
-  attachDisk: (vm: VM, f: { capacityGb: string; format: string; storageId: string }) => Promise<void>;
+  attachDisk: (vm: VM, f: { capacityGb: string; format: string; storageId: string; provisioning?: string; discard?: boolean }) => Promise<void>;
   attachNic: (vm: VM, f: { networkId: string; model: string }) => Promise<void>;
   detachDisk: (vm: VM, diskId: string) => void;
   detachNic: (vm: VM, nicId: string) => void;
