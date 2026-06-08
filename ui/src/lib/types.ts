@@ -1506,6 +1506,138 @@ export interface Inventory {
   generatedAt: string; // RFC3339
 }
 
+/* ===================== FinOps (unified cost & rightsizing) ===================== */
+
+// The configurable rate card driving cost estimates (GET/PUT /finops/ratecard).
+// All rates are per-hour except storage, which is per-GiB per-month. Field names
+// match the backend finops.RateCard json tags verbatim.
+export interface RateCard {
+  currency: string;
+  vcpuHour: number;
+  gbRamHour: number;
+  gbStorageMonth: number;
+  containerVcpuHour: number;
+  containerGbRamHour: number;
+}
+
+// Per-dimension hourly cost split for one entity.
+export interface CostBreakdown {
+  cpuHour: number;
+  ramHour: number;
+  storageHour: number;
+}
+
+// One priced entity (a VM or a container) in the cost view.
+export interface EntityCost {
+  id: string;
+  name: string;
+  domain: "vm" | "container";
+  kind: string;
+  providerId: string;
+  hostId?: string;
+  clusterId?: string;
+  running: boolean;
+  vcpus: number;
+  memoryGb: number;
+  storageGb: number;
+  breakdown: CostBreakdown;
+  hourlyCost: number;
+  monthlyCost: number;
+}
+
+// A rolled-up cost for a grouping key (domain / hypervisor / cluster / host).
+export interface GroupCost {
+  key: string;
+  label?: string;
+  count: number;
+  hourlyCost: number;
+  monthlyCost: number;
+}
+
+// Response of GET /finops/summary — the cost overview.
+export interface FinOpsSummary {
+  currency: string;
+  totalHourly: number;
+  totalMonthly: number;
+  vmHourly: number;
+  containerHourly: number;
+  entities: number;
+  runningEntities: number;
+  byDomain: GroupCost[];
+  byHypervisor: GroupCost[];
+  byCluster: GroupCost[];
+  byHost: GroupCost[];
+  topSpenders: EntityCost[];
+  potentialMonthlySavings: number;
+  recommendations: number;
+}
+
+// Observed utilization summary backing a rightsizing recommendation.
+export interface RightsizeUtilization {
+  samples: number;
+  avgCpuPercent: number;
+  peakCpuPercent: number;
+  avgMemPercent: number;
+  peakMemPercent: number;
+}
+
+// One rightsizing recommendation with projected savings.
+export interface Recommendation {
+  entityId: string;
+  name: string;
+  domain: "vm" | "container";
+  kind: string;
+  providerId: string;
+  hostId?: string;
+  clusterId?: string;
+  recommendation: "idle" | "oversized";
+  severity: "info" | "warn" | "critical";
+  currentVcpus: number;
+  currentMemGb: number;
+  suggestedVcpus: number;
+  suggestedMemGb: number;
+  utilization: RightsizeUtilization;
+  currentMonthly: number;
+  projectedMonthly: number;
+  monthlySavings: number;
+  rationale: string;
+}
+
+// Response of GET /finops/rightsizing.
+export interface RightsizingResponse {
+  recommendations: Recommendation[];
+  potentialMonthlySavings: number;
+  currency: string;
+}
+
+/* ===================== Insights (drift / health / best-practice feed) ===================== */
+
+export type InsightSeverity = "critical" | "warn" | "info";
+export type InsightCategory = "resilience" | "reclaim" | "housekeeping" | "health";
+
+// One finding in the insights feed.
+export interface Insight {
+  id: string;
+  rule: string;
+  severity: InsightSeverity;
+  category: InsightCategory;
+  title: string;
+  detail: string;
+  suggestion: string;
+  entityId?: string;
+  entityName?: string;
+  entityType?: string;
+  providerId?: string;
+  kind?: string;
+}
+
+// Response of GET /insights.
+export interface InsightsFeed {
+  insights: Insight[];
+  counts: Record<InsightSeverity, number>;
+  generatedAt: string; // RFC3339
+}
+
 /* ===================== V2V migration (cross-hypervisor) ===================== */
 
 // Body for POST /v2v/preflight and POST /v2v/migrate. The same shape drives
@@ -1564,6 +1696,69 @@ export interface V2VProgress {
   error?: string;
   startedAt?: string; // RFC3339
   updatedAt?: string; // RFC3339
+}
+
+/* ===================== Replication (cross-hypervisor DR) ===================== */
+
+// Live DR status of a policy (mirrors replication.Status).
+export type ReplicationStatus = "idle" | "syncing" | "error" | "degraded" | "failed_over";
+
+// One replication cycle outcome (ring-buffer history entry).
+export interface ReplicationCycle {
+  startedAt: string; // RFC3339
+  finishedAt: string; // RFC3339
+  durationMs: number;
+  bytesTransferred: number;
+  replicaVmId?: string;
+  ok: boolean;
+  error?: string;
+  firstCycle: boolean;
+}
+
+// The engine's live, observable DR state for a policy.
+export interface ReplicationState {
+  status: ReplicationStatus;
+  lastSyncAt?: string; // RFC3339 (zero-value omitted)
+  lastDurationMs: number;
+  bytesTransferred: number; // cumulative
+  replicaVmId?: string;
+  lastError?: string;
+  measuredRpoSeconds: number; // achieved RPO (now - lastSyncAt)
+  rpoTargetSeconds: number; // policy interval
+  cycleCount: number;
+  history: ReplicationCycle[];
+}
+
+// The create-policy request body.
+export interface ReplicationPolicyInput {
+  name: string;
+  sourceProviderId: string;
+  sourceVmId: string;
+  targetProviderId: string;
+  targetHostId?: string;
+  intervalSeconds: number; // RPO target
+  retain: number;
+  enabled: boolean;
+}
+
+// The durable policy row merged with the live engine state.
+export interface ReplicationPolicyView {
+  id: string;
+  name: string;
+  sourceProviderId: string;
+  sourceVmId: string;
+  targetProviderId: string;
+  targetHostId?: string;
+  intervalSeconds: number;
+  retain: number;
+  enabled: boolean;
+  status: string;
+  lastSyncAt?: number; // unix seconds
+  replicaVmId?: string;
+  lastError?: string;
+  createdAt: number;
+  updatedAt: number;
+  state?: ReplicationState;
 }
 
 /* ===================== Error envelope ===================== */

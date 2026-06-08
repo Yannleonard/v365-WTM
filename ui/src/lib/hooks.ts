@@ -58,6 +58,11 @@ import type {
   VMStorage,
   Volume,
   V2VProgress,
+  ReplicationPolicyView,
+  FinOpsSummary,
+  RightsizingResponse,
+  RateCard,
+  InsightsFeed,
 } from "./types";
 
 export const DEFAULT_HOST = "local";
@@ -127,6 +132,12 @@ export const qk = {
   vmVolumes: (pid: string, sid: string) => ["vm", "volumes", pid, sid] as const,
   v2vJobs: ["v2v", "jobs"] as const,
   v2vJob: (id: string) => ["v2v", "job", id] as const,
+  replicationPolicies: ["replication", "policies"] as const,
+  replicationPolicy: (id: string) => ["replication", "policy", id] as const,
+  finopsSummary: ["finops", "summary"] as const,
+  finopsRightsizing: ["finops", "rightsizing"] as const,
+  finopsRateCard: ["finops", "ratecard"] as const,
+  insights: ["insights"] as const,
 };
 
 const POLL = 8000; // background refresh cadence for live-ish lists
@@ -655,6 +666,80 @@ export function useV2VJobs(enabled = true, opts?: Partial<UseQueryOptions<V2VPro
     queryFn: () => api.v2vJobs(),
     enabled,
     refetchInterval: 4000,
+    ...opts,
+  });
+}
+
+/** Cross-hypervisor replication (DR) policies + their live state. Polled. */
+export function useReplicationPolicies(
+  enabled = true,
+  opts?: Partial<UseQueryOptions<ReplicationPolicyView[]>>,
+) {
+  return useQuery<ReplicationPolicyView[]>({
+    queryKey: qk.replicationPolicies,
+    queryFn: () => api.replicationPolicies(),
+    enabled,
+    refetchInterval: 5000,
+    ...opts,
+  });
+}
+
+/** One replication policy with status + cycle history (polled while open). */
+export function useReplicationPolicy(
+  id: string,
+  enabled = true,
+  opts?: Partial<UseQueryOptions<ReplicationPolicyView>>,
+) {
+  return useQuery<ReplicationPolicyView>({
+    queryKey: qk.replicationPolicy(id),
+    queryFn: () => api.replicationPolicy(id),
+    enabled: enabled && !!id,
+    refetchInterval: 5000,
+    ...opts,
+  });
+}
+
+/* ===================== FinOps + Insights ===================== */
+
+/** Unified cost overview (totals, breakdowns, top spenders, savings). Live-ish. */
+export function useFinOpsSummary(opts?: Partial<UseQueryOptions<FinOpsSummary>>) {
+  return useQuery<FinOpsSummary>({
+    queryKey: qk.finopsSummary,
+    queryFn: () => api.finopsSummary(),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+    ...opts,
+  });
+}
+
+/** Rightsizing recommendations with projected savings. */
+export function useFinOpsRightsizing(opts?: Partial<UseQueryOptions<RightsizingResponse>>) {
+  return useQuery<RightsizingResponse>({
+    queryKey: qk.finopsRightsizing,
+    queryFn: () => api.finopsRightsizing(),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+    ...opts,
+  });
+}
+
+/** The current rate card (for the editor). */
+export function useRateCard(opts?: Partial<UseQueryOptions<RateCard>>) {
+  return useQuery<RateCard>({
+    queryKey: qk.finopsRateCard,
+    queryFn: () => api.finopsRateCard(),
+    staleTime: 60_000,
+    ...opts,
+  });
+}
+
+/** The cross-domain insights feed. Live-ish. */
+export function useInsights(opts?: Partial<UseQueryOptions<InsightsFeed>>) {
+  return useQuery<InsightsFeed>({
+    queryKey: qk.insights,
+    queryFn: () => api.insights(),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
     ...opts,
   });
 }

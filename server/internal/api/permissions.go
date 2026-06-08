@@ -121,11 +121,20 @@ var permissionCatalog = []string{
 	// UniHV V2V cross-hypervisor migration: read job status / run a migration.
 	"v2v.read",
 	"v2v.migrate",
+	// UniHV cross-hypervisor VM REPLICATION (DR): read policy status/RPO/history;
+	// write covers create/delete a policy + trigger a run + failover. Operator-grade.
+	"replication.read",
+	"replication.write",
 	// UniHV pluggable storage backends (SAN/NAS + cloud object stores). Read lists
 	// registered backends (secrets redacted); write covers create/test/delete +
 	// credential management — admin-grade infrastructure configuration.
 	"storage.backend.read",
 	"storage.backend.write",
+	// UniHV FinOps (unified cost & rightsizing) + Insights (drift/health rules
+	// feed). Reads are viewer-grade analytics over the unified inventory; editing
+	// the rate card / thresholds reuses settings.update (admin-grade).
+	"finops.read",
+	"insights.read",
 	// audit & settings
 	"audit.read",
 	"settings.read",

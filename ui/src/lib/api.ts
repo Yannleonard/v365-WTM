@@ -127,6 +127,14 @@ import type {
   V2VPreflightResult,
   V2VMigrateResponse,
   V2VProgress,
+  ReplicationPolicyInput,
+  ReplicationPolicyView,
+  ReplicationCycle,
+  ReplicationState,
+  FinOpsSummary,
+  RightsizingResponse,
+  RateCard,
+  InsightsFeed,
 } from "./types";
 
 export const API_BASE = "/api/v1";
@@ -841,6 +849,32 @@ export const api = {
   v2vMigrate: (body: V2VRequest) => post<V2VMigrateResponse>("/v2v/migrate", body),
   v2vJobs: () => get<V2VProgress[]>("/v2v/jobs"),
   v2vJob: (id: string) => get<V2VProgress>(`/v2v/jobs/${encId(id)}`),
+
+  /* ---- Cross-hypervisor VM replication (DR) ---- */
+  // Replicate a VM from one hypervisor to a DIFFERENT one on a schedule (RPO),
+  // with a one-click failover. Reads return the policy + its live DR state
+  // (status, measured RPO, cycle history); run/failover are operator-grade.
+  replicationPolicies: () => get<ReplicationPolicyView[]>("/replication/policies"),
+  replicationPolicy: (id: string) => get<ReplicationPolicyView>(`/replication/policies/${encId(id)}`),
+  replicationCreate: (body: ReplicationPolicyInput) =>
+    post<ReplicationPolicyView>("/replication/policies", body),
+  replicationDelete: (id: string) => del<void>(`/replication/policies/${encId(id)}`),
+  replicationRun: (id: string) => post<ReplicationCycle>(`/replication/policies/${encId(id)}/run`, {}),
+  replicationFailover: (id: string) =>
+    post<ReplicationState>(`/replication/policies/${encId(id)}/failover`, {}),
+
+  /* ---- FinOps (unified cost & rightsizing) ---- */
+  // Cost overview (totals, by-domain/hypervisor/cluster/host breakdowns, top
+  // spenders, headline savings) computed across VMs AND containers in one pass.
+  finopsSummary: () => get<FinOpsSummary>("/finops/summary"),
+  // Rightsizing recommendations (idle / oversized) with projected $ savings.
+  finopsRightsizing: () => get<RightsizingResponse>("/finops/rightsizing"),
+  // Rate card read/update. Update requires settings.update (admin) + AAL.
+  finopsRateCard: () => get<RateCard>("/finops/ratecard"),
+  finopsRateCardUpdate: (body: RateCard) => put<RateCard>("/finops/ratecard", body),
+
+  /* ---- Insights (drift / health / best-practice feed) ---- */
+  insights: () => get<InsightsFeed>("/insights"),
 
   /* ---- settings ---- */
   settings: () => get<SettingsResponse>("/settings"),

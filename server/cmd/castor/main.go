@@ -201,6 +201,9 @@ func run() error {
 	// Connect + register all enabled persisted hypervisor connections (real
 	// providers: KVM/libvirt, Hyper-V/WMI, ESXi/govmomi, Xen/XAPI). Best-effort.
 	apiServer.LoadHypervisorConnections(rootCtx)
+	// Start the cross-hypervisor replication (DR) engine and resume enabled policies
+	// (scheduled V2V cycles + RPO tracking). After connections so providers exist.
+	apiServer.LoadReplicationPolicies(rootCtx)
 	handler := apiServer.Router()
 
 	// 7. HTTP server with sane timeouts.

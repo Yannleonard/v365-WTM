@@ -48,8 +48,12 @@ var AllReadPermissions = []string{
 	"vm.storage.read",
 	"inventory.read",
 	"v2v.read",
+	"replication.read",
 	// UniHV pluggable storage backends (read). Write is admin-grade (via "*").
 	"storage.backend.read",
+	// UniHV FinOps cost & rightsizing + Insights feed (read-only analytics).
+	"finops.read",
+	"insights.read",
 	"audit.read",
 	"settings.read",
 }
@@ -127,6 +131,7 @@ var operatorExtraPermissions = []string{
 	"vm.storage.write",// create/delete volumes, upload ISOs
 	"vm.hotplug",      // live hot-attach/detach disk & NIC, mount/eject ISO (no reboot)
 	"v2v.migrate",     // run a cross-hypervisor V2V migration
+	"replication.write", // manage cross-hypervisor DR replication policies + failover
 }
 
 // Seed inserts the built-in roles, the local host row, and default settings.
@@ -178,6 +183,14 @@ func (s *Store) Seed(ctx context.Context) error {
 	// env var permanently. GetSettings falls back to 43200 (12h) for display.
 	protectedLabels, _ := json.Marshal([]string{"io.castor.protected"})
 	if err := s.seedSettingIfMissing(ctx, SettingProtectedLabels, string(protectedLabels)); err != nil {
+		return err
+	}
+	// UniHV FinOps default rate card (USD; small-cloud-like list prices). Seeded so
+	// the cost view is meaningful on first run; operators tune it from Settings.
+	// Mirrors finops.DefaultRateCard() — kept as a literal to avoid a store->finops
+	// import. The API hydrates/overrides from this same key.
+	if err := s.seedSettingIfMissing(ctx, SettingFinOpsRateCard,
+		`{"currency":"USD","vcpuHour":0.04,"gbRamHour":0.005,"gbStorageMonth":0.1,"containerVcpuHour":0.02,"containerGbRamHour":0.003}`); err != nil {
 		return err
 	}
 	return nil

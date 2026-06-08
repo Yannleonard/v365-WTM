@@ -14,6 +14,12 @@ const (
 	SettingTOTPRequiredForMut = "security.totp_required_for_mutations"
 	SettingSessionTTLSeconds  = "session.ttl_seconds"
 	SettingProtectedLabels    = "security.protected_labels"
+	// UniHV FinOps + Insights: a JSON rate card and JSON threshold blobs persisted
+	// in the same settings table (no new migration needed). Absent => engine
+	// defaults apply.
+	SettingFinOpsRateCard       = "finops.ratecard"
+	SettingFinOpsThresholds     = "finops.thresholds"
+	SettingInsightsThresholds   = "insights.thresholds"
 )
 
 // GetSetting returns a setting value by key.

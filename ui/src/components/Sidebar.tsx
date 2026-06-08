@@ -15,6 +15,7 @@ import {
   IconWorkloads,
   IconVM,
   IconMigrate,
+  IconRefresh,
   IconMarketplace,
   IconStacks,
   IconImages,
@@ -28,6 +29,8 @@ import {
   IconRoles,
   IconShield,
   IconSettings,
+  IconStats,
+  IconAlert,
 } from "./icons";
 import { BrandLock } from "./BrandLock";
 
@@ -49,6 +52,8 @@ const GROUPS: NavGroup[] = [
     label: "Overview",
     items: [
       { to: "/", label: "Dashboard", icon: <IconDashboard size={18} /> },
+      { to: "/finops", label: "Cost (FinOps)", icon: <IconStats size={18} />, perms: ["finops.read"] },
+      { to: "/insights", label: "Insights", icon: <IconAlert size={18} />, perms: ["insights.read"] },
       { to: "/hosts", label: "Hosts", icon: <IconHosts size={18} /> },
     ],
   },
@@ -73,6 +78,7 @@ const GROUPS: NavGroup[] = [
       { to: "/vm-storage", label: "VM Storage", icon: <IconVolumes size={18} />, perms: ["vm.storage.read", "vm.storage.write", "vm.read"] },
       { to: "/storage-backends", label: "Storage Backends", icon: <IconVolumes size={18} />, perms: ["storage.backend.read", "storage.backend.write"] },
       { to: "/migration", label: "Migration (V2V)", icon: <IconMigrate size={18} />, perms: ["v2v.read"] },
+      { to: "/replication", label: "Replication (DR)", icon: <IconRefresh size={18} />, perms: ["replication.read"] },
     ],
   },
   {

@@ -17,6 +17,7 @@ import (
 	"github.com/gtek-it/castor/server/internal/inventory"
 	"github.com/gtek-it/castor/server/internal/migrate"
 	"github.com/gtek-it/castor/server/internal/provider"
+	"github.com/gtek-it/castor/server/internal/replication"
 	"github.com/gtek-it/castor/server/internal/store"
 	"github.com/gtek-it/castor/server/internal/vprovider"
 )
@@ -36,6 +37,9 @@ type Server struct {
 	vreg   *vprovider.Registry
 	agg    *inventory.Aggregator
 	migEng *migrate.Engine
+	// replEng drives cross-hypervisor VM replication (DR): scheduled V2V cycles +
+	// RPO tracking + failover. It reuses the V2V migrate pipeline under the hood.
+	replEng *replication.Engine
 }
 
 // NewServer constructs the API server. vreg is the hypervisor registry (may be an
@@ -56,6 +60,10 @@ func NewServer(cfg *config.Config, st *store.Store, az *authz.Deps, guard *authz
 	}
 	s.agg = inventory.New(vreg, containerSnapshotAdapter{mgr: mgr})
 	s.migEng = migrate.New(vreg, nil) // nil -> qemu-img converter (passthrough fallback)
+	// Replication engine reuses the SAME converter selection as the V2V engine and
+	// persists per-policy DR summaries to the store. Scheduling starts in
+	// LoadReplicationPolicies (called from main after providers are registered).
+	s.replEng = replication.New(vreg, nil, st)
 	return s
 }
 

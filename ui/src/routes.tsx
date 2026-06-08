@@ -11,6 +11,8 @@ import { Login } from "./views/Login";
 import { TotpChallenge } from "./views/TotpChallenge";
 import { Bootstrap } from "./views/Bootstrap";
 import { Dashboard } from "./views/Dashboard";
+import { FinOps } from "./views/FinOps";
+import { Insights } from "./views/Insights";
 import { Hosts } from "./views/Hosts";
 import { Workloads } from "./views/Workloads";
 import { WorkloadDetail } from "./views/WorkloadDetail";
@@ -23,6 +25,7 @@ import { VMClusters } from "./views/VMClusters";
 import { HypervisorConnections } from "./views/HypervisorConnections";
 import { StorageBackends } from "./views/StorageBackends";
 import { Migration } from "./views/Migration";
+import { Replication } from "./views/Replication";
 import { Stacks } from "./views/Stacks";
 import { StackEditor } from "./views/StackEditor";
 import { Marketplace } from "./views/Marketplace";
@@ -58,6 +61,22 @@ export const router = createBrowserRouter([
     ),
     children: [
       { index: true, element: <Dashboard /> },
+      {
+        path: "finops",
+        element: (
+          <RequirePerm anyOf={["finops.read", "*"]}>
+            <FinOps />
+          </RequirePerm>
+        ),
+      },
+      {
+        path: "insights",
+        element: (
+          <RequirePerm anyOf={["insights.read", "*"]}>
+            <Insights />
+          </RequirePerm>
+        ),
+      },
       { path: "hosts", element: <Hosts /> },
       { path: "workloads", element: <Workloads /> },
       { path: "workloads/:hostId/:id", element: <WorkloadDetail /> },
@@ -130,6 +149,14 @@ export const router = createBrowserRouter([
         element: (
           <RequirePerm anyOf={["v2v.read", "*"]}>
             <Migration />
+          </RequirePerm>
+        ),
+      },
+      {
+        path: "replication",
+        element: (
+          <RequirePerm anyOf={["replication.read", "*"]}>
+            <Replication />
           </RequirePerm>
         ),
       },
