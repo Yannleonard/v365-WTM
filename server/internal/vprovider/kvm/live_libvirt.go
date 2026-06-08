@@ -1537,16 +1537,91 @@ func (b *liveBackend) exportDisk(uuid string, format vp.DiskFormat) (io.ReadClos
 	}
 	toTok := qemuExportFormat(format)
 	outPath := filepath.Join(tmpDir, "disk."+toTok)
-	// qemu-img convert -U -O <fmt> <src> <out>
-	//   -U forces a SHARED lock so a RUNNING VM's disk can be exported (otherwise
-	//      libvirt's exclusive write lock makes qemu-img fail "Failed to get lock").
-	//      This is the standard live-export approach; the snapshot is crash-consistent.
-	//   -O selects the target format; the source format is auto-detected.
-	cmd := exec.Command(qemuImg, "convert", "-U", "-O", toTok, srcPath, outPath)
+
+	// Two deployment shapes are supported, transparently:
+	//
+	//  (1) LOCAL fast-path — the app process shares a filesystem with libvirtd
+	//      (e.g. running directly in WSL for kvmprobe, or co-located on the host).
+	//      Detected by os.Stat(srcPath) succeeding. We point qemu-img straight at
+	//      the host path, which is the fastest route (no byte copy over RPC).
+	//
+	//  (2) REMOTE RPC stream — the app runs in a container connected to libvirt
+	//      over tcp:// and CANNOT see the host's images directory. os.Stat fails
+	//      with NotExist. We pull the raw volume bytes over the SAME libvirt TCP
+	//      connection via StorageVolDownload (a virStream), land them in a
+	//      container-writable temp file, then convert that LOCAL copy with qemu-img.
+	//      The host path is used only as a libvirt KEY (StorageVolLookupByPath),
+	//      never opened on the local filesystem.
+	if _, statErr := os.Stat(srcPath); statErr == nil {
+		// (1) LOCAL fast-path.
+		// qemu-img convert -U -O <fmt> <src> <out>
+		//   -U forces a SHARED lock so a RUNNING VM's disk can be exported (otherwise
+		//      libvirt's exclusive write lock makes qemu-img fail "Failed to get lock").
+		//      This is the standard live-export approach; the snapshot is crash-consistent.
+		//   -O selects the target format; the source format is auto-detected.
+		cmd := exec.Command(qemuImg, "convert", "-U", "-O", toTok, srcPath, outPath)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			os.RemoveAll(tmpDir)
+			return nil, 0, fmt.Errorf("qemu-img export convert failed: %v: %s", err, string(out))
+		}
+		return openExport(outPath, tmpDir)
+	}
+
+	// (2) REMOTE RPC stream-download path.
+	srcCopy := filepath.Join(tmpDir, "src.img")
+	if err := b.downloadVolumeRPC(l, srcPath, srcCopy); err != nil {
+		os.RemoveAll(tmpDir)
+		return nil, 0, err
+	}
+	// Convert the locally-downloaded copy to the requested target format. The
+	// source format is auto-detected from the qcow2/raw header in the bytes we
+	// just streamed. No -U needed: this is a private temp copy, not a live image.
+	cmd := exec.Command(qemuImg, "convert", "-O", toTok, srcCopy, outPath)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		os.RemoveAll(tmpDir)
-		return nil, 0, fmt.Errorf("qemu-img export convert failed: %v: %s", err, string(out))
+		return nil, 0, fmt.Errorf("qemu-img export convert (rpc) failed: %v: %s", err, string(out))
 	}
+	// The intermediate downloaded source is no longer needed once converted.
+	_ = os.Remove(srcCopy)
+	return openExport(outPath, tmpDir)
+}
+
+// downloadVolumeRPC streams the bytes of the storage volume identified by its
+// host path (srcPath, used only as a libvirt lookup KEY) over the libvirt RPC
+// connection into dstPath on the LOCAL/container filesystem. This is what makes
+// disk export work when the app runs in a container with no access to the
+// hypervisor's images directory.
+//
+// StorageVolDownload opens the volume read-only and streams it with a SHARED
+// lock, so a RUNNING VM's disk can be downloaded (crash-consistent point-in-time
+// copy, the RPC equivalent of qemu-img's -U). Length 0 == download the whole
+// volume.
+func (b *liveBackend) downloadVolumeRPC(l *libvirt.Libvirt, srcPath, dstPath string) error {
+	vol, err := l.StorageVolLookupByPath(srcPath)
+	if err != nil {
+		b.fail(err)
+		return fmt.Errorf("export: storage volume not found for %q over RPC: %w", srcPath, mapLibvirtErr(err))
+	}
+	dst, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	// Stream the full volume (offset 0, length 0 = whole volume). go-libvirt
+	// drives the virStream and writes received chunks into dst.
+	if err := l.StorageVolDownload(vol, dst, 0, 0, 0); err != nil {
+		_ = dst.Close()
+		b.fail(err)
+		return fmt.Errorf("export: StorageVolDownload stream failed for %q: %w", srcPath, mapLibvirtErr(err))
+	}
+	if err := dst.Close(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// openExport opens a freshly-produced export file and wraps it so closing the
+// reader also removes the working temp dir.
+func openExport(outPath, tmpDir string) (io.ReadCloser, int64, error) {
 	f, err := os.Open(outPath)
 	if err != nil {
 		os.RemoveAll(tmpDir)
@@ -1557,7 +1632,6 @@ func (b *liveBackend) exportDisk(uuid string, format vp.DiskFormat) (io.ReadClos
 	if fi != nil {
 		size = fi.Size()
 	}
-	// Wrap so closing the reader also removes the temp dir.
 	return &cleanupReadCloser{f: f, dir: tmpDir}, size, nil
 }
 
