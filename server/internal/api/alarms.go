@@ -2,6 +2,9 @@ package api
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -17,7 +20,12 @@ import (
 // --- adapters bridging the alarms engine to the store + hypervisor registry ---
 
 // alarmStoreAdapter maps the durable store rows to the alarms engine's interfaces.
-type alarmStoreAdapter struct{ st *store.Store }
+// secretKey opens the sealed SMTP password so the engine can authenticate on
+// dispatch (it is NEVER exposed beyond the engine notifier).
+type alarmStoreAdapter struct {
+	st        *store.Store
+	secretKey []byte
+}
 
 func (a alarmStoreAdapter) ListDefinitions(ctx context.Context) ([]alarms.Definition, error) {
 	rows, err := a.st.ListAlarmDefinitions(ctx)
@@ -38,7 +46,7 @@ func (a alarmStoreAdapter) ListChannels(ctx context.Context) ([]alarms.Channel, 
 	}
 	out := make([]alarms.Channel, 0, len(rows))
 	for _, c := range rows {
-		out = append(out, chToEngine(c))
+		out = append(out, a.chToEngine(c))
 	}
 	return out, nil
 }
@@ -48,7 +56,23 @@ func (a alarmStoreAdapter) GetChannel(ctx context.Context, id string) (alarms.Ch
 	if err != nil {
 		return alarms.Channel{}, false
 	}
-	return chToEngine(c), true
+	return a.chToEngine(c), true
+}
+
+// chToEngine maps a store channel row to the engine Channel, opening the sealed
+// SMTP password into Channel.Secret so the notifier can authenticate. A failure to
+// open is logged WITHOUT the secret and yields an empty password (the SMTP send
+// then surfaces a clear auth error rather than silently using a wrong secret).
+func (a alarmStoreAdapter) chToEngine(c *store.AlarmChannel) alarms.Channel {
+	ch := alarms.Channel{ID: c.ID, Name: c.Name, Type: alarms.ChannelType(c.Type), Config: c.Config}
+	if len(c.ConfigSecret) > 0 && len(a.secretKey) == 32 {
+		if pw, err := authz.OpenSecret(a.secretKey, c.ConfigSecret); err == nil {
+			ch.Secret = string(pw)
+		} else {
+			log.Printf("alarms: failed to open sealed secret for channel %s: %v", c.ID, err)
+		}
+	}
+	return ch
 }
 
 func (a alarmStoreAdapter) SaveInstances(ctx context.Context, insts []alarms.Instance) error {
@@ -131,9 +155,6 @@ func defToEngine(d *store.AlarmDefinition) alarms.Definition {
 	}
 }
 
-func chToEngine(c *store.AlarmChannel) alarms.Channel {
-	return alarms.Channel{ID: c.ID, Name: c.Name, Type: alarms.ChannelType(c.Type), Config: c.Config}
-}
 
 // --- request bodies ---
 
@@ -176,10 +197,27 @@ func (in alarmDefInput) validate() error {
 	return nil
 }
 
+// smtpChannelInput is the structured SMTP config sent by the UI when type=smtp.
+// The password is accepted here, sealed at rest (authz.SealSecret) and NEVER
+// stored/returned/logged in plaintext.
+type smtpChannelInput struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	From     string `json:"from"`
+	To       string `json:"to"`
+	UseTLS   bool   `json:"useTLS"`
+	StartTLS bool   `json:"startTLS"`
+}
+
 type alarmChannelInput struct {
-	Name   string `json:"name"`
-	Type   string `json:"type"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+	// Config is the raw destination for webhook (URL) / email-stub (address).
 	Config string `json:"config"`
+	// SMTP carries the structured config when Type == smtp.
+	SMTP *smtpChannelInput `json:"smtp"`
 }
 
 func (in alarmChannelInput) validate() error {
@@ -187,12 +225,64 @@ func (in alarmChannelInput) validate() error {
 		return authz.Errorf(authz.ErrValidation, "name is required")
 	}
 	if !alarms.ChannelType(in.Type).Valid() {
-		return authz.Errorf(authz.ErrValidation, "invalid type (webhook|email-stub)")
+		return authz.Errorf(authz.ErrValidation, "invalid type (webhook|email-stub|smtp)")
 	}
-	if alarms.ChannelType(in.Type) == alarms.ChannelWebhook && strings.TrimSpace(in.Config) == "" {
-		return authz.Errorf(authz.ErrValidation, "config (webhook URL) is required for a webhook channel")
+	switch alarms.ChannelType(in.Type) {
+	case alarms.ChannelWebhook:
+		if strings.TrimSpace(in.Config) == "" {
+			return authz.Errorf(authz.ErrValidation, "config (webhook URL) is required for a webhook channel")
+		}
+	case alarms.ChannelEmail:
+		if strings.TrimSpace(in.Config) == "" {
+			return authz.Errorf(authz.ErrValidation, "config (email address) is required for an email-stub channel")
+		}
+	case alarms.ChannelSMTP:
+		if in.SMTP == nil {
+			return authz.Errorf(authz.ErrValidation, "smtp config is required for an smtp channel")
+		}
+		if strings.TrimSpace(in.SMTP.Host) == "" {
+			return authz.Errorf(authz.ErrValidation, "smtp host is required")
+		}
+		if strings.TrimSpace(in.SMTP.From) == "" {
+			return authz.Errorf(authz.ErrValidation, "smtp from address is required")
+		}
+		if strings.TrimSpace(in.SMTP.To) == "" {
+			return authz.Errorf(authz.ErrValidation, "smtp to address is required")
+		}
 	}
 	return nil
+}
+
+// buildChannelConfig turns an input into the persisted (config string, sealed
+// password BLOB). For smtp it serialises the non-secret SMTPConfig as JSON and
+// seals the password separately; for other types the password is empty.
+func (s *Server) buildChannelConfig(in alarmChannelInput) (cfg string, sealed []byte, err error) {
+	if alarms.ChannelType(in.Type) != alarms.ChannelSMTP {
+		return strings.TrimSpace(in.Config), nil, nil
+	}
+	sc := alarms.SMTPConfig{
+		Host:     strings.TrimSpace(in.SMTP.Host),
+		Port:     in.SMTP.Port,
+		Username: strings.TrimSpace(in.SMTP.Username),
+		From:     strings.TrimSpace(in.SMTP.From),
+		To:       strings.TrimSpace(in.SMTP.To),
+		UseTLS:   in.SMTP.UseTLS,
+		StartTLS: in.SMTP.StartTLS,
+	}
+	if sc.Port <= 0 {
+		sc.Port = 587
+	}
+	b, err := json.Marshal(sc)
+	if err != nil {
+		return "", nil, err
+	}
+	if pw := in.SMTP.Password; pw != "" {
+		sealed, err = authz.SealSecret(s.cfg.SecretKey, []byte(pw))
+		if err != nil {
+			return "", nil, err
+		}
+	}
+	return string(b), sealed, nil
 }
 
 // --- definition handlers ---
@@ -314,11 +404,20 @@ func (s *Server) CreateAlarmChannel(w http.ResponseWriter, r *http.Request) {
 		authz.WriteError(w, r, err)
 		return
 	}
-	rec := &store.AlarmChannel{ID: store.NewUUID(), Name: in.Name, Type: in.Type, Config: in.Config}
+	cfg, sealed, err := s.buildChannelConfig(in)
+	if err != nil {
+		authz.WriteError(w, r, err)
+		return
+	}
+	rec := &store.AlarmChannel{
+		ID: store.NewUUID(), Name: in.Name, Type: in.Type, Config: cfg, ConfigSecret: sealed,
+	}
 	if err := s.store.CreateAlarmChannel(r.Context(), rec); err != nil {
 		authz.WriteError(w, r, err)
 		return
 	}
+	// Never echo the sealed secret back; HasSecret is the safe flag.
+	rec.ConfigSecret = nil
 	created(w, rec)
 }
 
@@ -339,8 +438,15 @@ func (s *Server) TestAlarmChannel(w http.ResponseWriter, r *http.Request) {
 		authz.WriteError(w, r, err)
 		return
 	}
-	n := &alarms.HTTPNotifier{}
-	n.SendTest(context.Background(), chToEngine(c))
+	adapter := alarmStoreAdapter{st: s.store, secretKey: s.cfg.SecretKey}
+	ch := adapter.chToEngine(c)
+	n := alarms.NewHTTPNotifier(s.cfg)
+	// Real delivery: a webhook POST / SMTP send / logged stub. Surface a CLEAR
+	// error to the operator on failure — no false-success (travaux.md §7.4).
+	if err := n.SendTest(r.Context(), ch); err != nil {
+		authz.WriteError(w, r, authz.Errorf(authz.ErrValidation, fmt.Sprintf("test failed: %v", err)))
+		return
+	}
 	ok(w, ActionResult{OK: true})
 }
 

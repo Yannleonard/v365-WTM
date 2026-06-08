@@ -11,6 +11,8 @@ package esxi
 
 import (
 	"context"
+	"io"
+	"strings"
 	"testing"
 
 	"github.com/vmware/govmomi/simulator"
@@ -209,6 +211,51 @@ func TestLiveVSphere_RealClientPath_VCSim(t *testing.T) {
 		if v.ID == newID {
 			t.Errorf("deleted VM %q still present after Destroy_Task", newID)
 		}
+	}
+
+	// --- REAL export via HttpNfcLease (ExportVm -> device-URL download) ---
+	// This is the travaux.md §4.2 proof: the live govmomi backend exports a VM over a
+	// real HttpNfcLease against the official vcsim simulator. We assert a real byte
+	// stream (the stream-optimized VMDK device file) — NOT the in-memory placeholder.
+	{
+		rc, info, err := p.ExportVM(ctx, target.ID, vp.DiskVMDK)
+		if err != nil {
+			t.Fatalf("ExportVM(live/vcsim): %v", err)
+		}
+		if rc == nil || info == nil {
+			t.Fatal("ExportVM returned nil stream/info on the live path")
+		}
+		defer rc.Close()
+		if info.Format != vp.DiskVMDK {
+			t.Errorf("export format=%q want vmdk", info.Format)
+		}
+		if info.SourceVMID != target.ID {
+			t.Errorf("export sourceVmId=%q want %q", info.SourceVMID, target.ID)
+		}
+		if info.DiskCount < 1 {
+			t.Errorf("export diskCount=%d want >=1", info.DiskCount)
+		}
+		// SizeBytes is the lease-reported total. Per the contract it may legitimately be
+		// 0 ("unknown/streamed") — vcsim reports FileSize=0 for its synthetic device
+		// files, whereas a real ESXi/vCenter host reports the true VMDK size. We assert
+		// it is never negative; the real-byte count below is the load-bearing proof.
+		if info.SizeBytes < 0 {
+			t.Errorf("export sizeBytes=%d must not be negative", info.SizeBytes)
+		}
+		buf, err := io.ReadAll(rc)
+		if err != nil {
+			t.Fatalf("draining export stream: %v", err)
+		}
+		if len(buf) == 0 {
+			t.Fatal("export stream yielded 0 bytes from the real HttpNfcLease")
+		}
+		// Hard proof this is NOT the sim placeholder ("VSPHEREEXPORT..."): the live path
+		// must never emit that token.
+		if strings.HasPrefix(string(buf), "VSPHEREEXPORT") {
+			t.Fatal("live export returned the sim PLACEHOLDER, not real disk bytes")
+		}
+		t.Logf("live HttpNfcLease export: %d bytes streamed, lease-reported size=%d, disks=%d",
+			len(buf), info.SizeBytes, info.DiskCount)
 	}
 
 	// --- vMotion / relocate to another host (RelocateVM_Task), if >1 host ---

@@ -1853,7 +1853,7 @@ export type AlarmSeverity = "info" | "warning" | "critical";
 export type AlarmTarget = "vm" | "host" | "datastore";
 export type AlarmMetric = "cpu" | "memory" | "disk" | "storage_pct" | "state";
 export type AlarmComparator = "gt" | "lt" | "eq";
-export type AlarmChannelType = "webhook" | "email-stub";
+export type AlarmChannelType = "webhook" | "email-stub" | "smtp";
 
 // A user-defined alarm definition (GET/POST /alarms/definitions).
 export interface AlarmDefinition {
@@ -1904,20 +1904,37 @@ export interface AlarmInstance {
   lastNotifiedAt?: string;
 }
 
-// A notification channel (GET/POST /alarms/channels).
+// A notification channel (GET/POST /alarms/channels). For smtp channels `config`
+// is a JSON-encoded SMTPConfig (host/port/username/from/to/tls — never the
+// password) and `hasSecret` reports whether a sealed SMTP password is stored.
 export interface AlarmChannel {
   id: string;
   name: string;
   type: AlarmChannelType;
   config: string;
+  hasSecret?: boolean;
   createdAt: number;
   updatedAt: number;
+}
+
+// Structured SMTP config sent when creating an smtp channel. The password is
+// sealed server-side (authz.SealSecret) and never returned.
+export interface AlarmSmtpInput {
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+  from: string;
+  to: string;
+  useTLS?: boolean;
+  startTLS?: boolean;
 }
 
 export interface AlarmChannelInput {
   name: string;
   type: AlarmChannelType;
-  config: string;
+  config?: string; // webhook URL / email-stub address
+  smtp?: AlarmSmtpInput; // present when type === "smtp"
 }
 
 /* ===================== V2V migration (cross-hypervisor) ===================== */

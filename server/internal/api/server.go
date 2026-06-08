@@ -80,8 +80,8 @@ func NewServer(cfg *config.Config, st *store.Store, az *authz.Deps, guard *authz
 	s.alarmEng = alarms.New(
 		s.agg,
 		alarmMetricsAdapter{vreg: vreg},
-		alarmStoreAdapter{st: st},
-		&alarms.HTTPNotifier{},
+		alarmStoreAdapter{st: st, secretKey: cfg.SecretKey},
+		alarms.NewHTTPNotifier(cfg),
 		30*time.Second,
 	)
 	// Backup engine (Lot 5B): snapshot -> export -> store to a storage backend.

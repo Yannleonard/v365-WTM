@@ -1,10 +1,14 @@
 package alarms
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -138,6 +142,7 @@ func TestStateMachine_DisabledDefinitionIgnored(t *testing.T) {
 
 // TestWebhookPayloadShape verifies the real HTTP POST body shape on a raise.
 func TestWebhookPayloadShape(t *testing.T) {
+
 	var got NotifyEvent
 	var gotCT string
 	done := make(chan struct{})
@@ -167,6 +172,209 @@ func TestWebhookPayloadShape(t *testing.T) {
 	}
 	if got.Event != "raised" || got.Severity != SeverityCritical || got.ObjectName != "web" || got.Value != 97 {
 		t.Fatalf("unexpected webhook payload: %+v", got)
+	}
+}
+
+func startFakeSMTPServer(t *testing.T) (host string, port int, emails <-chan string, close func()) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	emailsCh := make(chan string, 1)
+	go func() {
+		defer ln.Close()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		w := func(s string) { _, _ = conn.Write([]byte(s)) }
+		r := bufio.NewReader(conn)
+		w("220 localhost ESMTP\r\n")
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				return
+			}
+			cmd := strings.TrimSpace(line)
+			switch {
+			case strings.HasPrefix(cmd, "EHLO"), strings.HasPrefix(cmd, "HELO"):
+				w("250-localhost\r\n250 AUTH PLAIN LOGIN\r\n")
+			case strings.HasPrefix(cmd, "MAIL FROM:"):
+				w("250 OK\r\n")
+			case strings.HasPrefix(cmd, "RCPT TO:"):
+				w("250 OK\r\n")
+			case strings.HasPrefix(cmd, "DATA"):
+				w("354 End data with <CR><LF>.<CR><LF>\r\n")
+				var email strings.Builder
+				for {
+					line, err := r.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if line == ".\r\n" {
+						break
+					}
+					email.WriteString(line)
+				}
+				emailsCh <- email.String()
+				w("250 OK\r\n")
+			case strings.HasPrefix(cmd, "QUIT"):
+				w("221 Bye\r\n")
+				return
+			default:
+				w("250 OK\r\n")
+			}
+		}
+	}()
+	addr := ln.Addr().String()
+	host, portStr, _ := net.SplitHostPort(addr)
+	port, _ = strconv.Atoi(portStr)
+	return host, port, emailsCh, func() { _ = ln.Close() }
+}
+
+// smtpChannelJSON builds a smtp channel whose Config holds the JSON SMTPConfig
+// for a (host, port) — mirroring how the API layer persists it.
+func smtpChannelJSON(t *testing.T, host string, port int) Channel {
+	t.Helper()
+	b, err := json.Marshal(SMTPConfig{Host: host, Port: port, From: "noreply@example.com", To: "ops@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Channel{ID: "c1", Name: "ops", Type: ChannelSMTP, Config: string(b)}
+}
+
+// TestSMTPNotifierSendsEmail proves a REAL SMTP send over a plain connection,
+// using per-channel config (host/port/from/to JSON). The fake SMTP server
+// captures the wire message; we assert RFC5322 headers + the alarm body.
+func TestSMTPNotifierSendsEmail(t *testing.T) {
+	host, port, emailsCh, stopSMTP := startFakeSMTPServer(t)
+	defer stopSMTP()
+	msgCh := make(chan string, 1)
+	go func() {
+		select {
+		case msg := <-emailsCh:
+			msgCh <- msg
+		case <-time.After(3 * time.Second):
+			close(msgCh)
+		}
+	}()
+	n := &HTTPNotifier{Client: http.DefaultClient}
+	err := n.Send(context.Background(), smtpChannelJSON(t, host, port), NotifyEvent{
+		Event: "raised", AlarmID: "d1:vm1", Definition: "CPU>90", Severity: SeverityCritical,
+		ObjectID: "vm1", ObjectName: "web", ObjectType: "vm", Metric: "cpu", Value: 97,
+		Message: "boom", Timestamp: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("Send returned error: %v", err)
+	}
+	msg, ok := <-msgCh
+	if !ok {
+		t.Fatal("SMTP server did not receive a message")
+	}
+	if !strings.Contains(msg, "Subject: UniHV alarm: CPU>90") {
+		t.Fatalf("unexpected email subject payload: %q", msg)
+	}
+	if !strings.Contains(msg, "boom") {
+		t.Fatalf("expected email body to contain the alarm message, got %q", msg)
+	}
+	if !strings.Contains(msg, "From: noreply@example.com") || !strings.Contains(msg, "To: ops@example.com") {
+		t.Fatalf("missing From/To headers: %q", msg)
+	}
+	if !strings.Contains(msg, "Date: ") {
+		t.Fatalf("missing Date header (RFC5322): %q", msg)
+	}
+}
+
+// TestSMTPSendErrorOnUnreachableHost proves a REAL error is returned (no
+// false-success) when the SMTP server is unreachable.
+func TestSMTPSendErrorOnUnreachableHost(t *testing.T) {
+	n := &HTTPNotifier{Client: http.DefaultClient}
+	// 127.0.0.1:1 is reserved/closed — connection must fail fast.
+	ch := smtpChannelJSON(t, "127.0.0.1", 1)
+	err := n.SendTest(context.Background(), ch)
+	if err == nil {
+		t.Fatal("expected a clear SMTP error for an unreachable host, got nil")
+	}
+}
+
+// TestBuildEmailMessageRFC5322 asserts the composed message has the required
+// RFC5322 headers in order with CRLF line endings and a blank line before body.
+func TestBuildEmailMessageRFC5322(t *testing.T) {
+	now := time.Date(2026, 6, 8, 12, 30, 0, 0, time.UTC)
+	ev := NotifyEvent{
+		Event: "raised", AlarmID: "d1:vm1", Definition: "CPU>90", Severity: SeverityCritical,
+		ObjectName: "web", ObjectType: "vm", Metric: "cpu", Value: 97.5,
+		Message: "alarm body", Timestamp: now,
+	}
+	msg := BuildEmailMessage("from@x.test", "a@x.test, b@x.test", "Sub", ev, now)
+	for _, h := range []string{
+		"From: from@x.test\r\n", "To: a@x.test, b@x.test\r\n", "Subject: Sub\r\n",
+		"Date: ", "MIME-Version: 1.0\r\n", "Content-Type: text/plain; charset=utf-8\r\n",
+	} {
+		if !strings.Contains(msg, h) {
+			t.Fatalf("missing header %q in:\n%s", h, msg)
+		}
+	}
+	headerEnd := strings.Index(msg, "\r\n\r\n")
+	if headerEnd < 0 {
+		t.Fatalf("no header/body separator (blank line) in:\n%s", msg)
+	}
+	if !strings.Contains(msg[headerEnd:], "alarm body") {
+		t.Fatalf("body missing the message text:\n%s", msg)
+	}
+	if !strings.Contains(msg, "Value: 97.50\r\n") {
+		t.Fatalf("expected formatted Value header:\n%s", msg)
+	}
+}
+
+// TestParseSMTPConfigValidation covers the config validation paths.
+func TestParseSMTPConfigValidation(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		wantErr bool
+	}{
+		{"empty", "", true},
+		{"bad-json", "{not json", true},
+		{"no-host", `{"from":"a@x","to":"b@x"}`, true},
+		{"no-from", `{"host":"h","to":"b@x"}`, true},
+		{"no-to", `{"host":"h","from":"a@x"}`, true},
+		{"ok", `{"host":"h","from":"a@x","to":"b@x"}`, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg, err := ParseSMTPConfig(c.raw)
+			if c.wantErr && err == nil {
+				t.Fatalf("expected error for %q", c.raw)
+			}
+			if !c.wantErr {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if cfg.Port != 587 {
+					t.Fatalf("expected default port 587, got %d", cfg.Port)
+				}
+			}
+		})
+	}
+}
+
+// TestStubVsSMTPDispatch proves the explicit stub mode logs (never errors, never
+// sends) while smtp performs a real send — the two email options are distinct.
+func TestStubVsSMTPDispatch(t *testing.T) {
+	n := &HTTPNotifier{Client: http.DefaultClient}
+	// email-stub: always succeeds, no network, even with a nonsense config.
+	if err := n.Send(context.Background(), Channel{Name: "ci", Type: ChannelEmail, Config: "ops@x.test"}, NotifyEvent{
+		Event: "test", Message: "stub", Timestamp: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("email-stub must never error, got %v", err)
+	}
+	// smtp with empty config: must error (no false-success).
+	if err := n.Send(context.Background(), Channel{Name: "real", Type: ChannelSMTP, Config: ""}, NotifyEvent{
+		Event: "test", Message: "x", Timestamp: time.Now().UTC(),
+	}); err == nil {
+		t.Fatal("smtp with empty config must error")
 	}
 }
 

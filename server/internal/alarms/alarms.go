@@ -23,14 +23,18 @@ package alarms
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"net/smtp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/gtek-it/castor/server/internal/config"
 	"github.com/gtek-it/castor/server/internal/inventory"
 	"github.com/gtek-it/castor/server/internal/vprovider"
 )
@@ -113,12 +117,13 @@ type ChannelType string
 
 const (
 	ChannelWebhook ChannelType = "webhook"    // real HTTP POST of the payload JSON
-	ChannelEmail   ChannelType = "email-stub" // logged stub (no SMTP dependency)
+	ChannelEmail   ChannelType = "email-stub" // logged stub (CI/offline, no SMTP)
+	ChannelSMTP    ChannelType = "smtp"       // real SMTP delivery via net/smtp
 )
 
 func (c ChannelType) Valid() bool {
 	switch c {
-	case ChannelWebhook, ChannelEmail:
+	case ChannelWebhook, ChannelEmail, ChannelSMTP:
 		return true
 	}
 	return false
@@ -141,11 +146,58 @@ type Definition struct {
 }
 
 // Channel is a notification destination.
+//
+// For webhook channels Config is the target URL; for email-stub it is the
+// recipient address (logged only). For smtp channels Config is a JSON-encoded
+// SMTPConfig (host/port/username/from/to/tls — NEVER the password) and Secret
+// carries the SMTP password in plaintext, opened from the sealed store BLOB by
+// the API layer at dispatch/test time. Secret is intentionally json:"-" so it is
+// never serialised back to a client.
 type Channel struct {
 	ID     string      `json:"id"`
 	Name   string      `json:"name"`
 	Type   ChannelType `json:"type"`
-	Config string      `json:"config"` // webhook URL, or email address (stub)
+	Config string      `json:"config"` // webhook URL, stub address, or smtp JSON config
+	Secret string      `json:"-"`      // smtp password (opened from sealed store BLOB)
+}
+
+// SMTPConfig is the non-secret SMTP channel configuration carried in Channel.Config
+// as JSON. The password is NEVER part of this struct — it is sealed at rest and
+// passed separately via Channel.Secret.
+type SMTPConfig struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Username string `json:"username,omitempty"`
+	From     string `json:"from"`
+	To       string `json:"to"`                 // comma-separated recipients
+	UseTLS   bool   `json:"useTLS,omitempty"`   // implicit TLS (SMTPS, typically port 465)
+	StartTLS bool   `json:"startTLS,omitempty"` // STARTTLS upgrade (typically port 587)
+}
+
+// ParseSMTPConfig decodes a smtp channel's Config JSON and validates the required
+// fields. Returns a clear error so the /test endpoint can surface a bad config.
+func ParseSMTPConfig(raw string) (SMTPConfig, error) {
+	var c SMTPConfig
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return c, fmt.Errorf("smtp channel config is empty")
+	}
+	if err := json.Unmarshal([]byte(raw), &c); err != nil {
+		return c, fmt.Errorf("smtp channel config is not valid JSON: %w", err)
+	}
+	if strings.TrimSpace(c.Host) == "" {
+		return c, fmt.Errorf("smtp host is required")
+	}
+	if strings.TrimSpace(c.From) == "" {
+		return c, fmt.Errorf("smtp from address is required")
+	}
+	if strings.TrimSpace(c.To) == "" {
+		return c, fmt.Errorf("smtp to address is required")
+	}
+	if c.Port <= 0 {
+		c.Port = 587
+	}
+	return c, nil
 }
 
 // InstanceState is the lifecycle of an alarm instance.
@@ -169,7 +221,7 @@ type Instance struct {
 	Severity       Severity      `json:"severity"`
 	Metric         Metric        `json:"metric"`
 	State          InstanceState `json:"state"`
-	Value          float64       `json:"value"`            // last measured value (numeric metrics)
+	Value          float64       `json:"value"`              // last measured value (numeric metrics)
 	StateRaw       string        `json:"stateRaw,omitempty"` // last measured state (state metric)
 	RaisedAt       time.Time     `json:"raisedAt"`
 	ClearedAt      time.Time     `json:"clearedAt,omitempty"`
@@ -658,37 +710,224 @@ func sevRank(s Severity) int {
 	}
 }
 
-// HTTPNotifier is the real notifier: POSTs the JSON payload to webhook channels
-// and logs email-stub channels (no SMTP dependency, keeps it CGO-free + offline).
+// HTTPNotifier is the real notifier: POSTs the JSON payload to webhook channels,
+// sends REAL email via net/smtp for smtp channels, and logs email-stub channels
+// (the explicit CI/offline mode — no SMTP dependency). Pure stdlib, CGO-free.
 type HTTPNotifier struct {
 	Client *http.Client
+	// now is overridable in tests for a deterministic Date header.
+	now func() time.Time
 }
 
-// Notify implements Notifier.
+// Notify implements Notifier: fire-and-forget dispatch for the engine's raise/
+// clear transitions. Errors are logged (never the password); use Send for the
+// error-returning path consumed by the channel "test" endpoint.
 func (n *HTTPNotifier) Notify(ctx context.Context, ch Channel, ev NotifyEvent) {
-	switch ch.Type {
-	case ChannelWebhook:
-		n.postWebhook(ctx, ch, ev)
-	case ChannelEmail:
-		log.Printf("alarms: [email-stub %s -> %s] %s", ch.Name, ch.Config, ev.Message)
+	if err := n.Send(ctx, ch, ev); err != nil {
+		log.Printf("alarms: channel %q (%s) delivery failed: %v", ch.Name, ch.Type, err)
 	}
 }
 
-func (n *HTTPNotifier) postWebhook(ctx context.Context, ch Channel, ev NotifyEvent) {
+// Send delivers one event to one channel and RETURNS a clear error on failure
+// (no mock/false-success — a real send or a real error, per travaux.md §7.4).
+// The smtp password is never included in any returned/logged error.
+func (n *HTTPNotifier) Send(ctx context.Context, ch Channel, ev NotifyEvent) error {
+	switch ch.Type {
+	case ChannelWebhook:
+		return n.postWebhook(ctx, ch, ev)
+	case ChannelEmail:
+		// Explicit CI/offline stub: log only, always succeeds.
+		log.Printf("alarms: [email-stub %s -> %s] %s", ch.Name, ch.Config, ev.Message)
+		return nil
+	case ChannelSMTP:
+		return n.sendSMTP(ctx, ch, ev)
+	default:
+		return fmt.Errorf("unknown channel type %q", ch.Type)
+	}
+}
+
+func (n *HTTPNotifier) nowUTC() time.Time {
+	if n.now != nil {
+		return n.now()
+	}
+	return time.Now().UTC()
+}
+
+// sendSMTP delivers a real email over SMTP using only the Go stdlib. It supports
+// implicit TLS (UseTLS), STARTTLS upgrade (StartTLS) and plain (e.g. a local
+// MailHog test server). PLAIN auth is used only when a username+password are set.
+func (n *HTTPNotifier) sendSMTP(ctx context.Context, ch Channel, ev NotifyEvent) error {
+	cfg, err := ParseSMTPConfig(ch.Config)
+	if err != nil {
+		return fmt.Errorf("smtp channel %q: %w", ch.Name, err)
+	}
+	recipients := splitAddrs(cfg.To)
+	if len(recipients) == 0 {
+		return fmt.Errorf("smtp channel %q: no recipients", ch.Name)
+	}
+	subject := "UniHV alarm: " + ev.Definition
+	if ev.Event == "test" {
+		subject = "UniHV alarms test: " + ch.Name
+	}
+	msg := BuildEmailMessage(cfg.From, cfg.To, subject, ev, n.nowUTC())
+	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+
+	var auth smtp.Auth
+	if cfg.Username != "" && ch.Secret != "" {
+		auth = smtp.PlainAuth("", cfg.Username, ch.Secret, cfg.Host)
+	}
+
+	if cfg.UseTLS {
+		if err := sendMailTLS(addr, cfg.Host, auth, cfg.From, recipients, []byte(msg)); err != nil {
+			return fmt.Errorf("smtp channel %q implicit-TLS send to %s failed: %w", ch.Name, addr, err)
+		}
+		return nil
+	}
+	if cfg.StartTLS {
+		if err := sendMailStartTLS(addr, cfg.Host, auth, cfg.From, recipients, []byte(msg)); err != nil {
+			return fmt.Errorf("smtp channel %q STARTTLS send to %s failed: %w", ch.Name, addr, err)
+		}
+		return nil
+	}
+	// Plain SMTP (no TLS) — e.g. a local MailHog/relay. smtp.SendMail still
+	// performs STARTTLS automatically if the server advertises it.
+	if err := smtp.SendMail(addr, auth, cfg.From, recipients, []byte(msg)); err != nil {
+		return fmt.Errorf("smtp channel %q send to %s failed: %w", ch.Name, addr, err)
+	}
+	return nil
+}
+
+// sendMailStartTLS opens a plain connection, issues STARTTLS, then authenticates
+// and sends. Mirrors smtp.SendMail but forces the STARTTLS upgrade.
+func sendMailStartTLS(addr, host string, auth smtp.Auth, from string, to []string, msg []byte) error {
+	c, err := smtp.Dial(addr)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+	if err := c.Hello("unihv"); err != nil {
+		return err
+	}
+	if ok, _ := c.Extension("STARTTLS"); !ok {
+		return fmt.Errorf("server does not advertise STARTTLS")
+	}
+	if err := c.StartTLS(&tls.Config{ServerName: host}); err != nil {
+		return err
+	}
+	return finishSMTP(c, auth, from, to, msg)
+}
+
+// sendMailTLS opens an implicit-TLS (SMTPS) connection, then authenticates + sends.
+func sendMailTLS(addr, host string, auth smtp.Auth, from string, to []string, msg []byte) error {
+	conn, err := tls.Dial("tcp", addr, &tls.Config{ServerName: host})
+	if err != nil {
+		return err
+	}
+	c, err := smtp.NewClient(conn, host)
+	if err != nil {
+		_ = conn.Close()
+		return err
+	}
+	defer func() { _ = c.Close() }()
+	if err := c.Hello("unihv"); err != nil {
+		return err
+	}
+	return finishSMTP(c, auth, from, to, msg)
+}
+
+// finishSMTP runs AUTH (if any) + MAIL/RCPT/DATA on an established client.
+func finishSMTP(c *smtp.Client, auth smtp.Auth, from string, to []string, msg []byte) error {
+	if auth != nil {
+		if ok, _ := c.Extension("AUTH"); ok {
+			if err := c.Auth(auth); err != nil {
+				return err
+			}
+		}
+	}
+	if err := c.Mail(from); err != nil {
+		return err
+	}
+	for _, rcpt := range to {
+		if err := c.Rcpt(rcpt); err != nil {
+			return err
+		}
+	}
+	w, err := c.Data()
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write(msg); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return c.Quit()
+}
+
+func splitAddrs(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// BuildEmailMessage composes a proper RFC5322 message (From/To/Subject/Date/
+// MIME headers + plain-text body) for an alarm raise/clear/test notification.
+func BuildEmailMessage(from, to, subject string, ev NotifyEvent, now time.Time) string {
+	var b strings.Builder
+	b.WriteString("From: " + from + "\r\n")
+	b.WriteString("To: " + to + "\r\n")
+	b.WriteString("Subject: " + subject + "\r\n")
+	b.WriteString("Date: " + now.Format(time.RFC1123Z) + "\r\n")
+	b.WriteString("MIME-Version: 1.0\r\n")
+	b.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
+	b.WriteString("\r\n")
+	b.WriteString(ev.Message)
+	b.WriteString("\r\n\r\n")
+	b.WriteString("Event: " + ev.Event + "\r\n")
+	if ev.AlarmID != "" {
+		b.WriteString("Alarm ID: " + ev.AlarmID + "\r\n")
+	}
+	b.WriteString("Definition: " + ev.Definition + "\r\n")
+	b.WriteString("Object: " + ev.ObjectType + " " + ev.ObjectName + "\r\n")
+	b.WriteString("Severity: " + string(ev.Severity) + "\r\n")
+	if ev.Metric != "" {
+		b.WriteString("Metric: " + ev.Metric + "\r\n")
+		b.WriteString(fmt.Sprintf("Value: %.2f\r\n", ev.Value))
+	}
+	if ev.StateRaw != "" {
+		b.WriteString("State: " + ev.StateRaw + "\r\n")
+	}
+	b.WriteString("Timestamp: " + ev.Timestamp.Format(time.RFC3339) + "\r\n")
+	return b.String()
+}
+
+// NewHTTPNotifier builds the real notifier. cfg is accepted for signature
+// compatibility with the server wiring; SMTP settings are now PER-CHANNEL (the
+// channel's Config + sealed Secret), so no global SMTP config is consulted.
+func NewHTTPNotifier(cfg *config.Config) *HTTPNotifier {
+	return &HTTPNotifier{Client: http.DefaultClient}
+}
+
+func (n *HTTPNotifier) postWebhook(ctx context.Context, ch Channel, ev NotifyEvent) error {
 	url := strings.TrimSpace(ch.Config)
 	if url == "" {
-		return
+		return fmt.Errorf("webhook channel %q has no URL configured", ch.Name)
 	}
 	body, err := json.Marshal(ev)
 	if err != nil {
-		return
+		return err
 	}
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(cctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		log.Printf("alarms: webhook %s build error: %v", ch.Name, err)
-		return
+		return fmt.Errorf("webhook %q build error: %w", ch.Name, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "UniHV-Alarms/1")
@@ -698,24 +937,27 @@ func (n *HTTPNotifier) postWebhook(ctx context.Context, ch Channel, ev NotifyEve
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("alarms: webhook %s POST error: %v", ch.Name, err)
-		return
+		return fmt.Errorf("webhook %q POST error: %w", ch.Name, err)
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		log.Printf("alarms: webhook %s returned %d", ch.Name, resp.StatusCode)
+		return fmt.Errorf("webhook %q returned HTTP %d", ch.Name, resp.StatusCode)
 	}
+	return nil
 }
 
-// SendTest fires a synthetic test event to a single channel (used by the
-// "test channel" API). Returns immediately; webhook delivery is best-effort.
-func (n *HTTPNotifier) SendTest(ctx context.Context, ch Channel) {
-	n.Notify(ctx, ch, NotifyEvent{
+// SendTest fires a synthetic test event to a single channel (used by the channel
+// "test" API). It RETURNS the delivery error (real webhook POST / real SMTP send /
+// logged stub) so the endpoint surfaces a clear success or failure — no
+// false-success (travaux.md §7.4).
+func (n *HTTPNotifier) SendTest(ctx context.Context, ch Channel) error {
+	return n.Send(ctx, ch, NotifyEvent{
 		Event:      "test",
 		Definition: "Test notification",
 		Severity:   SeverityInfo,
+		ObjectType: "system",
 		ObjectName: "unihv",
 		Message:    "UniHV alarms test notification for channel " + ch.Name,
-		Timestamp:  time.Now().UTC(),
+		Timestamp:  n.nowUTC(),
 	})
 }

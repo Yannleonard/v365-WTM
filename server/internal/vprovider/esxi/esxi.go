@@ -495,12 +495,27 @@ func (p *Provider) ExportVM(ctx context.Context, vmID string, format vp.DiskForm
 	if !ok {
 		return nil, nil, vp.ErrNotFound
 	}
-	// LIVE path: a real vSphere connection is attached but no real OVF/VMDK export
-	// (HttpNfcLease) is implemented yet. Fabricating a placeholder here would make
-	// backup / V2V record a worthless stub as SUCCESS, so we HARD-ERROR instead.
-	// Only the in-memory sim backend (tests) may return the placeholder below.
-	if _, live := p.backend.(*liveBackend); live {
-		return nil, nil, fmt.Errorf("%w: VM export not yet implemented for esxi", vp.ErrUnsupported)
+	// LIVE path: a real vSphere connection is attached. Perform a REAL OVF/VMDK
+	// export over an HttpNfcLease (VirtualMachine.ExportVm -> device-URL download).
+	// The returned reader streams actual disk bytes off the ESXi/vCenter host; on any
+	// failure it returns a clear error. It NEVER fabricates a placeholder — backup /
+	// V2V must record either real bytes or a real failure.
+	if lb, live := p.backend.(*liveBackend); live {
+		rc, size, diskCount, err := lb.export(vmID)
+		if err != nil {
+			return nil, nil, err
+		}
+		// vSphere exports stream-optimized VMDK disk files (regardless of the requested
+		// normalized format token); record the true on-the-wire format.
+		info := &vp.ExportInfo{
+			Format:     vp.DiskVMDK,
+			SizeBytes:  size,
+			DiskCount:  diskCount,
+			SourceVMID: vmID,
+			GuestOS:    vm.GuestID,
+			Firmware:   vm.Firmware,
+		}
+		return rc, info, nil
 	}
 	// Stand in for an OVF/VMDK export (HttpNfcLease) streaming the VM's disk(s).
 	payload := fmt.Sprintf("VSPHEREEXPORT\x00provider=%s\x00vm=%s\x00format=%s\n", p.id, vmID, format)

@@ -77,6 +77,18 @@ function SevBadge({ sev }: { sev: AlarmSeverity }) {
   );
 }
 
+// channelDestination renders a human-friendly destination. For smtp the config is
+// JSON (host/port/from/to — never the password); show host:port -> to.
+function channelDestination(c: AlarmChannel): string {
+  if (c.type !== "smtp") return c.config;
+  try {
+    const cfg = JSON.parse(c.config) as { host?: string; port?: number; to?: string };
+    return `${cfg.host ?? "?"}:${cfg.port ?? 587} → ${cfg.to ?? "?"}`;
+  } catch {
+    return c.config;
+  }
+}
+
 export function Alarms() {
   const queryClient = useQueryClient();
   const { permissions } = useAuth();
@@ -147,7 +159,13 @@ export function Alarms() {
     setBusyId(c.id);
     try {
       await api.alarmChannelTest(c.id);
-      toast.success("Test notification sent", c.type === "webhook" ? "Webhook POSTed." : "Logged (email stub).");
+      const detail =
+        c.type === "webhook"
+          ? "Webhook POSTed."
+          : c.type === "smtp"
+            ? "Real email sent via SMTP."
+            : "Logged (email stub).";
+      toast.success("Test notification sent", detail);
     } catch (err) {
       toastError("Test failed", err);
     } finally {
@@ -256,7 +274,7 @@ export function Alarms() {
   const chCols: Column<AlarmChannel>[] = [
     { key: "name", header: "Channel", sortValue: (c) => c.name, cell: (c) => <span style={{ fontWeight: 600 }}>{c.name}</span> },
     { key: "type", header: "Type", sortValue: (c) => c.type, cell: (c) => <span className="chip text-xs">{c.type}</span> },
-    { key: "config", header: "Destination", cell: (c) => <span className="mono text-xs truncate">{c.config}</span> },
+    { key: "config", header: "Destination", cell: (c) => <span className="mono text-xs truncate">{channelDestination(c)}</span> },
     {
       key: "actions",
       header: "",
@@ -607,15 +625,47 @@ function CreateChannelModal({ onClose, onCreated }: { onClose: () => void; onCre
   const [name, setName] = useState("");
   const [type, setType] = useState<AlarmChannelType>("webhook");
   const [config, setConfig] = useState("");
+
+  // SMTP fields (only used when type === "smtp").
+  const [smtpHost, setSmtpHost] = useState("");
+  const [smtpPort, setSmtpPort] = useState("587");
+  const [smtpUser, setSmtpUser] = useState("");
+  const [smtpPass, setSmtpPass] = useState("");
+  const [smtpFrom, setSmtpFrom] = useState("");
+  const [smtpTo, setSmtpTo] = useState("");
+  const [smtpTls, setSmtpTls] = useState<"none" | "starttls" | "tls">("none");
   const [busy, setBusy] = useState(false);
 
-  const valid = name.trim() !== "" && (type !== "webhook" || config.trim() !== "");
+  const isSmtp = type === "smtp";
+
+  const valid =
+    name.trim() !== "" &&
+    (type === "webhook" || type === "email-stub"
+      ? config.trim() !== ""
+      : smtpHost.trim() !== "" && smtpFrom.trim() !== "" && smtpTo.trim() !== "");
 
   const submit = async () => {
     if (!valid) return;
     setBusy(true);
     try {
-      await api.alarmChannelCreate({ name: name.trim(), type, config: config.trim() });
+      if (isSmtp) {
+        await api.alarmChannelCreate({
+          name: name.trim(),
+          type,
+          smtp: {
+            host: smtpHost.trim(),
+            port: Number(smtpPort) || 587,
+            username: smtpUser.trim() || undefined,
+            password: smtpPass || undefined,
+            from: smtpFrom.trim(),
+            to: smtpTo.trim(),
+            useTLS: smtpTls === "tls",
+            startTLS: smtpTls === "starttls",
+          },
+        });
+      } else {
+        await api.alarmChannelCreate({ name: name.trim(), type, config: config.trim() });
+      }
       toast.success("Channel created", name.trim());
       onCreated();
     } catch (err) {
@@ -626,19 +676,62 @@ function CreateChannelModal({ onClose, onCreated }: { onClose: () => void; onCre
   };
 
   return (
-    <Modal open title="New notification channel" onClose={onClose}>
+    <Modal open title="New notification channel" onClose={onClose} wide={isSmtp}>
       <div className="col" style={{ gap: "var(--sp-4)" }}>
         <TextField label="Name" placeholder="e.g. ops-webhook" value={name} onChange={(e) => setName(e.target.value)} />
         <SelectField label="Type" value={type} onChange={(e) => setType(e.target.value as AlarmChannelType)}>
           <option value="webhook">Webhook (HTTP POST)</option>
-          <option value="email-stub">Email (stub / logged)</option>
+          <option value="smtp">Email (SMTP — real send)</option>
+          <option value="email-stub">Email (stub / logged — CI/offline)</option>
         </SelectField>
-        <TextField
-          label={type === "webhook" ? "Webhook URL" : "Email address"}
-          placeholder={type === "webhook" ? "https://hooks.example.com/alarms" : "ops@example.com"}
-          value={config}
-          onChange={(e) => setConfig(e.target.value)}
-        />
+
+        {isSmtp ? (
+          <>
+            <div className="row-wrap" style={{ gap: "var(--sp-4)", alignItems: "flex-start" }}>
+              <div style={{ flex: "2 1 220px" }}>
+                <TextField label="SMTP host" placeholder="smtp.example.com" value={smtpHost} onChange={(e) => setSmtpHost(e.target.value)} />
+              </div>
+              <div style={{ flex: "1 1 100px" }}>
+                <TextField label="Port" type="number" value={smtpPort} onChange={(e) => setSmtpPort(e.target.value)} />
+              </div>
+            </div>
+            <div className="row-wrap" style={{ gap: "var(--sp-4)", alignItems: "flex-start" }}>
+              <div style={{ flex: "1 1 200px" }}>
+                <TextField label="Username (optional)" placeholder="apikey / user" value={smtpUser} onChange={(e) => setSmtpUser(e.target.value)} />
+              </div>
+              <div style={{ flex: "1 1 200px" }}>
+                <TextField
+                  label="Password (optional)"
+                  type="password"
+                  placeholder="•••••• (sealed, never returned)"
+                  value={smtpPass}
+                  onChange={(e) => setSmtpPass(e.target.value)}
+                />
+              </div>
+            </div>
+            <div className="row-wrap" style={{ gap: "var(--sp-4)", alignItems: "flex-start" }}>
+              <div style={{ flex: "1 1 200px" }}>
+                <TextField label="From" placeholder="alarms@example.com" value={smtpFrom} onChange={(e) => setSmtpFrom(e.target.value)} />
+              </div>
+              <div style={{ flex: "1 1 200px" }}>
+                <TextField label="To" placeholder="ops@example.com, oncall@example.com" value={smtpTo} onChange={(e) => setSmtpTo(e.target.value)} />
+              </div>
+            </div>
+            <SelectField label="Encryption" value={smtpTls} onChange={(e) => setSmtpTls(e.target.value as "none" | "starttls" | "tls")}>
+              <option value="none">None (plain — e.g. local relay / MailHog)</option>
+              <option value="starttls">STARTTLS (typically port 587)</option>
+              <option value="tls">Implicit TLS / SMTPS (typically port 465)</option>
+            </SelectField>
+          </>
+        ) : (
+          <TextField
+            label={type === "webhook" ? "Webhook URL" : "Email address"}
+            placeholder={type === "webhook" ? "https://hooks.example.com/alarms" : "ops@example.com"}
+            value={config}
+            onChange={(e) => setConfig(e.target.value)}
+          />
+        )}
+
         <div className="row" style={{ gap: "var(--sp-2)", justifyContent: "flex-end" }}>
           <ActionButton variant="ghost" onClick={onClose}>Cancel</ActionButton>
           <ActionButton variant="primary" loading={busy} disabled={!valid} onClick={submit}>

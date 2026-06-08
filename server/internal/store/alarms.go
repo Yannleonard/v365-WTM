@@ -29,13 +29,21 @@ type AlarmDefinition struct {
 }
 
 // AlarmChannel is a row of alarm_channels: a notification destination.
+//
+// For webhook channels Config is the URL; email-stub holds the recipient; smtp
+// holds a JSON SMTPConfig (host/port/username/from/to/TLS — no password).
+// ConfigSecret is the AES-256-GCM-sealed SMTP password (authz.SealSecret in the
+// API layer); it is json:"-" so it is NEVER serialised back to a client, and the
+// store never logs it. HasSecret is a derived, safe flag the API surfaces instead.
 type AlarmChannel struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Type      string `json:"type"` // webhook|email-stub
-	Config    string `json:"config"`
-	CreatedAt int64  `json:"createdAt"`
-	UpdatedAt int64  `json:"updatedAt"`
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Type         string `json:"type"` // webhook|email-stub|smtp
+	Config       string `json:"config"`
+	ConfigSecret []byte `json:"-"` // sealed SMTP password (never returned)
+	HasSecret    bool   `json:"hasSecret"`
+	CreatedAt    int64  `json:"createdAt"`
+	UpdatedAt    int64  `json:"updatedAt"`
 }
 
 // AlarmInstance is a row of alarm_instances: a durable snapshot of an ACTIVE alarm
@@ -155,16 +163,19 @@ func (s *Store) DeleteAlarmDefinition(ctx context.Context, id string) error {
 	return nil
 }
 
-const alarmChCols = `id, name, type, config, created_at, updated_at`
+const alarmChCols = `id, name, type, config, config_secret, created_at, updated_at`
 
 func scanAlarmChannel(row interface{ Scan(...any) error }) (*AlarmChannel, error) {
 	var c AlarmChannel
-	if err := row.Scan(&c.ID, &c.Name, &c.Type, &c.Config, &c.CreatedAt, &c.UpdatedAt); err != nil {
+	var secret []byte
+	if err := row.Scan(&c.ID, &c.Name, &c.Type, &c.Config, &secret, &c.CreatedAt, &c.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
+	c.ConfigSecret = secret
+	c.HasSecret = len(secret) > 0
 	return &c, nil
 }
 
@@ -192,14 +203,20 @@ func (s *Store) GetAlarmChannel(ctx context.Context, id string) (*AlarmChannel, 
 		`SELECT `+alarmChCols+` FROM alarm_channels WHERE id = ?`, id))
 }
 
-// CreateAlarmChannel inserts a new channel.
+// CreateAlarmChannel inserts a new channel. ConfigSecret (if any) must already be
+// sealed by the API layer (authz.SealSecret); the store persists the BLOB as-is.
 func (s *Store) CreateAlarmChannel(ctx context.Context, c *AlarmChannel) error {
 	now := time.Now().Unix()
 	c.CreatedAt, c.UpdatedAt = now, now
+	var secret any
+	if len(c.ConfigSecret) > 0 {
+		secret = c.ConfigSecret
+	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO alarm_channels (id, name, type, config, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		c.ID, c.Name, c.Type, c.Config, c.CreatedAt, c.UpdatedAt)
+		`INSERT INTO alarm_channels (id, name, type, config, config_secret, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, c.Name, c.Type, c.Config, secret, c.CreatedAt, c.UpdatedAt)
+	c.HasSecret = len(c.ConfigSecret) > 0
 	return err
 }
 

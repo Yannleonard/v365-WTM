@@ -527,12 +527,30 @@ func (p *Provider) ExportVM(ctx context.Context, vmID string, format vp.DiskForm
 	if !ok {
 		return nil, nil, vp.ErrNotFound
 	}
-	// LIVE path: a real XAPI connection is attached but no real export (XVA / disk
-	// HTTP handler) is implemented yet. Fabricating a placeholder here would make
-	// backup / V2V record a worthless stub as SUCCESS, so we HARD-ERROR instead.
-	// Only the in-memory sim backend (tests) may return the placeholder below.
-	if _, live := p.backend.(*liveBackend); live {
-		return nil, nil, fmt.Errorf("%w: VM export not yet implemented for xen", vp.ErrUnsupported)
+	// LIVE path: a REAL XAPI connection is attached. Export the VM as an XVA via the
+	// XAPI HTTP export handler (GET /export?session_id=...&uuid=...), authenticated by
+	// the already-established XML-RPC session, and stream the response body straight to
+	// the caller. NO placeholder, NO buffering: a real stream or a CLEAR error.
+	if live, isLive := p.backend.(*liveBackend); isLive {
+		body, size, err := live.exportStream(ctx, v.UUID)
+		if err != nil {
+			return nil, nil, err
+		}
+		// The XAPI export artifact is an XVA archive (a tar of VM metadata + VHD disk
+		// images), not a single bare disk image. The contract's DiskFormat has no "xva"
+		// member, so we echo the caller's requested (already-validated) format as the
+		// logical target and surface the raw XVA stream; the caller treats it as an
+		// opaque V2V/backup blob. SizeBytes is the HTTP Content-Length when XAPI sends
+		// one (often -1/unknown for the chunked XVA stream).
+		info := &vp.ExportInfo{
+			Format:     format,
+			SizeBytes:  size,
+			DiskCount:  len(v.VBDs),
+			SourceVMID: vmID,
+			GuestOS:    v.OSDistro,
+			Firmware:   normalizeFirmware(v),
+		}
+		return body, info, nil
 	}
 	// Stand in for the XAPI export HTTP handler streaming the VM's xva / disk(s).
 	payload := fmt.Sprintf("XENEXPORT\x00provider=%s\x00vm=%s\x00format=%s\n", p.id, vmID, format)

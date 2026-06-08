@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -424,6 +425,74 @@ func (b *liveBackend) migrate(ref, targetHost string) error {
 		return mapXapiErr(err)
 	}
 	return nil
+}
+
+// --- VM export (XVA over the XAPI HTTP handler) ---
+//
+// XenServer / XCP-ng do NOT export a VM via XML-RPC. Instead XAPI exposes a plain
+// HTTP handler on the SAME host as the XML-RPC endpoint:
+//
+//	GET https://<master>/export?session_id=<sid>&uuid=<vm-uuid>
+//	  (equivalently ...&ref=<vm-opaque-ref>)
+//
+// authenticated by an EXISTING XML-RPC session (the same session.login_with_password
+// ref this backend already holds). The response body is the VM's XVA archive — a tar
+// stream of the VM metadata + VHD disk images — streamed as it is produced. The XVA is
+// what `xe vm-export` writes and what the import handler (/import) consumes, so this is
+// the canonical V2V / backup artifact.
+//
+// exportStream builds that URL from the cached session + the VM uuid, issues the
+// authenticated GET (honoring the same insecure-TLS http.Client as every other call),
+// and returns the live response body as an io.ReadCloser the caller streams to disk —
+// NEVER buffering it in memory. On any non-200 (401/403 = session refused, 404 =
+// unknown VM, 500 = XAPI export error) it drains+closes the body and returns a CLEAR
+// error carrying the HTTP status, never a placeholder. Content-Length (usually absent
+// for a chunked XVA stream) is returned so the caller can show size when known.
+func (b *liveBackend) exportStream(ctx context.Context, vmUUID string) (io.ReadCloser, int64, error) {
+	b.mu.RLock()
+	sess := b.session
+	b.mu.RUnlock()
+	if sess == "" {
+		return nil, 0, fmt.Errorf("xen: export: no active XAPI session")
+	}
+	if strings.TrimSpace(vmUUID) == "" {
+		return nil, 0, fmt.Errorf("xen: export: empty VM uuid")
+	}
+	// b.url is "<endpoint>/" (the XML-RPC path); the export handler lives on the same
+	// host. Derive the base and hang /export off it.
+	base := strings.TrimRight(b.url, "/")
+	exportURL := base + "/export?session_id=" + url.QueryEscape(sess) +
+		"&uuid=" + url.QueryEscape(vmUUID)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, exportURL, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	// XVA is an opaque binary tar stream.
+	req.Header.Set("Accept", "application/octet-stream")
+
+	resp, err := b.client.Do(req)
+	if err != nil {
+		b.fail(err)
+		return nil, 0, fmt.Errorf("xen: export GET: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		// Read a small slice of the error body for diagnostics, then close.
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		resp.Body.Close()
+		msg := strings.TrimSpace(string(snippet))
+		switch resp.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return nil, 0, fmt.Errorf("xen: export refused: HTTP %d (session rejected): %s",
+				resp.StatusCode, msg)
+		case http.StatusNotFound:
+			return nil, 0, fmt.Errorf("xen: export: VM not found: HTTP %d: %s", resp.StatusCode, msg)
+		default:
+			return nil, 0, fmt.Errorf("xen: export failed: HTTP %d: %s", resp.StatusCode, msg)
+		}
+	}
+	size := resp.ContentLength // -1 when the XVA is chunked (the common case)
+	return resp.Body, size, nil
 }
 
 // --- XML-RPC transport ---

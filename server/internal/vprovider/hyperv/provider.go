@@ -502,6 +502,15 @@ func (p *Provider) MigrateVM(ctx context.Context, vmID, targetHost string, opts 
 	return p.finishTask("migrate", vmID), nil
 }
 
+// liveExportHook is the seam to the REAL (windows-tagged) VHDX exporter. It is nil on
+// the default cross-platform build (which only ever constructs the sim backend, whose
+// isLive() is false, so the hook is never consulted). The windows live backend
+// (live_windows.go) installs the real implementation in init(). Keeping it a package
+// var — rather than a method on the backend interface — avoids forcing every backend
+// (incl. the sim) to carry an io-streaming export method while still guaranteeing the
+// LIVE path can NEVER fall through to the sim placeholder below.
+var liveExportHook func(ctx context.Context, p *Provider, vm *hypervVM, format vp.DiskFormat) (io.ReadCloser, *vp.ExportInfo, error)
+
 func (p *Provider) ExportVM(ctx context.Context, vmID string, format vp.DiskFormat) (io.ReadCloser, *vp.ExportInfo, error) {
 	if !p.caps.Has(vp.CapExport) {
 		return nil, nil, vp.ErrUnsupported
@@ -513,14 +522,22 @@ func (p *Provider) ExportVM(ctx context.Context, vmID string, format vp.DiskForm
 	if !ok {
 		return nil, nil, vp.ErrNotFound
 	}
-	// LIVE path: a real WMI/Hyper-V connection is attached but no real Export-VM
-	// (VHDX streaming) is implemented yet. Fabricating a placeholder here would make
-	// backup / V2V record a worthless stub as SUCCESS, so we HARD-ERROR instead.
-	// Only the in-memory sim backend (tests) may return the placeholder below.
+	// LIVE path: a real WMI/Hyper-V connection is attached. Delegate to the REAL
+	// VHDX-streaming exporter implemented in the windows-tagged live backend
+	// (live_windows.go installs liveExportHook in init()). That path resolves the
+	// VM's VHDX file(s) via Msvm_StorageAllocationSettingData.HostResource and streams
+	// the real disk bytes — or returns a CLEAR error (never a placeholder). If for some
+	// reason the hook is not wired (a live backend on a non-windows build — impossible
+	// today, but defended against), HARD-ERROR rather than fabricate a stub: a backup /
+	// V2V job must not record a worthless placeholder as SUCCESS (travaux.md §7.4).
 	if p.backend.isLive() {
-		return nil, nil, fmt.Errorf("%w: VM export not yet implemented for hyperv", vp.ErrUnsupported)
+		if liveExportHook == nil {
+			return nil, nil, fmt.Errorf("%w: hyperv live VHDX export not wired on this build", vp.ErrUnsupported)
+		}
+		return liveExportHook(ctx, p, vm, format)
 	}
-	// Stand in for an Export-VM streaming the VM's VHDX disk(s) for V2V.
+	// SIM/FAKE path (tests only, isLive()==false): stand in for an Export-VM streaming
+	// the VM's VHDX disk(s) for V2V. This placeholder is NEVER reached on a live host.
 	payload := fmt.Sprintf("HYPERVEXPORT\x00provider=%s\x00vm=%s\x00format=%s\n", p.id, vmID, format)
 	info := &vp.ExportInfo{
 		Format:     format,

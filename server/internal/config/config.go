@@ -62,6 +62,14 @@ type Config struct {
 	// (the compose service). Empty disables the integrated console.
 	GuacdAddr string
 
+	// SMTP settings for alarm email delivery. If SMTPHost is unset, email channels
+	// remain in stub/log-only mode.
+	SMTPHost string
+	SMTPPort int
+	SMTPUser string
+	SMTPPass string
+	SMTPFrom string
+
 	// --- ADR-001 intervals (env-overridable) ---
 
 	DockerSnapshotInterval time.Duration // default 10s
@@ -125,6 +133,11 @@ func Load() *Config {
 		AllowedOrigins:         envList("CASTOR_ALLOWED_ORIGINS"),
 		EnableSwarm:            envBool("CASTOR_ENABLE_SWARM", true),
 		GuacdAddr:              envStr("UNIHV_GUACD_ADDR", "guacd:4822"),
+		SMTPHost:               envStr("CASTOR_SMTP_HOST", ""),
+		SMTPPort:               envInt("CASTOR_SMTP_PORT", 587),
+		SMTPUser:               os.Getenv("CASTOR_SMTP_USER"),
+		SMTPPass:               os.Getenv("CASTOR_SMTP_PASS"),
+		SMTPFrom:               envStr("CASTOR_SMTP_FROM", ""),
 		DockerSnapshotInterval: envDur("CASTOR_DOCKER_SNAPSHOT_INTERVAL", 10*time.Second),
 		SwarmSnapshotInterval:  envDur("CASTOR_SWARM_SNAPSHOT_INTERVAL", 15*time.Second),
 		K8sSnapshotInterval:    envDur("CASTOR_K8S_SNAPSHOT_INTERVAL", 15*time.Second),
@@ -189,6 +202,10 @@ func envList(key string) []string {
 	if v == "" {
 		return nil
 	}
+	return splitEnvList(v)
+}
+
+func splitEnvList(v string) []string {
 	parts := strings.Split(v, ",")
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
@@ -197,4 +214,16 @@ func envList(key string) []string {
 		}
 	}
 	return out
+}
+
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	i, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		return def
+	}
+	return i
 }
