@@ -16,6 +16,23 @@ Il est conçu pour être utilisé par les agents experts et par l’équipe QA.
     créer les connexions hyperviseur dans l'app, et **prouver chaque export en réel**.
   - Réel confirmé aujourd'hui : **KVM/libvirt uniquement** (host WSL local).
 
+## 0bis. Avancement (2026-06-08 soir) — code écrit, validé hors-host
+
+| Tâche | Statut | Preuve |
+|---|---|---|
+| `alarms-expert` SMTP réel | ✅ FAIT + prouvé | net/smtp réel, mdp scellé (migration 0011), email-stub gardé pour CI. **MailHog a reçu un vrai mail** (from/to/subject OK) ; mauvais host → erreur claire. UI SMTP + bouton Test. |
+| `hyperv-expert` ExportVM live | ✅ code écrit, ⏳ host demain | Export-VM/VHDX via WMI (HostResource→stream vhdx) ; VM allumée → ErrConflict clair ; hook windows-tagged ; jamais de placeholder en live. Compile linux+windows. |
+| `esxi-expert` ExportVM live | ✅ code écrit + prouvé vs vcsim, ⏳ host demain | HttpNfcLease govmomi (vm.Export→lease→stream) ; vcsim streame de vrais octets (≠ placeholder). |
+| `xen-expert` ExportVM live | ✅ code écrit + prouvé vs wire, ⏳ host demain | GET /export?session_id&uuid (XAPI) streame le body XVA ; httptest prouve vrais octets ; 403/404 → erreurs claires. |
+| `kvm-expert` export | ✅ déjà fait | file-backed qcow2 = export réel (qemu-img + StorageVolDownload RPC) ; non-file → ErrUnsupported clair. |
+| Placeholders export (KVM/ESXi/Xen/HyperV) | ✅ confinés aux backends sim/tests | plus jamais sur le chemin live. |
+
+**À PROUVER DEMAIN MATIN sur les hosts réels (Xen/ESXi/Hyper-V fournis par l'owner) :**
+- Brancher chaque host (IP + identifiants) → créer la connexion hyperviseur dans l'app.
+- Hyper-V : VM arrêtée → stream VHDX byte-identique (sha256) ; VM allumée → erreur "stop/checkpoint".
+- ESXi : `vm.Export()` (ExportVm complet) marche directement (pas le fallback snapshot) ; tailles réelles.
+- Xen : `session.login` réel → GET /export → vrai XVA importable ; comportement VM allumée ; chunked (SizeBytes=-1).
+
 ## 1. État actuel constaté
 
 - L’application fonctionne déjà dans Docker sur `http://localhost:8080/`.
