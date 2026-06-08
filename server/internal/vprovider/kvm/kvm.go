@@ -308,18 +308,30 @@ func (p *Provider) CreateVM(ctx context.Context, spec vp.VMSpec) (*vp.Task, erro
 		return nil, vp.ErrInvalidSpec
 	}
 	uuid := p.nextID("dom")
+	// Secure Boot requires UEFI firmware (signed OVMF + SMM); force it on when the
+	// caller requests Secure Boot regardless of the firmware they sent.
+	firmware := spec.Firmware
+	if spec.SecureBoot {
+		firmware = vp.FirmwareUEFI
+	}
 	d := &libvirtDomain{
-		UUID:     uuid,
-		Name:     spec.Name,
-		State:    domShutoff, // freshly defined domains are shutoff
-		HostID:   spec.HostID,
-		VCPUs:    spec.VCPUs,
-		MemoryKB: spec.MemoryMB * 1024,
-		OSType:   spec.GuestOS,
-		Firmware: spec.Firmware,
-		Labels:   spec.Labels,
-		Created:  time.Now().UTC().Unix(),
-		BootISO:  spec.BootISO,
+		UUID:       uuid,
+		Name:       spec.Name,
+		State:      domShutoff, // freshly defined domains are shutoff
+		HostID:     spec.HostID,
+		VCPUs:      spec.VCPUs,
+		MemoryKB:   spec.MemoryMB * 1024,
+		OSType:     spec.GuestOS,
+		Firmware:   firmware,
+		TPM:        spec.TPM,
+		SecureBoot: spec.SecureBoot,
+		Labels:     spec.Labels,
+		Created:    time.Now().UTC().Unix(),
+		BootISO:    spec.BootISO,
+		// CloudInit is consumed by the LIVE backend's defineDomain, which builds the
+		// NoCloud 'cidata' seed ISO and attaches it as an extra cdrom. The sim backend
+		// ignores it (cloud-init is a live-only feature; the create still succeeds).
+		CloudInit:  spec.CloudInit,
 	}
 	for i, dk := range spec.Disks {
 		d.Disks = append(d.Disks, libvirtDisk{

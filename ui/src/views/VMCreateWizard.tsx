@@ -34,8 +34,8 @@ import { formatBytes } from "../lib/format";
 import type { VMHost, VMSpec, VMTask } from "../lib/types";
 
 const FORMAT_OPTIONS = ["qcow2", "raw", "vmdk", "vhdx", "vdi"] as const;
-const STEPS = ["Basics", "Compute", "Storage", "Network"] as const;
-type StepIndex = 0 | 1 | 2 | 3;
+const STEPS = ["Basics", "Compute", "Storage", "Network", "Security", "Customization"] as const;
+type StepIndex = 0 | 1 | 2 | 3 | 4 | 5;
 
 export function VMCreateWizard() {
   const navigate = useNavigate();
@@ -66,6 +66,18 @@ export function VMCreateWizard() {
   const [bootIso, setBootIso] = useState("");
 
   const [networkId, setNetworkId] = useState("");
+
+  // ---- Security (vTPM 2.0 + UEFI Secure Boot) ----
+  const [tpm, setTpm] = useState(false);
+  const [secureBoot, setSecureBoot] = useState(false);
+
+  // ---- Guest customization (cloud-init / NoCloud) ----
+  const [ciEnabled, setCiEnabled] = useState(false);
+  const [ciHostname, setCiHostname] = useState("");
+  const [ciUsername, setCiUsername] = useState("");
+  const [ciPassword, setCiPassword] = useState("");
+  const [ciSshKeys, setCiSshKeys] = useState(""); // one public key per line
+  const [ciRunCmd, setCiRunCmd] = useState(""); // one command per line
 
   const [submitting, setSubmitting] = useState(false);
   const [task, setTask] = useState<VMTask | null>(null);
@@ -101,8 +113,16 @@ export function VMCreateWizard() {
   const step1Ok = Number.isInteger(vcpusNum) && vcpusNum > 0 && Number.isFinite(memNum) && memNum > 0;
   const step2Ok = Number.isFinite(diskNum) && diskNum > 0;
   const step3Ok = networks.length === 0 || !!networkId;
+  const step4Ok = true; // Security toggles are always optional.
+  const step5Ok = true; // Cloud-init customization is always optional.
 
-  const stepValid = [step0Ok, step1Ok, step2Ok, step3Ok][step];
+  const stepValid = [step0Ok, step1Ok, step2Ok, step3Ok, step4Ok, step5Ok][step];
+
+  // Secure Boot requires UEFI firmware; keep the firmware selector consistent so the
+  // user can't pick BIOS + Secure Boot (the backend would force UEFI anyway).
+  useEffect(() => {
+    if (secureBoot && firmware !== "uefi") setFirmware("uefi");
+  }, [secureBoot, firmware]);
 
   const submit = async () => {
     if (!step0Ok || !step1Ok || !step2Ok) return;
@@ -123,7 +143,20 @@ export function VMCreateWizard() {
       ],
       nics: networkId ? [{ networkId }] : [],
       bootIso: bootIso || undefined,
+      tpm: tpm || undefined,
+      secureBoot: secureBoot || undefined,
     };
+    if (ciEnabled) {
+      const sshKeys = ciSshKeys.split("\n").map((s) => s.trim()).filter(Boolean);
+      const runCmd = ciRunCmd.split("\n").map((s) => s.trim()).filter(Boolean);
+      spec.cloudInit = {
+        hostname: ciHostname.trim() || undefined,
+        username: ciUsername.trim() || undefined,
+        password: ciPassword || undefined,
+        sshAuthorizedKeys: sshKeys.length > 0 ? sshKeys : undefined,
+        runCmd: runCmd.length > 0 ? runCmd : undefined,
+      };
+    }
     setSubmitting(true);
     try {
       const t = await api.vmCreate(pid, spec);
@@ -421,13 +454,99 @@ export function VMCreateWizard() {
           </div>
         ) : null}
 
+        {step === 4 ? (
+          <div className="col" style={{ gap: "var(--sp-3)" }}>
+            <span className="text-sm secondary">
+              Security firmware for the guest. Windows 11 requires <strong>both</strong> a TPM 2.0 and UEFI Secure Boot.
+            </span>
+            <label className="row" style={{ gap: "var(--sp-2)", alignItems: "flex-start", cursor: "pointer" }}>
+              <input type="checkbox" checked={tpm} onChange={(e) => setTpm(e.target.checked)} />
+              <span className="col" style={{ gap: 2 }}>
+                <span style={{ fontWeight: 600 }}>TPM 2.0 (required for Windows 11)</span>
+                <span className="text-xs muted">Adds an emulated TPM 2.0 device (vTPM, swtpm-backed) for measured boot and BitLocker.</span>
+              </span>
+            </label>
+            <label className="row" style={{ gap: "var(--sp-2)", alignItems: "flex-start", cursor: "pointer" }}>
+              <input type="checkbox" checked={secureBoot} onChange={(e) => setSecureBoot(e.target.checked)} />
+              <span className="col" style={{ gap: 2 }}>
+                <span style={{ fontWeight: 600 }}>Secure Boot (UEFI)</span>
+                <span className="text-xs muted">Boots signed firmware only (OVMF with Microsoft keys + SMM). Forces UEFI firmware.</span>
+              </span>
+            </label>
+            {secureBoot && firmware !== "uefi" ? (
+              <span className="text-xs muted">Firmware switched to UEFI (Secure Boot requires it).</span>
+            ) : null}
+            {(tpm || secureBoot) && !(tpm && secureBoot) ? (
+              <div className="banner" role="status">
+                Windows 11 needs <strong>both</strong> TPM 2.0 and Secure Boot. The VM will still be created with only the
+                selected option(s).
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+
+        {step === 5 ? (
+          <div className="col" style={{ gap: "var(--sp-3)" }}>
+            <label className="row" style={{ gap: "var(--sp-2)", alignItems: "flex-start", cursor: "pointer" }}>
+              <input type="checkbox" checked={ciEnabled} onChange={(e) => setCiEnabled(e.target.checked)} />
+              <span className="col" style={{ gap: 2 }}>
+                <span style={{ fontWeight: 600 }}>Enable cloud-init guest customization</span>
+                <span className="text-xs muted">
+                  Generates a NoCloud seed ISO (user-data + meta-data) so the guest self-configures on first boot.
+                  Requires a <strong>cloud-init-enabled guest image</strong> (e.g. an Ubuntu/Debian/Fedora cloud image).
+                </span>
+              </span>
+            </label>
+            {ciEnabled ? (
+              <>
+                <div className="row-wrap" style={{ gap: "var(--sp-3)" }}>
+                  <TextField label="Hostname" value={ciHostname} onChange={(e) => setCiHostname(e.target.value)} placeholder="my-host" />
+                  <TextField label="Username" value={ciUsername} onChange={(e) => setCiUsername(e.target.value)} placeholder="cloud" />
+                  <TextField
+                    label="Password"
+                    type="password"
+                    value={ciPassword}
+                    onChange={(e) => setCiPassword(e.target.value)}
+                    placeholder="optional"
+                  />
+                </div>
+                <label className="field">
+                  <span className="field-label">SSH public key(s) — one per line</span>
+                  <textarea
+                    className="input"
+                    rows={3}
+                    value={ciSshKeys}
+                    onChange={(e) => setCiSshKeys(e.target.value)}
+                    placeholder="ssh-ed25519 AAAA... user@host"
+                    style={{ fontFamily: "var(--font-mono)", resize: "vertical" }}
+                  />
+                </label>
+                <label className="field">
+                  <span className="field-label">First-boot commands (runcmd) — one per line</span>
+                  <textarea
+                    className="input"
+                    rows={3}
+                    value={ciRunCmd}
+                    onChange={(e) => setCiRunCmd(e.target.value)}
+                    placeholder="apt-get update"
+                    style={{ fontFamily: "var(--font-mono)", resize: "vertical" }}
+                  />
+                </label>
+                <span className="text-xs muted">
+                  Cloud-init is applied by KVM/libvirt providers only; non-cloud-init guest images will ignore the seed.
+                </span>
+              </>
+            ) : null}
+          </div>
+        ) : null}
+
         {/* Navigation */}
         <div className="row">
           <ActionButton variant="ghost" disabled={step === 0 || submitting} onClick={() => setStep((s) => (s - 1) as StepIndex)}>
             Back
           </ActionButton>
           <span className="spacer" />
-          {step < 3 ? (
+          {step < 5 ? (
             <ActionButton
               variant="primary"
               disabled={!stepValid}

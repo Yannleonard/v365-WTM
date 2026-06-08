@@ -1465,6 +1465,34 @@ export interface VMSpec {
   disks: VMSpecDisk[];
   nics: VMSpecNic[];
   bootIso?: string;
+  // tpm requests an emulated TPM 2.0 device (vTPM) — required for Windows 11.
+  tpm?: boolean;
+  // secureBoot enables UEFI Secure Boot (implies UEFI firmware + signed OVMF).
+  secureBoot?: boolean;
+  // cloudInit, when set, generates a NoCloud seed ISO (cloud-init guest
+  // customization) attached to the VM. Requires a cloud-init-enabled guest image.
+  cloudInit?: CloudInitSpec;
+}
+
+// CloudInitSpec is guest customization applied via a NoCloud seed ISO. Mirrors the
+// backend vprovider.CloudInitSpec. All fields are optional; an empty spec seeds a
+// minimal datasource. Requires a cloud-init-enabled guest image (e.g. an Ubuntu/
+// Debian/Fedora/RHEL cloud image) for any of this to take effect on first boot.
+export interface CloudInitSpec {
+  // hostname sets the guest hostname / fqdn (local-hostname in meta-data).
+  hostname?: string;
+  // username creates a sudo user on first boot.
+  username?: string;
+  // password is the plaintext password for username (the guest hashes it).
+  password?: string;
+  // sshAuthorizedKeys are public keys installed for username.
+  sshAuthorizedKeys?: string[];
+  // runCmd is a list of shell commands run once on first boot.
+  runCmd?: string[];
+  // networkConfig is optional raw cloud-init network-config v2 YAML ("" = DHCP).
+  networkConfig?: string;
+  // userDataExtra is optional raw extra #cloud-config appended (advanced).
+  userDataExtra?: string;
 }
 
 // VM power operation tokens (path segment for the power endpoint).

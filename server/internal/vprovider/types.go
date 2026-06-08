@@ -191,6 +191,31 @@ type VMSpec struct {
 	NICs      []NICSpec         `json:"nics,omitempty"`
 	Labels    map[string]string `json:"labels,omitempty"`
 	BootISO   string            `json:"bootIso,omitempty"` // optional install ISO path/id
+
+	// --- security/firmware (vTPM + Secure Boot) ---
+	// TPM requests an emulated TPM 2.0 device (swtpm) — required for Windows 11.
+	TPM bool `json:"tpm,omitempty"`
+	// SecureBoot enables UEFI Secure Boot (implies UEFI firmware + signed OVMF).
+	SecureBoot bool `json:"secureBoot,omitempty"`
+
+	// --- guest customization (cloud-init / NoCloud) ---
+	// CloudInit, when non-nil, generates a NoCloud seed ISO (user-data + meta-data)
+	// attached to the VM so a cloud-init-enabled guest image self-configures on boot.
+	CloudInit *CloudInitSpec `json:"cloudInit,omitempty"`
+}
+
+// CloudInitSpec is normalized guest customization applied via a NoCloud seed.
+type CloudInitSpec struct {
+	Hostname       string   `json:"hostname,omitempty"`
+	Username       string   `json:"username,omitempty"`
+	Password       string   `json:"password,omitempty"` // plaintext; provider hashes/seeds it
+	SSHAuthorizedKeys []string `json:"sshAuthorizedKeys,omitempty"`
+	// RunCmd is an optional list of shell commands run on first boot.
+	RunCmd []string `json:"runCmd,omitempty"`
+	// NetworkConfig is optional raw cloud-init network-config v2 YAML ("" = DHCP).
+	NetworkConfig string `json:"networkConfig,omitempty"`
+	// UserDataExtra is optional raw extra #cloud-config appended (advanced).
+	UserDataExtra string `json:"userDataExtra,omitempty"`
 }
 
 // DiskSpec is a disk to create/attach.

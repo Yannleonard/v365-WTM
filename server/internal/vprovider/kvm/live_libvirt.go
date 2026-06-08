@@ -449,6 +449,20 @@ func (b *liveBackend) defineDomain(d *libvirtDomain) error {
 		dk.Source = path
 		dk.Driver = format
 	}
+	// Cloud-init (NoCloud) guest customization: build the 'cidata' seed ISO and
+	// attach it as an extra cdrom (renderDomainXML reads d.SeedISO). The seed lands
+	// in the first disk's pool (or "default") so the qemu process can read it.
+	if d.CloudInit != nil {
+		poolName := "default"
+		if len(d.Disks) > 0 && d.Disks[0].Pool != "" {
+			poolName = d.Disks[0].Pool
+		}
+		seed, err := b.buildSeedISO(d.Name, poolName, d.CloudInit)
+		if err != nil {
+			return err
+		}
+		d.SeedISO = seed
+	}
 	xmlDesc := renderDomainXML(d)
 	dom, err := l.DomainDefineXML(xmlDesc)
 	if err != nil {
@@ -2060,6 +2074,45 @@ func netModeFromXML(raw string) string {
 }
 
 // renderDomainXML builds a minimal-but-valid libvirt domain XML for define/create.
+// Secure-boot OVMF firmware paths (confirmed present on the WSL libvirt host).
+//   - secureBootCodePath    : the read-only OVMF CODE built with secure-boot support.
+//   - secureBootVarsTemplate: the VARS template PRE-ENROLLED with Microsoft's KEK/db
+//     keys, so a guest can verify Windows' Microsoft-signed bootloader out of the box.
+//     libvirt copies it to a per-VM nvram file on first define.
+const (
+	secureBootCodePath     = "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd"
+	secureBootVarsTemplate = "/usr/share/OVMF/OVMF_VARS_4M.ms.fd"
+	// secureBootNVRAMDir is libvirt's default per-VM nvram location.
+	secureBootNVRAMDir = "/var/lib/libvirt/images"
+)
+
+// secureBootNVRAMPath is the per-VM nvram (VARS) copy path. Each VM gets its own
+// writable copy of the MS-keys VARS template so their secure-boot state is isolated.
+// The path is derived from the (libvirt-unique) domain name, sanitized to a safe
+// filename — NOT truncated, so distinct VMs never collide on the same nvram file.
+func secureBootNVRAMPath(name string) string {
+	return filepath.Join(secureBootNVRAMDir, sanitizeFilename(name)+"_VARS.fd")
+}
+
+// sanitizeFilename keeps [A-Za-z0-9._-] from name (replacing other runes with '-')
+// so the result is a safe, collision-free filename component. Unlike sanitizeBridge
+// it does NOT cap the length, preserving uniqueness across VM names.
+func sanitizeFilename(name string) string {
+	var sb strings.Builder
+	for _, r := range name {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-':
+			sb.WriteRune(r)
+		default:
+			sb.WriteRune('-')
+		}
+	}
+	if sb.Len() == 0 {
+		return "vm"
+	}
+	return sb.String()
+}
+
 func renderDomainXML(d *libvirtDomain) string {
 	memKiB := d.MemoryKB
 	if memKiB <= 0 {
@@ -2078,14 +2131,38 @@ func renderDomainXML(d *libvirtDomain) string {
 	// Always use the modern q35 machine type so EVERY UniHV-created VM supports PCIe
 	// hot-plug (live add/remove of disks & NICs). i440fx's pci.0 bus cannot hotplug,
 	// so we no longer emit it. UEFI adds the efi firmware loader.
-	if d.Firmware == vp.FirmwareUEFI {
+	switch {
+	case d.SecureBoot:
+		// Secure Boot: pin the SECURE-BOOT OVMF firmware explicitly. The loader is
+		// the secboot CODE image (secure='yes' arms the SMM-protected boot path); the
+		// nvram is a PER-VM copy of the Microsoft-keys-enrolled VARS template so the
+		// guest's secure-boot db/KEK/PK chain validates Windows' signed bootloader.
+		// libvirt copies <nvram template=...> -> the per-VM path automatically on
+		// first define. SMM (emitted in <features> below) is REQUIRED for secure boot.
+		nvram := secureBootNVRAMPath(d.Name)
+		// NOTE: do NOT set firmware='efi' on <os> here. firmware='efi' asks libvirt to
+		// AUTOSELECT a firmware from its descriptors, which conflicts with an explicit
+		// <loader> path ("Unable to find 'efi' firmware compatible with the current
+		// configuration"). We pin the loader+nvram MANUALLY instead — the canonical way
+		// to force a specific secure-boot OVMF build.
+		fmt.Fprintf(&sb, "  <os>\n")
+		fmt.Fprintf(&sb, "    <type arch='x86_64' machine='q35'>hvm</type>\n")
+		fmt.Fprintf(&sb, "    <loader readonly='yes' secure='yes' type='pflash'>%s</loader>\n", xmlEscape(secureBootCodePath))
+		fmt.Fprintf(&sb, "    <nvram template='%s'>%s</nvram>\n", xmlEscape(secureBootVarsTemplate), xmlEscape(nvram))
+		fmt.Fprintf(&sb, "  </os>\n")
+	case d.Firmware == vp.FirmwareUEFI:
 		fmt.Fprintf(&sb, "  <os firmware='efi'><type arch='x86_64' machine='q35'>hvm</type></os>\n")
-	} else {
+	default:
 		fmt.Fprintf(&sb, "  <os><type arch='x86_64' machine='q35'>hvm</type></os>\n")
 	}
 	// ACPI is required by q35/UEFI on x86_64 and expected by every modern guest;
-	// APIC enables SMP/IO interrupt routing.
-	fmt.Fprintf(&sb, "  <features><acpi/><apic/></features>\n")
+	// APIC enables SMP/IO interrupt routing. Secure Boot additionally REQUIRES SMM
+	// (System Management Mode) so the firmware can protect the secure-boot variables.
+	if d.SecureBoot {
+		fmt.Fprintf(&sb, "  <features><acpi/><apic/><smm state='on'/></features>\n")
+	} else {
+		fmt.Fprintf(&sb, "  <features><acpi/><apic/></features>\n")
+	}
 	fmt.Fprintf(&sb, "  <devices>\n")
 	// Pre-provision ample spare pcie-root-ports so devices can be HOT-PLUGGED later
 	// (CapHotPlug) AND so the VM's own boot disk/NIC/cdrom have slots. Too few ports
@@ -2093,6 +2170,14 @@ func renderDomainXML(d *libvirtDomain) string {
 	// headroom (libvirt assigns the addresses automatically; unused ports are cheap).
 	for i := 1; i <= 14; i++ {
 		fmt.Fprintf(&sb, "    <controller type='pci' index='%d' model='pcie-root-port'/>\n", i)
+	}
+	// vTPM 2.0: an emulated TPM (swtpm) backing a tpm-crb device — Windows 11 requires
+	// a TPM 2.0. tpm-crb is the modern CRB interface (preferred over tpm-tis for
+	// UEFI/Win11). Independent of Secure Boot; Win11 needs BOTH (TPM + Secure Boot).
+	if d.TPM {
+		fmt.Fprintf(&sb, "    <tpm model='tpm-crb'>\n")
+		fmt.Fprintf(&sb, "      <backend type='emulator' version='2.0'/>\n")
+		fmt.Fprintf(&sb, "    </tpm>\n")
 	}
 	for _, dk := range d.Disks {
 		driver := dk.Driver
@@ -2126,6 +2211,17 @@ func renderDomainXML(d *libvirtDomain) string {
 		fmt.Fprintf(&sb, "      <boot order='1'/>\n")
 	}
 	fmt.Fprintf(&sb, "    </disk>\n")
+	// Cloud-init NoCloud seed: a SECOND read-only cdrom carrying the 'cidata' ISO so a
+	// cloud-init-enabled guest reads its datasource (user-data + meta-data) on first
+	// boot. Uses a distinct sata target (sdb) so it coexists with the boot/media cdrom.
+	if d.SeedISO != "" {
+		fmt.Fprintf(&sb, "    <disk type='file' device='cdrom'>\n")
+		fmt.Fprintf(&sb, "      <driver name='qemu' type='raw'/>\n")
+		fmt.Fprintf(&sb, "      <source file='%s'/>\n", xmlEscape(d.SeedISO))
+		fmt.Fprintf(&sb, "      <target dev='sdb' bus='sata'/>\n")
+		fmt.Fprintf(&sb, "      <readonly/>\n")
+		fmt.Fprintf(&sb, "    </disk>\n")
+	}
 	for _, nic := range d.NICs {
 		if nic.Network == "" {
 			continue

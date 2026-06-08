@@ -102,12 +102,30 @@ type libvirtDomain struct {
 	MemoryKB int64  // <memory unit='KiB'> ; libvirt reports memory in KiB
 	OSType   string // <os><type> / metadata -> GuestOS
 	Firmware vp.Firmware
+	// TPM requests an emulated TPM 2.0 device (<tpm model='tpm-crb'><backend
+	// type='emulator' version='2.0'/></tpm>) — required for Windows 11. Backed by
+	// swtpm on the libvirt host.
+	TPM bool
+	// SecureBoot enables UEFI Secure Boot: it forces the secure-boot OVMF firmware
+	// (loader secure='yes' + the MS-keys-enrolled VARS template) and <smm state='on'/>
+	// (SMM is mandatory for secure boot). Implies UEFI firmware.
+	SecureBoot bool
 	Disks    []libvirtDisk
 	NICs     []libvirtNIC
 	IPs      []string
 	Labels   map[string]string
 	Created  int64  // unix seconds
 	BootISO  string // optional boot CD-ROM ISO path (from VMSpec.BootISO)
+
+	// --- guest customization (cloud-init / NoCloud) ---
+	// CloudInit, when non-nil, requests a NoCloud seed ISO at define time. The LIVE
+	// backend builds it (buildSeedISO) and sets SeedISO to the resulting path; the
+	// sim backend ignores it (cloud-init is a live-only feature).
+	CloudInit *vp.CloudInitSpec
+	// SeedISO is the on-disk path of the generated NoCloud 'cidata' seed ISO. When
+	// set, renderDomainXML attaches it as an additional read-only cdrom so the guest
+	// reads the cloud-init datasource from a CD labeled 'cidata'.
+	SeedISO string
 }
 
 // libvirtDisk subsets a <disk> element.

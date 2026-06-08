@@ -1116,6 +1116,10 @@ function ReconfigureBody({
         <dl className="spec-summary">
           <dt>Firmware</dt>
           <dd>{vm.firmware || "—"}</dd>
+          <dt>Secure Boot</dt>
+          <dd>{vm.firmware === "uefi" ? "Available (UEFI)" : "Not available (BIOS)"}</dd>
+          <dt>TPM</dt>
+          <dd>{vm.labels?.tpm === "true" ? "TPM 2.0 (vTPM)" : "Reported by hypervisor"}</dd>
           <dt>Guest OS</dt>
           <dd>{vm.guestOs || "—"}</dd>
           <dt>Boot order</dt>
@@ -1123,7 +1127,7 @@ function ReconfigureBody({
         </dl>
         <div className="drawer-banner info">
           <IconHelp size={15} />
-          <span>Firmware and boot order are reported by the hypervisor. Changing them requires a power-off and is managed in the create wizard / native console.</span>
+          <span>Firmware, Secure Boot and TPM are set at creation and cannot be changed in place — they require recreating the VM (use the create wizard's Security step). Boot order is reported by the hypervisor.</span>
         </div>
       </div>
     </Drawer>

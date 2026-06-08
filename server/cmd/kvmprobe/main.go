@@ -251,6 +251,8 @@ func main() {
 	proveSnapshotOnDiskedDomain(ctx, p, socket)
 	proveDuplicateNetworkConflict(ctx, p)
 	proveHotPlug(ctx, p)
+	proveTPMSecureBoot(ctx, p)
+	proveCloudInit(ctx, p)
 
 	fmt.Println("\nPROBE OK: real libvirt RPC API exercised end to end.")
 }
@@ -765,6 +767,261 @@ func proveDuplicateNetworkConflict(ctx context.Context, p *kvm.Provider) {
 	}
 	fmt.Println("  CONFIRMED: duplicate-name maps to vp.ErrConflict (-> HTTP 409).")
 	fmt.Println()
+}
+
+// proveTPMSecureBoot: vTPM 2.0 + UEFI Secure Boot proof (Windows 11 prerequisites).
+// Creates a domain with spec.TPM=true + spec.SecureBoot=true + a real backing disk,
+// STARTS it, then confirms via the LIVE domain XML (DomainGetXMLDesc, dumped via
+// virsh) that ALL THREE are present:
+//   - <tpm ... version='2.0'>   (emulated TPM 2.0)
+//   - <loader ... secure='yes'> (secure-boot OVMF firmware armed)
+//   - <smm state='on'>          (SMM, mandatory for secure boot)
+// then deletes the domain (DomainUndefineNvram drops the per-VM VARS copy) + disk.
+func proveTPMSecureBoot(ctx context.Context, p *kvm.Provider) {
+	fmt.Println("== vTPM 2.0 + Secure Boot proof: Windows 11 firmware prerequisites in the LIVE domain XML ==")
+	sp, ok := any(p).(vprovider.StorageProvider)
+	if !ok {
+		fmt.Println("  provider has no StorageProvider; skipping")
+		fmt.Println()
+		return
+	}
+	pools, _ := p.ListStorage(ctx)
+	var pool string
+	for _, pl := range pools {
+		if pl.Accessible {
+			pool = pl.Name
+			break
+		}
+	}
+	if pool == "" {
+		fmt.Println("  no active storage pool; skipping TPM/secure-boot proof")
+		fmt.Println()
+		return
+	}
+
+	// Real backing disk so the domain is bootable/snapshotable like a true Win11 VM.
+	volName := fmt.Sprintf("unihv-win11-boot-%d.qcow2", time.Now().UnixNano())
+	if _, err := sp.CreateVolume(ctx, vprovider.VolumeSpec{Name: volName, StorageID: pool, CapacityGB: 1, Format: vprovider.DiskQcow2}); err != nil {
+		fatalf("tpm: CreateVolume(boot): %v", err)
+	}
+	var diskPath string
+	if vols, err := sp.ListVolumes(ctx, pool); err == nil {
+		for _, v := range vols {
+			if v.Name == volName {
+				diskPath = v.Path
+			}
+		}
+	}
+
+	name := fmt.Sprintf("unihv-win11-dom-%d", time.Now().UnixNano())
+	task, err := p.CreateVM(ctx, vprovider.VMSpec{
+		Name: name, VCPUs: 2, MemoryMB: 512,
+		TPM: true, SecureBoot: true, Firmware: vprovider.FirmwareUEFI,
+		Disks: []vprovider.DiskSpec{{StorageID: pool, SourcePath: diskPath, Format: vprovider.DiskQcow2, CapacityGB: 1}},
+	})
+	if err != nil {
+		fatalf("tpm: CreateVM(TPM+SecureBoot): %v", err)
+	}
+	id := task.EntityID
+	cleanup := func() {
+		_, _ = p.DeleteVM(ctx, id, vprovider.DeleteOptions{Force: true})
+		_, _ = sp.DeleteVolume(ctx, pool, volName)
+	}
+	defer cleanup()
+	fmt.Printf("  created %s id=%s (TPM=true SecureBoot=true UEFI, 1 disk)\n", name, id)
+
+	// START it — a real, running Win11-style domain with vTPM + secure boot active.
+	if _, err := p.PowerOp(ctx, id, vprovider.PowerStart); err != nil {
+		fatalf("tpm: PowerStart: %v (swtpm + OVMF.secboot must be installed on the host)", err)
+	}
+	fmt.Printf("  PowerStart -> domain running\n")
+
+	// Confirm via the LIVE domain XML (virsh dumpxml is the independent source of truth).
+	xml := dumpXML(ctx, name)
+	hasTPM := strings.Contains(xml, "<tpm") && strings.Contains(xml, "version='2.0'")
+	hasSecure := strings.Contains(xml, "secure='yes'")
+	hasSMM := strings.Contains(xml, "<smm state='on'")
+	fmt.Printf("  live XML checks: vTPM2.0=%v  loader secure='yes'=%v  smm state='on'=%v\n", hasTPM, hasSecure, hasSMM)
+	for _, line := range strings.Split(xml, "\n") {
+		l := strings.TrimSpace(line)
+		if strings.Contains(l, "<tpm") || strings.Contains(l, "<backend type='emulator'") ||
+			strings.Contains(l, "secure='yes'") || strings.Contains(l, "<smm") ||
+			strings.Contains(l, "<nvram") {
+			fmt.Printf("    | %s\n", l)
+		}
+	}
+	if !hasTPM || !hasSecure || !hasSMM {
+		fatalf("tpm: live domain XML missing one of vTPM2.0/secure-boot loader/SMM — feature NOT proven")
+	}
+	fmt.Println("  CONFIRMED: vTPM 2.0 + Secure-Boot loader + SMM all present in the LIVE domain — Win11-ready.")
+	fmt.Println()
+}
+
+// dumpXML returns the live domain XML via virsh (qemu:///system), else "".
+func dumpXML(ctx context.Context, name string) string {
+	out, err := exec.CommandContext(ctx, "virsh", "-c", "qemu:///system", "dumpxml", name).CombinedOutput()
+	if err != nil {
+		out2, err2 := exec.CommandContext(ctx, "virsh", "dumpxml", name).CombinedOutput()
+		if err2 != nil {
+			fmt.Printf("  (virsh dumpxml unavailable: %v)\n", err)
+			return string(out)
+		}
+		return string(out2)
+	}
+	return string(out)
+}
+
+// proveCloudInit: cloud-init NoCloud guest customization proof. Creates a domain
+// with a CloudInitSpec (hostname + user + ssh key + runcmd), then confirms:
+//   - the LIVE domain XML has a SECOND cdrom whose <source> points at a *-seed.iso
+//   - that seed ISO file exists on disk and reports a 'cidata' volume id (xorriso -indev)
+// then deletes the domain + backing disk + seed ISO.
+func proveCloudInit(ctx context.Context, p *kvm.Provider) {
+	fmt.Println("== cloud-init proof: NoCloud 'cidata' seed ISO built by xorriso + attached as a cdrom ==")
+	sp, ok := any(p).(vprovider.StorageProvider)
+	if !ok {
+		fmt.Println("  provider has no StorageProvider; skipping")
+		fmt.Println()
+		return
+	}
+	pools, _ := p.ListStorage(ctx)
+	var pool string
+	for _, pl := range pools {
+		if pl.Accessible {
+			pool = pl.Name
+			break
+		}
+	}
+	if pool == "" {
+		fmt.Println("  no active storage pool; skipping cloud-init proof")
+		fmt.Println()
+		return
+	}
+
+	// Real backing disk so this resembles a true cloud-image VM.
+	volName := fmt.Sprintf("unihv-ci-boot-%d.qcow2", time.Now().UnixNano())
+	if _, err := sp.CreateVolume(ctx, vprovider.VolumeSpec{Name: volName, StorageID: pool, CapacityGB: 1, Format: vprovider.DiskQcow2}); err != nil {
+		fatalf("cloudinit: CreateVolume(boot): %v", err)
+	}
+	var diskPath string
+	if vols, err := sp.ListVolumes(ctx, pool); err == nil {
+		for _, v := range vols {
+			if v.Name == volName {
+				diskPath = v.Path
+			}
+		}
+	}
+
+	name := fmt.Sprintf("unihv-ci-dom-%d", time.Now().UnixNano())
+	ci := &vprovider.CloudInitSpec{
+		Hostname:          "ci-demo",
+		Username:          "cloud",
+		Password:          "Passw0rd!",
+		SSHAuthorizedKeys: []string{"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIProbeKeyXXXXXXXXXXXXXXXXXXXXXXXX probe@unihv"},
+		RunCmd:            []string{"echo unihv-cloud-init-ran > /tmp/unihv-ci"},
+	}
+	task, err := p.CreateVM(ctx, vprovider.VMSpec{
+		Name: name, VCPUs: 1, MemoryMB: 512, Firmware: vprovider.FirmwareUEFI,
+		Disks:     []vprovider.DiskSpec{{StorageID: pool, SourcePath: diskPath, Format: vprovider.DiskQcow2, CapacityGB: 1}},
+		CloudInit: ci,
+	})
+	if err != nil {
+		fatalf("cloudinit: CreateVM(CloudInit): %v", err)
+	}
+	id := task.EntityID
+	seedToDelete := ""
+	defer func() {
+		_, _ = p.DeleteVM(ctx, id, vprovider.DeleteOptions{Force: true})
+		_, _ = sp.DeleteVolume(ctx, pool, volName)
+		if seedToDelete != "" {
+			_ = os.Remove(seedToDelete)
+		}
+	}()
+	fmt.Printf("  created %s id=%s (CloudInit: hostname=%s user=%s 1 ssh key, 1 runcmd)\n", name, id, ci.Hostname, ci.Username)
+
+	// Confirm the seed cdrom is attached in the LIVE domain XML.
+	domXML := dumpXML(ctx, name)
+	seedPath := ""
+	for _, line := range strings.Split(domXML, "\n") {
+		l := strings.TrimSpace(line)
+		if strings.Contains(l, "-seed.iso") {
+			// extract the source file path
+			if i := strings.Index(l, "file='"); i >= 0 {
+				rest := l[i+len("file='"):]
+				if j := strings.Index(rest, "'"); j >= 0 {
+					seedPath = rest[:j]
+				}
+			}
+		}
+	}
+	cdromCount := strings.Count(domXML, "device='cdrom'")
+	fmt.Printf("  live XML: cdrom devices=%d  seed cdrom <source>=%q\n", cdromCount, seedPath)
+	if seedPath == "" {
+		fatalf("cloudinit: no *-seed.iso cdrom found in the live domain XML — feature NOT proven")
+	}
+	seedToDelete = seedPath
+
+	// Confirm the seed ISO file exists and carries the 'cidata' volume id.
+	if _, statErr := os.Stat(seedPath); statErr != nil {
+		fatalf("cloudinit: seed ISO %s does not exist: %v", seedPath, statErr)
+	}
+	volid := isoVolID(ctx, seedPath)
+	fmt.Printf("  seed ISO on disk: %s  volume-id=%q\n", seedPath, volid)
+	if !strings.EqualFold(strings.TrimSpace(volid), "cidata") {
+		fatalf("cloudinit: seed ISO volume id is %q, want 'cidata' (NoCloud datasource won't find it)", volid)
+	}
+	// Dump the embedded user-data so the proof shows the rendered #cloud-config.
+	if ud := isoFile(ctx, seedPath, "user-data"); ud != "" {
+		fmt.Println("  --- embedded user-data ---")
+		for _, l := range strings.Split(strings.TrimRight(ud, "\n"), "\n") {
+			fmt.Printf("  | %s\n", l)
+		}
+	}
+	fmt.Println("  CONFIRMED: xorriso built a 'cidata' NoCloud seed ISO and libvirt attached it as a cdrom.")
+	fmt.Println()
+}
+
+// isoVolID reads the ISO9660/Joliet volume id of an image via xorriso -indev.
+func isoVolID(ctx context.Context, path string) string {
+	out, err := exec.CommandContext(ctx, "xorriso", "-indev", path, "-pvd_info").CombinedOutput()
+	if err != nil {
+		// blkid is a simpler fallback for the LABEL.
+		if bo, berr := exec.CommandContext(ctx, "blkid", "-o", "value", "-s", "LABEL", path).CombinedOutput(); berr == nil {
+			return strings.TrimSpace(string(bo))
+		}
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		l := strings.TrimSpace(line)
+		// xorriso -pvd_info prints e.g. "Volume Id    : cidata"
+		if strings.HasPrefix(strings.ToLower(l), "volume id") {
+			if i := strings.Index(l, ":"); i >= 0 {
+				// xorriso prints the id wrapped in single quotes, e.g. 'cidata'.
+				return strings.Trim(strings.TrimSpace(l[i+1:]), "'\"")
+			}
+		}
+	}
+	return ""
+}
+
+// isoFile extracts a single file's contents from an ISO via xorriso -osirrox.
+func isoFile(ctx context.Context, isoPath, name string) string {
+	tmp, err := os.MkdirTemp("", "unihv-ci-extract-*")
+	if err != nil {
+		return ""
+	}
+	defer os.RemoveAll(tmp)
+	dst := tmp + "/" + name
+	cmd := exec.CommandContext(ctx, "xorriso", "-osirrox", "on", "-indev", isoPath, "-extract", "/"+name, dst)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		_ = out
+		return ""
+	}
+	b, err := os.ReadFile(dst)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 func fatalf(format string, args ...any) {
