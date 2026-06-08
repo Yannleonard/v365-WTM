@@ -782,12 +782,13 @@ func mapLibvirtErr(err error) error {
 		// max allowable", or a diskless internal-snapshot request) -> 422.
 		return vp.ErrInvalidSpec
 	case libvirt.ErrOperationFailed:
-		// ErrOperationFailed (9) is generic. libvirt reports a duplicate-name
-		// collision on NetworkDefineXML this way (message: "network '...' already
-		// exists with uuid ..."), so disambiguate on the message and surface a
-		// conflict (HTTP 409). Anything else stays a generic error (500).
-		if isAlreadyExistsMsg(le.Message) {
-			return vp.ErrConflict
+		// ErrOperationFailed (9) is generic; disambiguate on the message and surface
+		// an actionable 409 instead of an opaque 500 where we can.
+		//   - duplicate-name collision (NetworkDefineXML "... already exists ...")
+		//   - hot-plug unsupported on i440fx ("Bus 'pci.0' does not support hotplugging")
+		//   - disk lock contention ("Failed to get ... lock")
+		if isAlreadyExistsMsg(le.Message) || isHotplugUnsupportedMsg(le.Message) || isLockMsg(le.Message) {
+			return fmt.Errorf("%w: %s", vp.ErrConflict, friendlyLibvirtMsg(le.Message))
 		}
 		return err
 	default:
@@ -800,6 +801,31 @@ func mapLibvirtErr(err error) error {
 // under the generic ErrOperationFailed code rather than a dedicated *Exist code).
 func isAlreadyExistsMsg(msg string) bool {
 	return strings.Contains(strings.ToLower(msg), "already exists")
+}
+
+// isHotplugUnsupportedMsg detects the i440fx PCI-hotplug limitation.
+func isHotplugUnsupportedMsg(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "does not support hotplug") || strings.Contains(m, "no more available pci slots")
+}
+
+// isLockMsg detects disk-lock contention (e.g. attaching a disk already in use).
+func isLockMsg(msg string) bool {
+	return strings.Contains(strings.ToLower(msg), "lock")
+}
+
+// friendlyLibvirtMsg turns a raw libvirt message into an actionable hint.
+func friendlyLibvirtMsg(msg string) string {
+	switch {
+	case isHotplugUnsupportedMsg(msg):
+		return "this VM's machine type (i440fx) does not support hot-plug; recreate the VM as q35, or stop the VM to attach the device offline"
+	case isLockMsg(msg):
+		return "the disk is already in use (locked) by this or another VM"
+	case isAlreadyExistsMsg(msg):
+		return "an object with that name already exists"
+	default:
+		return msg
+	}
 }
 
 // errorAs is errors.As specialized to avoid importing errors twice across files.
@@ -1060,7 +1086,10 @@ func (b *liveBackend) listVolumes(storageID string) ([]vp.Volume, error) {
 			}
 		}
 		out = append(out, vp.Volume{
-			ID:         v.Key,
+			// ID is the volume NAME (unique within a pool) so the API URL carries a
+			// simple token, not a URL-encoded absolute path. volHandle resolves it via
+			// StorageVolLookupByName (fast path); the real path is in .Path.
+			ID:         v.Name,
 			Name:       v.Name,
 			StorageID:  storageID,
 			Format:     format,
@@ -2046,24 +2075,24 @@ func renderDomainXML(d *libvirtDomain) string {
 	fmt.Fprintf(&sb, "  <memory unit='KiB'>%d</memory>\n", memKiB)
 	fmt.Fprintf(&sb, "  <currentMemory unit='KiB'>%d</currentMemory>\n", memKiB)
 	fmt.Fprintf(&sb, "  <vcpu placement='static'>%d</vcpu>\n", vcpu)
+	// Always use the modern q35 machine type so EVERY UniHV-created VM supports PCIe
+	// hot-plug (live add/remove of disks & NICs). i440fx's pci.0 bus cannot hotplug,
+	// so we no longer emit it. UEFI adds the efi firmware loader.
 	if d.Firmware == vp.FirmwareUEFI {
 		fmt.Fprintf(&sb, "  <os firmware='efi'><type arch='x86_64' machine='q35'>hvm</type></os>\n")
 	} else {
-		fmt.Fprintf(&sb, "  <os><type arch='x86_64' machine='pc'>hvm</type></os>\n")
+		fmt.Fprintf(&sb, "  <os><type arch='x86_64' machine='q35'>hvm</type></os>\n")
 	}
-	// ACPI is required by UEFI on x86_64 ("UEFI requires ACPI on this architecture")
-	// and is expected by every modern guest; APIC enables SMP/IO interrupt routing.
+	// ACPI is required by q35/UEFI on x86_64 and expected by every modern guest;
+	// APIC enables SMP/IO interrupt routing.
 	fmt.Fprintf(&sb, "  <features><acpi/><apic/></features>\n")
 	fmt.Fprintf(&sb, "  <devices>\n")
-	// On q35/PCIe (UEFI), pre-provision spare pcie-root-ports so devices can be
-	// HOT-PLUGGED later (CapHotPlug). Without free root ports a PCIe machine reports
-	// "No more available PCI slots" on attach. i440fx (pc) hotplugs onto pci.0 and
-	// needs none. libvirt assigns the controller index/addresses automatically.
-	if d.Firmware == vp.FirmwareUEFI {
-		// index 0 is the implicit pcie-root; spare root ports start at index 1.
-		for i := 1; i <= 6; i++ {
-			fmt.Fprintf(&sb, "    <controller type='pci' index='%d' model='pcie-root-port'/>\n", i)
-		}
+	// Pre-provision ample spare pcie-root-ports so devices can be HOT-PLUGGED later
+	// (CapHotPlug) AND so the VM's own boot disk/NIC/cdrom have slots. Too few ports
+	// causes "No more available PCI slots" on a later live attach. 14 gives generous
+	// headroom (libvirt assigns the addresses automatically; unused ports are cheap).
+	for i := 1; i <= 14; i++ {
+		fmt.Fprintf(&sb, "    <controller type='pci' index='%d' model='pcie-root-port'/>\n", i)
 	}
 	for _, dk := range d.Disks {
 		driver := dk.Driver

@@ -2,12 +2,33 @@
   <name>db-server-01</name>
   <memory unit="MiB">4096</memory>
   <vcpu>4</vcpu>
-  <os><type arch="x86_64" machine="pc">hvm</type></os>
+  <os><type arch="x86_64" machine="q35">hvm</type></os>
+  <features><acpi/><apic/></features>
   <devices>
+    <!-- q35 PCIe root-ports give hot-pluggable slots for live disk/NIC add -->
+    <controller type="pci" index="1" model="pcie-root-port"/>
+    <controller type="pci" index="2" model="pcie-root-port"/>
+    <controller type="pci" index="3" model="pcie-root-port"/>
+    <controller type="pci" index="4" model="pcie-root-port"/>
+    <controller type="pci" index="5" model="pcie-root-port"/>
+    <controller type="pci" index="6" model="pcie-root-port"/>
+    <controller type="pci" index="7" model="pcie-root-port"/>
+    <controller type="pci" index="8" model="pcie-root-port"/>
+    <controller type="pci" index="9" model="pcie-root-port"/>
+    <controller type="pci" index="10" model="pcie-root-port"/>
+    <controller type="pci" index="11" model="pcie-root-port"/>
+    <controller type="pci" index="12" model="pcie-root-port"/>
+    <controller type="pci" index="13" model="pcie-root-port"/>
+    <controller type="pci" index="14" model="pcie-root-port"/>
     <disk type="file" device="disk">
       <driver name="qemu" type="qcow2"/>
       <source file="/var/lib/libvirt/images/db-server-01.qcow2"/>
       <target dev="vda" bus="virtio"/>
+    </disk>
+    <disk type="file" device="cdrom">
+      <driver name="qemu" type="raw"/>
+      <target dev="sda" bus="sata"/>
+      <readonly/>
     </disk>
     <interface type="network">
       <source network="default"/>
