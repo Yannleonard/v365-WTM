@@ -12,6 +12,7 @@ import {
   gateVMNetworkWrite,
   gateVMStorageWrite,
   gateVMConsole,
+  gateVMBackup,
 } from "./rbac";
 import type { Capability, VMCapability } from "./types";
 
@@ -130,5 +131,14 @@ describe("VM infrastructure write gates", () => {
     expect(gateVMConsole(["network_write"], ["vm.console"]).allowed).toBe(false);
     // console is allowed on an otherwise read-only provider when the cap is present
     expect(gateVMConsole(RO, ["vm.console"]).allowed).toBe(true);
+  });
+
+  it("gateVMBackup needs export cap + vm.backup, blocked when read-only", () => {
+    const EXPORT: VMCapability[] = ["export", "snapshot"];
+    expect(gateVMBackup(EXPORT, ["vm.backup"]).allowed).toBe(true);
+    expect(gateVMBackup(EXPORT, ["*"]).allowed).toBe(true);
+    expect(gateVMBackup(EXPORT, []).allowed).toBe(false); // missing perm
+    expect(gateVMBackup(["snapshot"], ["vm.backup"]).allowed).toBe(false); // no export cap
+    expect(gateVMBackup(["readonly", "export"], ["*"]).allowed).toBe(false); // read-only
   });
 });

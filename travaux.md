@@ -27,6 +27,21 @@ Il est conçu pour être utilisé par les agents experts et par l’équipe QA.
 | `kvm-expert` export | ✅ déjà fait | file-backed qcow2 = export réel (qemu-img + StorageVolDownload RPC) ; non-file → ErrUnsupported clair. |
 | Placeholders export (KVM/ESXi/Xen/HyperV) | ✅ confinés aux backends sim/tests | plus jamais sur le chemin live. |
 
+### 0ter. Point de coordination immédiat
+
+- **2026-06-08 22:35** — `coordination-lead` a vérifié le code local :
+  - `go test ./server/internal/alarms ./server/internal/api` passe dans Docker.
+  - `cd ui && npm run build && npm test` passe localement.
+  - Le conteneur `unihv` est en service et l’API santé répond `200`.
+- Les agents sont désormais ordonnés de démarrer les tâches suivantes :
+  - `hyperv-expert` : vérification finale de `server/internal/vprovider/hyperv/provider.go`, tests live et attente host réel.
+  - `esxi-expert` : finaliser `server/internal/vprovider/esxi/esxi.go`, tests `govmomi` + host réel.
+  - `xen-expert` : finaliser `server/internal/vprovider/xen/xen.go`, tests XAPI + host réel.
+  - `alarms-expert` : vérifier le canal SMTP réel dans `server/internal/alarms/alarms.go`, ajouter tests d’envoi.
+  - `frontend-engineer` : auditer `ui/src/views/Alarms.tsx` + `ui/src/lib/types.ts`, s’assurer que l’UI n’expose que les actions réellement supportées.
+  - `qa-engineer` : préparer la liste de vérification live et documenter les étapes de test sur `http://localhost:8080/`.
+  - `coordination-lead` : mise à jour du document toutes les 10 minutes, vérification des livrables et arbitrage.
+
 **À PROUVER DEMAIN MATIN sur les hosts réels (Xen/ESXi/Hyper-V fournis par l'owner) :**
 - Brancher chaque host (IP + identifiants) → créer la connexion hyperviseur dans l'app.
 - Hyper-V : VM arrêtée → stream VHDX byte-identique (sha256) ; VM allumée → erreur "stop/checkpoint".
@@ -192,6 +207,7 @@ Ils doivent :
 ### 7.1 Règles de cadence
 
 - Chaque agent doit se mettre à jour dans `travaux.md` toutes les 10 minutes au moins.
+- Le `coordination-lead` se met également à jour toutes les 10 minutes et vérifie l’avancement global.
 - Si un agent termine une tâche ou rencontre un blocage, il inscrit le statut, les résultats et l’étape suivante.
 - Le `coordination-lead` valide les changements et ferme les tickets internes dans le document.
 

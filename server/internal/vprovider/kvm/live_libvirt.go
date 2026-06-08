@@ -1129,9 +1129,15 @@ func mapLibvirtErr(err error) error {
 		return err
 	}
 	switch libvirt.ErrorNumber(le.Code) {
-	case libvirt.ErrNoDomain, libvirt.ErrNoNetwork, libvirt.ErrNoStoragePool,
-		libvirt.ErrNoStorageVol, libvirt.ErrNoDomainSnapshot:
+	case libvirt.ErrNoDomain, libvirt.ErrNoDomainSnapshot:
+		// The addressed VM/snapshot itself doesn't exist -> 404.
 		return vp.ErrNotFound
+	case libvirt.ErrNoNetwork, libvirt.ErrNoStoragePool, libvirt.ErrNoStorageVol:
+		// A REFERENCED object (network/pool/volume) is missing. This happens e.g. on
+		// DomainCreate when the VM's <interface> points at a deleted network. The VM
+		// exists, so 404 ("resource not found") is misleading; surface a clear config
+		// error (422) carrying the libvirt message instead.
+		return fmt.Errorf("%w: %s", vp.ErrInvalidSpec, le.Message)
 	case libvirt.ErrNetworkExist, libvirt.ErrDomExist, libvirt.ErrStorageVolExist,
 		libvirt.ErrOperationInvalid:
 		// Duplicate-name / already-exists and "operation invalid in this state"

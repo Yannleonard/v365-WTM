@@ -277,8 +277,15 @@ function BackupNowModal({ onClose, onDone }: { onClose: () => void; onDone: () =
     if (!valid) return;
     setBusy(true);
     try {
-      await api.vmBackupRun({ providerId, vmId, backendId });
-      toast.success("Backup complete", "Artifact stored on the backend.");
+      const rec = await api.vmBackupRun({ providerId, vmId, backendId });
+      // Export failures (ErrUnsupported on a hypervisor whose live export is pending,
+      // or a KVM non-file disk) come back as an HTTP error -> the catch surfaces the
+      // real message. Defensively, never report a recorded "error" record as success.
+      if (rec.status === "error") {
+        toast.error("Backup failed", rec.error || "Export failed.");
+      } else {
+        toast.success("Backup complete", `${fmtBytes(rec.sizeBytes)} stored on the backend.`);
+      }
       onDone();
     } catch (err) {
       toastError("Backup failed", err);

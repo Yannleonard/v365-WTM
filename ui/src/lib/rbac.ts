@@ -454,6 +454,29 @@ export function gateVMMaintenance(
   return { allowed: true, reason: "" };
 }
 
+/**
+ * Gate the on-demand "Back up now" action (Lot 5B) — cap "export" + vm.backup.
+ * A backup = snapshot -> ExportVM -> upload, so it requires the provider's export
+ * capability and a writable (non-read-only) hypervisor.
+ *
+ * NOTE: every live provider advertises the "export" capability, so this gate does
+ * NOT distinguish hypervisors whose live export is not yet implemented (ESXi / Xen
+ * / Hyper-V) or KVM non-file disks — those return ErrUnsupported AT RUNTIME and are
+ * surfaced to the user as a clear error toast (never a fake success). KVM
+ * file-backed disks (e.g. web-server-01) export for real and succeed.
+ */
+export function gateVMBackup(
+  caps: VMCapability[] | undefined,
+  permissions: string[] | undefined,
+): GateResult {
+  if (hasVMCap(caps, "readonly")) return { allowed: false, reason: "This hypervisor is read-only" };
+  if (!hasVMCap(caps, "export"))
+    return { allowed: false, reason: "Provider does not support disk export / backup" };
+  if (!can(permissions, "vm.backup"))
+    return { allowed: false, reason: "You lack the vm.backup permission" };
+  return { allowed: true, reason: "" };
+}
+
 /** Gate opening the graphical console (cap "console" + vm.console). */
 export function gateVMConsole(
   caps: VMCapability[] | undefined,

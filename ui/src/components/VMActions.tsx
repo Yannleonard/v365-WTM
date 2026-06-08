@@ -19,6 +19,7 @@ import {
   gateVMConsole,
   gateVMHotPlug,
   gateVMTemplate,
+  gateVMBackup,
   type GateResult,
 } from "../lib/rbac";
 import { ActionButton } from "./ActionButton";
@@ -315,12 +316,11 @@ function ActionsMenu(props: Props & { compact?: boolean }) {
   const gMigrate = gateVMAction("migrate", caps, permissions);
   const gTemplate = gateVMTemplate(caps, permissions);
   const gDelete = deleteGate(vm, gateVMAction("delete_vm", caps, permissions), permissions);
-  // Backup (Lot 5B) is gated by vm.backup (export-class; reuses the snapshot/export
-  // capabilities). A read-only provider that cannot export is excluded.
-  const canBackupPerm = (permissions ?? []).includes("vm.backup") || (permissions ?? []).includes("*");
-  const gBackup: GateResult = canBackupPerm
-    ? { allowed: true, reason: "" }
-    : { allowed: false, reason: "You lack the vm.backup permission" };
+  // Backup (Lot 5B): cap "export" + vm.backup, read-only providers excluded. Every
+  // live provider advertises "export", so this does NOT grey out hypervisors whose
+  // live export is pending (ESXi/Xen/Hyper-V) or KVM non-file disks — those surface a
+  // clear ErrUnsupported toast at runtime rather than a fake success.
+  const gBackup = gateVMBackup(caps, permissions);
   const isTemplate = vm.labels?.["unihv.template"] === "true";
 
   const close = () => {

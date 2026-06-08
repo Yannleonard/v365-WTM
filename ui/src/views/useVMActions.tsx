@@ -423,8 +423,16 @@ export function useVMActions() {
     if (!backup || !backup.backendId) return;
     setBackupBusy(true);
     try {
-      await api.vmBackupRun({ providerId: backup.vm.providerId, vmId: backup.vm.id, backendId: backup.backendId });
-      toast.success("Backup complete", backup.vm.name);
+      const rec = await api.vmBackupRun({ providerId: backup.vm.providerId, vmId: backup.vm.id, backendId: backup.backendId });
+      // The backend returns an HTTP error when export fails (e.g. ErrUnsupported on
+      // a hypervisor whose live export is pending, or a KVM non-file disk), so the
+      // catch below surfaces the real message. Defensively, never report a recorded
+      // "error" record as a success.
+      if (rec.status === "error") {
+        toast.error("Backup failed", rec.error || backup.vm.name);
+      } else {
+        toast.success("Backup complete", `${backup.vm.name} — ${formatBytes(rec.sizeBytes, 1)} stored`);
+      }
       queryClient.invalidateQueries({ queryKey: ["vm-backups"] });
       setBackup(null);
     } catch (err) {
