@@ -35,8 +35,9 @@ import {
   IconAlert,
   IconHelp,
   IconCheck,
+  IconScale,
 } from "../components/icons";
-import type { VM, VMDisk, VMNic, VMPowerOp } from "../lib/types";
+import type { VM, VMDisk, VMNic, VMPowerOp, VMSnapshot } from "../lib/types";
 
 interface SnapForm {
   vm: VM;
@@ -79,6 +80,15 @@ interface MountIsoForm {
   storageId: string;
   isoPath: string;
 }
+interface ResizeDiskForm {
+  vm: VM;
+  disk: VMDisk;
+  capacityGb: string;
+}
+interface DeleteSnapForm {
+  vm: VM;
+  snap: VMSnapshot;
+}
 
 export function useVMActions() {
   const queryClient = useQueryClient();
@@ -102,6 +112,11 @@ export function useVMActions() {
   const [mountIso, setMountIso] = useState<MountIsoForm | null>(null);
   const [mountIsoBusy, setMountIsoBusy] = useState(false);
   const [detachBusyId, setDetachBusyId] = useState<string | null>(null);
+
+  // disk resize (online grow) + delete single snapshot
+  const [resize, setResize] = useState<ResizeDiskForm | null>(null);
+  const [resizeBusy, setResizeBusy] = useState(false);
+  const [delSnap, setDelSnap] = useState<DeleteSnapForm | null>(null);
 
   const invalidate = (vm: VM) => {
     queryClient.invalidateQueries({ queryKey: ["vms", vm.providerId] });
@@ -145,6 +160,10 @@ export function useVMActions() {
     setAddDisk({ vm, capacityGb: "10", format: "qcow2", storageId: "" });
   const triggerAddNic = (vm: VM) => setAddNic({ vm, networkId: "", model: "virtio" });
   const triggerMountIso = (vm: VM) => setMountIso({ vm, storageId: "", isoPath: "" });
+  // Pre-fill the resize input one GB above the current size (grow-only nudge).
+  const triggerResizeDisk = (vm: VM, disk: VMDisk) =>
+    setResize({ vm, disk, capacityGb: String(Math.max(1, Math.round(disk.capacityGb)) + 1) });
+  const triggerDeleteSnapshot = (vm: VM, snap: VMSnapshot) => setDelSnap({ vm, snap });
 
   /* ---- confirms ---- */
   const confirmSnapshot = async () => {
@@ -292,6 +311,36 @@ export function useVMActions() {
       toastError("Mount ISO failed", err);
     } finally {
       setMountIsoBusy(false);
+    }
+  };
+
+  const confirmResizeDisk = async () => {
+    if (!resize) return;
+    const cap = Number(resize.capacityGb);
+    setResizeBusy(true);
+    try {
+      await api.vmDiskResize(resize.vm.providerId, resize.vm.id, resize.disk.id, { capacityGb: cap });
+      toast.success("Disk resize requested", `${resize.disk.label || resize.disk.id} → ${cap} GB`);
+      invalidate(resize.vm);
+      setResize(null);
+    } catch (err) {
+      toastError("Resize disk failed", err);
+    } finally {
+      setResizeBusy(false);
+    }
+  };
+
+  // Delete a single snapshot, then refresh both the snapshot tree and the VM.
+  const confirmDeleteSnapshot = async () => {
+    if (!delSnap) return;
+    try {
+      await api.vmSnapshotDelete(delSnap.vm.providerId, delSnap.vm.id, delSnap.snap.id);
+      toast.success("Snapshot deleted", delSnap.snap.name);
+      queryClient.invalidateQueries({ queryKey: ["vm", "snapshots", delSnap.vm.providerId, delSnap.vm.id] });
+      invalidate(delSnap.vm);
+    } catch (err) {
+      toastError("Delete snapshot failed", err);
+      throw err;
     }
   };
 
@@ -679,6 +728,83 @@ export function useVMActions() {
         ) : null}
       </Drawer>
 
+      {/* Resize disk (online grow) */}
+      <Drawer
+        open={resize !== null}
+        title="Resize disk"
+        subtitle={resize ? `${resize.vm.name} · ${resize.disk.label || resize.disk.id}` : undefined}
+        icon={<IconScale size={18} />}
+        busy={resizeBusy}
+        onClose={() => setResize(null)}
+        footer={
+          <>
+            <button className="btn" onClick={() => setResize(null)} disabled={resizeBusy}>
+              Cancel
+            </button>
+            <ActionButton
+              variant="primary"
+              loading={resizeBusy}
+              disabled={!resize || Number(resize.capacityGb) <= resize.disk.capacityGb}
+              tooltip={
+                resize && Number(resize.capacityGb) <= resize.disk.capacityGb
+                  ? "New size must be larger than the current size"
+                  : undefined
+              }
+              onClick={confirmResizeDisk}
+            >
+              <IconScale size={14} />
+              Resize disk
+            </ActionButton>
+          </>
+        }
+      >
+        {resize ? (
+          <div className="drawer-section">
+            <div className="drawer-banner info">
+              <IconHelp size={15} />
+              <span>
+                Grow this virtual disk online — no reboot. Disks can only be <strong>enlarged</strong>;
+                shrinking is not supported. Extend the filesystem inside the guest afterwards.
+              </span>
+            </div>
+            <TextField
+              label="New capacity (GB)"
+              type="number"
+              min={Math.ceil(resize.disk.capacityGb) + 1}
+              autoFocus
+              value={resize.capacityGb}
+              hint={`Current: ${formatBytes(resize.disk.capacityGb * 1024 ** 3, 0)}`}
+              onChange={(e) => setResize({ ...resize, capacityGb: e.target.value })}
+            />
+            <dl className="spec-summary">
+              <dt>Capacity</dt>
+              <dd>
+                {formatBytes(resize.disk.capacityGb * 1024 ** 3, 0)}
+                {Number(resize.capacityGb) > resize.disk.capacityGb ? (
+                  <span className="delta"> → {formatBytes(Number(resize.capacityGb) * 1024 ** 3, 0)}</span>
+                ) : null}
+              </dd>
+            </dl>
+          </div>
+        ) : null}
+      </Drawer>
+
+      {/* Delete single snapshot */}
+      <ConfirmDestructiveDialog
+        open={delSnap !== null}
+        title="Delete snapshot"
+        variant="danger"
+        confirmLabel="Delete snapshot"
+        description={
+          <>
+            Permanently delete the snapshot <strong className="mono">{delSnap?.snap.name}</strong>? This
+            cannot be undone. Child snapshots (if any) are re-parented onto its parent by the hypervisor.
+          </>
+        }
+        onConfirm={confirmDeleteSnapshot}
+        onClose={() => setDelSnap(null)}
+      />
+
       {/* Delete */}
       <ConfirmDestructiveDialog
         open={del !== null}
@@ -714,6 +840,9 @@ export function useVMActions() {
     detachNic,
     ejectIso,
     detachBusyId,
+    // disk resize + delete-snapshot (Lot 3)
+    triggerResizeDisk,
+    triggerDeleteSnapshot,
     dialogs,
   };
 }

@@ -233,12 +233,17 @@ func (b *simBackend) listSnapshots(uuid string) []vp.Snapshot {
 	return out
 }
 
-func (b *simBackend) createSnapshot(uuid string, snap vp.Snapshot) error {
+func (b *simBackend) createSnapshot(uuid string, snap vp.Snapshot, opts vp.SnapshotOptions) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	// Model a tree: the previous current snapshot becomes this one's parent.
 	for i := range b.snapshots[uuid] {
+		if b.snapshots[uuid][i].IsCurrent {
+			snap.ParentID = b.snapshots[uuid][i].ID
+		}
 		b.snapshots[uuid][i].IsCurrent = false
 	}
+	snap.HasMemory = opts.Memory
 	b.snapshots[uuid] = append(b.snapshots[uuid], snap)
 	return nil
 }

@@ -127,6 +127,58 @@ type DeviceManager interface {
 	UnmountISO(ctx context.Context, vmID string) (*Task, error)
 }
 
+// --- guest agent (qemu-ga) ---
+
+// GuestInfo is the in-guest view a running qemu-guest-agent reports through
+// libvirt (DomainGetGuestInfo + DomainInterfaceAddresses source=AGENT). It is
+// best-effort: AgentConnected is false (and the rest may be empty) when the agent
+// is not installed/running in the guest — the caller MUST treat its absence as a
+// soft, non-error condition (the prompt's "fall back silently" requirement).
+type GuestInfo struct {
+	// AgentConnected reports whether the qemu-guest-agent answered at all.
+	AgentConnected bool `json:"agentConnected"`
+	// Hostname is the guest's reported hostname ("" if unknown).
+	Hostname string `json:"hostname,omitempty"`
+	// OS is the guest OS pretty-name/name as the agent reports it ("" if unknown).
+	OS string `json:"os,omitempty"`
+	// IPAddresses are the guest-reported IPs (loopback filtered out).
+	IPAddresses []string `json:"ipAddresses,omitempty"`
+	// Note carries a human-readable explanation when the agent is absent or partial.
+	Note string `json:"note,omitempty"`
+}
+
+// GuestAgentProvider is implemented by providers that can query a running
+// in-guest agent (KVM: qemu-guest-agent over libvirt). Requires CapGuestAgent.
+// GuestInfo NEVER returns ErrUnsupported for "agent not connected" — it returns a
+// GuestInfo with AgentConnected=false so the UI can show the soft state.
+type GuestAgentProvider interface {
+	// GuestInfo returns the in-guest hostname/OS/IPs reported by the guest agent.
+	GuestInfo(ctx context.Context, vmID string) (*GuestInfo, error)
+}
+
+// --- online disk resize ---
+
+// DiskResizer is implemented by providers that can grow a VM's virtual disk
+// online (KVM: DomainBlockResize on the running domain's block device, growing the
+// underlying volume first where needed). Shrink is rejected with ErrInvalidSpec.
+// Requires CapDiskResize.
+type DiskResizer interface {
+	// ResizeDisk grows the disk identified by diskID to newCapacityGB. Shrinking is
+	// not permitted (returns ErrInvalidSpec).
+	ResizeDisk(ctx context.Context, vmID, diskID string, newCapacityGB float64) (*Task, error)
+}
+
+// --- snapshot management (delete-single, tree) ---
+
+// SnapshotManager is implemented by providers that can delete an INDIVIDUAL
+// snapshot (KVM: DomainSnapshotDelete). The core ListSnapshots already returns the
+// tree fields (ParentID/IsCurrent/HasMemory/CreatedAt). Requires CapSnapshot.
+type SnapshotManager interface {
+	// DeleteSnapshot removes a single snapshot by id (its children are re-parented
+	// by the hypervisor; the disk chain is consolidated as the engine sees fit).
+	DeleteSnapshot(ctx context.Context, vmID, snapID string) (*Task, error)
+}
+
 // Capability bits for the optional interfaces (continue the CapabilityMatrix).
 // They are defined here (not in capability.go) to keep the extension self-contained;
 // being in the same package they share the same iota space is NOT required because
@@ -139,6 +191,12 @@ const (
 	// CapHotPlug declares live hot-add/hot-remove of disks/NICs and ISO mount/eject
 	// on a RUNNING VM (DeviceManager).
 	CapHotPlug CapabilityMatrix = 1 << 35
+	// CapGuestAgent declares an in-guest agent integration (qemu-guest-agent over
+	// libvirt): guest IPs/hostname/OS, agent-driven graceful shutdown, quiesced
+	// (app-consistent) snapshots (GuestAgentProvider).
+	CapGuestAgent CapabilityMatrix = 1 << 36
+	// CapDiskResize declares online (live) virtual-disk grow (DiskResizer).
+	CapDiskResize CapabilityMatrix = 1 << 37
 )
 
 // extTokens maps the extension capability bits to wire tokens (appended to the
@@ -151,6 +209,8 @@ var extTokens = []struct {
 	{CapNetworkWrite, "network_write"},
 	{CapStorageWrite, "storage_write"},
 	{CapHotPlug, "hotplug"},
+	{CapGuestAgent, "guest_agent"},
+	{CapDiskResize, "disk_resize"},
 }
 
 // ExtStrings returns the active EXTENSION capability tokens (console/network_write/

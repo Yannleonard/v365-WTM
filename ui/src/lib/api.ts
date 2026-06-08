@@ -115,6 +115,8 @@ import type {
   VMCloneRequest,
   VMMigrateRequest,
   VMReconfigureRequest,
+  VMDiskResizeRequest,
+  GuestInfo,
   VMSpec,
   VMSpecDisk,
   VMSpecNic,
@@ -779,6 +781,9 @@ export const api = {
     post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/snapshots`, body),
   vmSnapshotRevert: (pid: string, vmId: string, snapId: string) =>
     post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/snapshots/${encId(snapId)}/revert`),
+  // Delete a single snapshot (the snapshot tree node). Gated on vm.snapshot.
+  vmSnapshotDelete: (pid: string, vmId: string, snapId: string) =>
+    del<VMTask | void>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/snapshots/${encId(snapId)}`),
   // Clone / intra-hypervisor migrate / reconfigure.
   vmClone: (pid: string, vmId: string, body: VMCloneRequest) =>
     post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/clone`, body),
@@ -835,6 +840,15 @@ export const api = {
     post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/iso`, { isoPath }),
   vmIsoUnmount: (pid: string, vmId: string) =>
     del<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/iso`),
+  // Online disk resize (grow only). Gated on the "disk_resize" cap + vm.disk.resize.
+  vmDiskResize: (pid: string, vmId: string, diskId: string, body: VMDiskResizeRequest) =>
+    post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/disks/${encId(diskId)}/resize`, body),
+
+  /* ---- guest agent (IP / hostname / OS) ---- */
+  // GuestInfo reported by the in-guest agent. agentConnected:false on demo VMs —
+  // the caller renders a "not connected" hint, not an error. Gated on "guest_agent".
+  vmGuest: (pid: string, vmId: string) =>
+    get<GuestInfo>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/guest`),
 
   /* ---- graphical console ---- */
   // Resolve a one-shot console endpoint (vnc/spice/rdp). Gated on the "console"

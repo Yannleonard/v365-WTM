@@ -118,6 +118,8 @@ var permissionCatalog = []string{
 	// Hot-plug device management: live attach/detach disk & NIC, mount/eject ISO on
 	// a RUNNING VM (no reboot). Operator-grade.
 	"vm.hotplug",
+	// Online disk resize (grow a VM's disk live via DomainBlockResize). Operator-grade.
+	"vm.disk.resize",
 	// UniHV V2V cross-hypervisor migration: read job status / run a migration.
 	"v2v.read",
 	"v2v.migrate",

@@ -65,7 +65,10 @@ type libvirtBackend interface {
 
 	// snapshots
 	listSnapshots(uuid string) []vp.Snapshot
-	createSnapshot(uuid string, snap vp.Snapshot) error
+	// createSnapshot creates a snapshot. opts carries Memory/Quiesce so the live
+	// backend can request a QUIESCE (app-consistent) snapshot when the guest agent
+	// is present, falling back to non-quiesced otherwise.
+	createSnapshot(uuid string, snap vp.Snapshot, opts vp.SnapshotOptions) error
 	setCurrentSnapshot(uuid, snapID string) (bool, error)
 
 	// host/cluster
@@ -109,6 +112,22 @@ type extBackend interface {
 	detachNIC(uuid, nicID string) error
 	mountISO(uuid, isoPath string) error
 	unmountISO(uuid string) error
+
+	// guest agent (qemu-ga over libvirt): DomainGetGuestInfo (hostname/OS) +
+	// DomainInterfaceAddresses(source=AGENT) for guest IPs. Never errors on
+	// "agent not connected"; returns AgentConnected=false instead.
+	guestInfo(uuid string) (*vp.GuestInfo, error)
+	// guestShutdown attempts a guest-agent graceful shutdown (DomainShutdownFlags
+	// GUEST_AGENT), falling back to ACPI. Returns true if the agent path was taken.
+	guestShutdown(uuid string) (agentUsed bool, err error)
+
+	// snapshot management: delete a single snapshot (DomainSnapshotDelete) and
+	// parent-aware listing (DomainSnapshotGetXMLDesc parses <parent>).
+	deleteSnapshot(uuid, snapID string) error
+
+	// online disk resize: DomainBlockResize on the running domain's block device
+	// (growing the underlying StorageVol first when needed).
+	resizeDisk(uuid, diskID string, newCapacityGB float64) error
 }
 
 // Provider is the KVM/libvirt HypervisorProvider. The core is CGO-free; the
@@ -373,7 +392,15 @@ func (p *Provider) PowerOp(ctx context.Context, vmID string, op vp.PowerOp) (*vp
 		// start: shutoff->running; resume: paused->running; reset: hard reboot.
 		err = p.backend.setDomainState(vmID, domRunning)
 	case vp.PowerStop:
-		err = p.backend.setDomainState(vmID, domShutoff)
+		// Graceful shutdown: prefer the qemu-guest-agent path (clean OS shutdown)
+		// when the live backend + CapGuestAgent are available, falling back to ACPI
+		// inside guestShutdown. If the agent path is unavailable we use the existing
+		// ACPI-then-destroy behavior via setDomainState.
+		if e, ok := p.ext(); ok && p.caps.Has(vp.CapGuestAgent) {
+			_, err = e.guestShutdown(vmID)
+		} else {
+			err = p.backend.setDomainState(vmID, domShutoff)
+		}
 	case vp.PowerSuspend:
 		// suspend == save state / guest-PM suspend -> pmsuspended.
 		err = p.backend.setDomainState(vmID, domPMSuspended)
@@ -479,7 +506,7 @@ func (p *Provider) Snapshot(ctx context.Context, vmID string, opts vp.SnapshotOp
 		IsCurrent:   true,
 		CreatedAt:   time.Now().UTC(),
 	}
-	if err := p.backend.createSnapshot(vmID, snap); err != nil {
+	if err := p.backend.createSnapshot(vmID, snap, opts); err != nil {
 		return nil, err
 	}
 	return p.finishTask("snapshot", vmID), nil
@@ -975,14 +1002,86 @@ func (p *Provider) UnmountISO(ctx context.Context, vmID string) (*vp.Task, error
 	return p.finishTask("unmountISO", vmID), nil
 }
 
+// --- extension: guest agent (GuestAgentProvider) ---
+
+// GuestInfo queries the in-guest qemu-guest-agent (via libvirt DomainGetGuestInfo
+// + DomainInterfaceAddresses source=AGENT) for the guest hostname/OS/IPs. It does
+// NOT error when the agent is simply absent: it returns a GuestInfo with
+// AgentConnected=false and a note (the contract's "fall back silently" rule).
+func (p *Provider) GuestInfo(ctx context.Context, vmID string) (*vp.GuestInfo, error) {
+	if !p.caps.Has(vp.CapGuestAgent) {
+		return nil, vp.ErrUnsupported
+	}
+	e, ok := p.ext()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if _, ok := p.backend.getDomain(vmID); !ok {
+		return nil, vp.ErrNotFound
+	}
+	return e.guestInfo(vmID)
+}
+
+// --- extension: snapshot management (SnapshotManager) ---
+
+// DeleteSnapshot removes a single snapshot (DomainSnapshotDelete). Requires
+// CapSnapshot + a live backend.
+func (p *Provider) DeleteSnapshot(ctx context.Context, vmID, snapID string) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapSnapshot) {
+		return nil, vp.ErrUnsupported
+	}
+	e, ok := p.ext()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if _, ok := p.backend.getDomain(vmID); !ok {
+		return nil, vp.ErrNotFound
+	}
+	if strings.TrimSpace(snapID) == "" {
+		return nil, vp.ErrInvalidSpec
+	}
+	if err := e.deleteSnapshot(vmID, snapID); err != nil {
+		return nil, err
+	}
+	return p.finishTask("deleteSnapshot", vmID), nil
+}
+
+// --- extension: online disk resize (DiskResizer) ---
+
+// ResizeDisk grows the VM's disk online via DomainBlockResize (and the underlying
+// StorageVol when needed). Shrinking is rejected (ErrInvalidSpec). Requires
+// CapDiskResize + a live backend.
+func (p *Provider) ResizeDisk(ctx context.Context, vmID, diskID string, newCapacityGB float64) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapDiskResize) {
+		return nil, vp.ErrUnsupported
+	}
+	e, ok := p.ext()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if _, ok := p.backend.getDomain(vmID); !ok {
+		return nil, vp.ErrNotFound
+	}
+	if strings.TrimSpace(diskID) == "" || newCapacityGB <= 0 {
+		return nil, vp.ErrInvalidSpec
+	}
+	if err := e.resizeDisk(vmID, diskID, newCapacityGB); err != nil {
+		return nil, err
+	}
+	return p.finishTask("resizeDisk", vmID), nil
+}
+
 // compile-time assertion: *Provider satisfies the contract.
 var _ vp.HypervisorProvider = (*Provider)(nil)
 
 // *Provider also satisfies the extension contracts; whether a given instance
 // actually services them depends on the backend (live vs sim) + capability bits.
 var (
-	_ vp.ConsoleProvider = (*Provider)(nil)
-	_ vp.NetworkWriter   = (*Provider)(nil)
-	_ vp.StorageProvider = (*Provider)(nil)
-	_ vp.DeviceManager   = (*Provider)(nil)
+	_ vp.ConsoleProvider     = (*Provider)(nil)
+	_ vp.NetworkWriter       = (*Provider)(nil)
+	_ vp.StorageProvider     = (*Provider)(nil)
+	_ vp.DeviceManager       = (*Provider)(nil)
+	_ vp.GuestAgentProvider  = (*Provider)(nil)
+	_ vp.SnapshotManager     = (*Provider)(nil)
+	_ vp.DiskResizer         = (*Provider)(nil)
 )

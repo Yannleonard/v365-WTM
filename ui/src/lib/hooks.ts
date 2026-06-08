@@ -51,6 +51,7 @@ import type {
   StorageBackend,
   VMCapability,
   VMSnapshot,
+  GuestInfo,
   VMCluster,
   VMClusterTopology,
   VMMetricsResponse,
@@ -124,6 +125,7 @@ export const qk = {
   vms: (pid: string) => ["vms", pid] as const,
   vm: (pid: string, id: string) => ["vm", pid, id] as const,
   vmSnapshots: (pid: string, id: string) => ["vm", "snapshots", pid, id] as const,
+  vmGuest: (pid: string, id: string) => ["vm", "guest", pid, id] as const,
   vmMetrics: (pid: string, id: string) => ["vm", "metrics", pid, id] as const,
   vmClusters: (pid: string) => ["vm", "clusters", pid] as const,
   vmClusterTopology: (pid: string, cid: string) => ["vm", "topology", pid, cid] as const,
@@ -600,6 +602,19 @@ export function useVMSnapshots(pid: string, id: string, enabled = true) {
     queryKey: qk.vmSnapshots(pid, id),
     queryFn: () => api.vmSnapshots(pid, id),
     enabled: enabled && !!pid && !!id,
+  });
+}
+
+/** Guest-agent reported info (hostname / IPs / OS). Best-effort: agentConnected
+ *  is false on demo VMs, in which case the view shows a subtle hint. Polled
+ *  gently so a freshly-booted agent surfaces without a manual refresh. */
+export function useVMGuest(pid: string, id: string, enabled = true) {
+  return useQuery<GuestInfo>({
+    queryKey: qk.vmGuest(pid, id),
+    queryFn: () => api.vmGuest(pid, id),
+    enabled: enabled && !!pid && !!id,
+    staleTime: 15_000,
+    refetchInterval: 30_000,
   });
 }
 

@@ -321,3 +321,87 @@ func (s *Server) VMISOUnmount(w http.ResponseWriter, r *http.Request) {
 	ok(w, task)
 }
 
+// --- guest agent (qemu-ga) ---
+
+// VMGuestInfo returns the in-guest agent view (hostname, OS, IPs, agent-connected
+// flag). Requires the provider to implement GuestAgentProvider + advertise
+// CapGuestAgent. When the agent is simply NOT running in the guest the handler
+// still returns 200 with agentConnected=false (a soft state, not a 405/500).
+func (s *Server) VMGuestInfo(w http.ResponseWriter, r *http.Request) {
+	p, found := s.resolveVMProvider(w, r)
+	if !found {
+		return
+	}
+	ga, impl := p.(vprovider.GuestAgentProvider)
+	if !impl || !p.Capabilities().Has(vprovider.CapGuestAgent) {
+		authz.WriteError(w, r, authz.ErrMethodNotAllowed)
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 15*time.Second)
+	defer cancel()
+	gi, err := ga.GuestInfo(ctx, chi.URLParam(r, "vmID"))
+	if err != nil {
+		authz.WriteError(w, r, vmProviderError(err))
+		return
+	}
+	ok(w, gi)
+}
+
+// --- snapshot management (delete-single) ---
+
+// VMSnapshotDelete deletes a SINGLE snapshot (DomainSnapshotDelete). Requires
+// SnapshotManager + CapSnapshot.
+func (s *Server) VMSnapshotDelete(w http.ResponseWriter, r *http.Request) {
+	p, found := s.resolveVMProvider(w, r)
+	if !found {
+		return
+	}
+	sm, impl := p.(vprovider.SnapshotManager)
+	if !impl || !p.Capabilities().Has(vprovider.CapSnapshot) {
+		authz.WriteError(w, r, authz.ErrMethodNotAllowed)
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 60*time.Second)
+	defer cancel()
+	task, err := sm.DeleteSnapshot(ctx, chi.URLParam(r, "vmID"), chi.URLParam(r, "snapID"))
+	if err != nil {
+		authz.WriteError(w, r, vmProviderError(err))
+		return
+	}
+	ok(w, task)
+}
+
+// --- online disk resize ---
+
+// vmDiskResizeBody is the resize-disk request body.
+type vmDiskResizeBody struct {
+	CapacityGB float64 `json:"capacityGb"`
+}
+
+// VMDiskResize grows a VM's disk online (DomainBlockResize). Requires DiskResizer +
+// CapDiskResize.
+func (s *Server) VMDiskResize(w http.ResponseWriter, r *http.Request) {
+	p, found := s.resolveVMProvider(w, r)
+	if !found {
+		return
+	}
+	dr, impl := p.(vprovider.DiskResizer)
+	if !impl || !p.Capabilities().Has(vprovider.CapDiskResize) {
+		authz.WriteError(w, r, authz.ErrMethodNotAllowed)
+		return
+	}
+	var body vmDiskResizeBody
+	if err := decodeJSON(w, r, &body); err != nil {
+		authz.WriteError(w, r, err)
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 60*time.Second)
+	defer cancel()
+	task, err := dr.ResizeDisk(ctx, chi.URLParam(r, "vmID"), chi.URLParam(r, "diskID"), body.CapacityGB)
+	if err != nil {
+		authz.WriteError(w, r, vmProviderError(err))
+		return
+	}
+	ok(w, task)
+}
+

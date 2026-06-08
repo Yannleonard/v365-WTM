@@ -342,6 +342,36 @@ export function gateVMHotPlug(
   return { allowed: true, reason: "" };
 }
 
+/**
+ * Gate an online disk resize (grow) — cap "disk_resize" + vm.disk.resize. A
+ * read-only provider disables it. The backend additionally rejects a shrink
+ * (422), so the UI only ever offers growing the disk.
+ */
+export function gateVMDiskResize(
+  caps: VMCapability[] | undefined,
+  permissions: string[] | undefined,
+): GateResult {
+  if (hasVMCap(caps, "readonly")) return { allowed: false, reason: "This hypervisor is read-only" };
+  if (!hasVMCap(caps, "disk_resize"))
+    return { allowed: false, reason: "Provider does not support disk resize" };
+  if (!can(permissions, "vm.disk.resize"))
+    return { allowed: false, reason: "You lack the vm.disk.resize permission" };
+  return { allowed: true, reason: "" };
+}
+
+/**
+ * Gate showing guest-agent info — cap "guest_agent" + vm.read (anyone who can
+ * see the VM). Read-only does NOT disable it (it is a read affordance).
+ */
+export function gateVMGuestAgent(
+  caps: VMCapability[] | undefined,
+  _permissions: string[] | undefined,
+): GateResult {
+  if (!hasVMCap(caps, "guest_agent"))
+    return { allowed: false, reason: "Provider does not expose guest-agent info" };
+  return { allowed: true, reason: "" };
+}
+
 /** Gate opening the graphical console (cap "console" + vm.console). */
 export function gateVMConsole(
   caps: VMCapability[] | undefined,

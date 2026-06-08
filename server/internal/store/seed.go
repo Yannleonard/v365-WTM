@@ -130,6 +130,7 @@ var operatorExtraPermissions = []string{
 	"vm.network.write",// create/delete virtual networks/switches
 	"vm.storage.write",// create/delete volumes, upload ISOs
 	"vm.hotplug",      // live hot-attach/detach disk & NIC, mount/eject ISO (no reboot)
+	"vm.disk.resize",  // grow a VM's disk online (DomainBlockResize)
 	"v2v.migrate",     // run a cross-hypervisor V2V migration
 	"replication.write", // manage cross-hypervisor DR replication policies + failover
 }

@@ -13,7 +13,7 @@ import { useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { useAuth } from "../lib/auth";
-import { useVM, useVMSnapshots, useVMMetrics, useVMCapabilityLookup, useRoles, useUsers } from "../lib/hooks";
+import { useVM, useVMSnapshots, useVMMetrics, useVMGuest, useVMCapabilityLookup, useRoles, useUsers } from "../lib/hooks";
 import { useVMActions } from "./useVMActions";
 import { PageHeader } from "../components/PageHeader";
 import { LoadingFill } from "../components/Spinner";
@@ -28,7 +28,7 @@ import { StatsChart } from "../components/StatsChart";
 import { ResourceGauge } from "../components/ResourceGauge";
 import { ConsolePanel } from "../components/ConsolePanel";
 import { InspectTab } from "./workload/InspectTab";
-import { gateVMAction, gateVMConsole, gateVMHotPlug } from "../lib/rbac";
+import { gateVMAction, gateVMConsole, gateVMHotPlug, gateVMDiskResize, gateVMGuestAgent } from "../lib/rbac";
 import { formatBytes, formatDateTime, shortId, timeAgo, humanizeAction } from "../lib/format";
 import {
   IconVM,
@@ -174,6 +174,7 @@ export function VirtualMachineDetail() {
             pid={pid}
             vmId={vmId}
             detail={detail}
+            guestAgent={gateVMGuestAgent(caps, permissions)}
             consoleAllowed={consoleGate.allowed}
             onLaunchConsole={() => setTab("console")}
             hotPlug={gateVMHotPlug(caps, permissions)}
@@ -189,6 +190,7 @@ export function VirtualMachineDetail() {
             caps={caps}
             permissions={permissions}
             onCreate={() => actions.triggerSnapshot(detail)}
+            onDelete={(snap) => actions.triggerDeleteSnapshot(detail, snap)}
           />
         )}
         {tab === "monitor" && <MetricsPanel pid={pid} vmId={vmId} detail={detail} />}
@@ -196,10 +198,12 @@ export function VirtualMachineDetail() {
           <ConfigurePanel
             detail={detail}
             hotPlug={gateVMHotPlug(caps, permissions)}
+            diskResize={gateVMDiskResize(caps, permissions)}
             onReconfigure={() => actions.triggerReconfigure(detail)}
             onAddDisk={() => actions.triggerAddDisk(detail)}
             onAddNic={() => actions.triggerAddNic(detail)}
             onMountIso={() => actions.triggerMountIso(detail)}
+            onResizeDisk={(disk) => actions.triggerResizeDisk(detail, disk)}
           />
         )}
         {tab === "permissions" && <PermissionsPanel detail={detail} />}
@@ -224,6 +228,7 @@ function VMSummary({
   pid,
   vmId,
   detail,
+  guestAgent,
   consoleAllowed,
   onLaunchConsole,
   hotPlug,
@@ -234,6 +239,7 @@ function VMSummary({
   pid: string;
   vmId: string;
   detail: import("../lib/types").VMDetail;
+  guestAgent: import("../lib/rbac").GateResult;
   consoleAllowed: boolean;
   onLaunchConsole: () => void;
   hotPlug: import("../lib/rbac").GateResult;
@@ -244,6 +250,15 @@ function VMSummary({
   const disks = detail.disks ?? [];
   const nics = detail.nics ?? [];
   const labels = Object.entries(detail.labels ?? {});
+
+  // Guest-agent info (hostname / IPs / OS). Only fetched when the provider
+  // advertises the guest_agent capability; agentConnected may be false on demo
+  // VMs, in which case we show a subtle hint instead of an error.
+  const guestQ = useVMGuest(pid, vmId, guestAgent.allowed);
+  const guest = guestQ.data;
+  const guestConnected = !!guest?.agentConnected;
+  // Prefer the live guest-agent IPs; fall back to the normalized VMDetail list.
+  const guestIps = guest?.ipAddresses?.length ? guest.ipAddresses : detail.ipAddresses ?? [];
 
   // Latest metrics sample drives the CPU + memory gauges (best-effort: 0 if none).
   const metricsQ = useVMMetrics(pid, vmId);
@@ -358,19 +373,42 @@ function VMSummary({
               <dt>ID</dt>
               <dd className="mono">{shortId(detail.id, 24)}</dd>
               <dt>Guest OS</dt>
-              <dd>{detail.guestOs || "—"}</dd>
+              <dd>{guest?.osName || detail.guestOs || "—"}</dd>
               <dt>Host</dt>
               <dd className="mono">{detail.hostId || "—"}</dd>
               <dt>Cluster</dt>
               <dd>{detail.clusterId ? <span className="chip">{detail.clusterId}</span> : "—"}</dd>
+              {guestAgent.allowed ? (
+                <>
+                  <dt>Guest agent</dt>
+                  <dd>
+                    <span className="row" style={{ gap: 6 }}>
+                      <StatusDot color={guestConnected ? "var(--success)" : "var(--state-unknown)"} />
+                      <span className="text-sm" style={{ color: guestConnected ? "var(--success)" : "var(--text-muted)" }}>
+                        {guestConnected ? "Connected" : "Not connected"}
+                      </span>
+                    </span>
+                  </dd>
+                  <dt>Guest hostname</dt>
+                  <dd>
+                    {guest?.hostname ? (
+                      <span className="mono">{guest.hostname}</span>
+                    ) : (
+                      <span className="muted text-xs">{guestConnected ? "—" : "guest agent not connected"}</span>
+                    )}
+                  </dd>
+                </>
+              ) : null}
               <dt>IP addresses</dt>
               <dd>
-                {detail.ipAddresses && detail.ipAddresses.length ? (
+                {guestIps.length ? (
                   <span className="row-wrap" style={{ gap: 4 }}>
-                    {detail.ipAddresses.map((ip) => (
+                    {guestIps.map((ip) => (
                       <span key={ip} className="chip chip-mono text-xs">{ip}</span>
                     ))}
                   </span>
+                ) : guestAgent.allowed && !guestConnected ? (
+                  <span className="muted text-xs">guest agent not connected</span>
                 ) : (
                   <span className="muted">—</span>
                 )}
@@ -550,18 +588,36 @@ function VMSummary({
 
 /* ============================ Snapshots ============================ */
 
+// snapDepth computes a snapshot's depth in the parent tree (for indentation),
+// walking parentId links with a cycle guard.
+function snapDepth(s: VMSnapshot, all: VMSnapshot[]): number {
+  let depth = 0;
+  let cur: VMSnapshot | undefined = s;
+  const byId = new Map(all.map((x) => [x.id, x]));
+  const seen = new Set<string>();
+  while (cur?.parentId && byId.has(cur.parentId) && !seen.has(cur.parentId)) {
+    seen.add(cur.parentId);
+    cur = byId.get(cur.parentId);
+    depth++;
+    if (depth > 50) break;
+  }
+  return depth;
+}
+
 function SnapshotsPanel({
   pid,
   vmId,
   caps,
   permissions,
   onCreate,
+  onDelete,
 }: {
   pid: string;
   vmId: string;
   caps: import("../lib/types").VMCapability[] | undefined;
   permissions: string[] | undefined;
   onCreate: () => void;
+  onDelete?: (snap: VMSnapshot) => void;
 }) {
   const queryClient = useQueryClient();
   const snapsQ = useVMSnapshots(pid, vmId);
@@ -587,8 +643,10 @@ function SnapshotsPanel({
       header: "Name",
       sortValue: (s) => s.name,
       cell: (s) => (
-        <div className="col" style={{ gap: 2 }}>
+        <div className="col" style={{ gap: 2, paddingLeft: snapDepth(s, snapsQ.data ?? []) * 18 }}>
           <div className="row" style={{ gap: "var(--sp-2)" }}>
+            {snapDepth(s, snapsQ.data ?? []) > 0 ? <span className="muted" aria-hidden>└</span> : null}
+            <IconSnapshot size={14} />
             <span style={{ fontWeight: 600 }}>{s.name}</span>
             {s.isCurrent ? <span className="chip">current</span> : null}
           </div>
@@ -602,23 +660,41 @@ function SnapshotsPanel({
       key: "actions",
       header: "",
       align: "right",
-      width: "120px",
+      width: "210px",
       cell: (s) => (
-        <CapabilityGate gate={gateVMAction("snapshot_revert", caps, permissions)}>
-          {(allowed, reason) => (
-            <ActionButton
-              size="sm"
-              variant="ghost"
-              disabled={!allowed}
-              loading={revertingId === s.id}
-              tooltip={allowed ? "Revert to this snapshot" : reason}
-              onClick={() => revert(s)}
-            >
-              <IconRestart size={14} />
-              Revert
-            </ActionButton>
-          )}
-        </CapabilityGate>
+        <div className="row" style={{ gap: "var(--sp-1)", justifyContent: "flex-end" }}>
+          <CapabilityGate gate={gateVMAction("snapshot_revert", caps, permissions)}>
+            {(allowed, reason) => (
+              <ActionButton
+                size="sm"
+                variant="ghost"
+                disabled={!allowed}
+                loading={revertingId === s.id}
+                tooltip={allowed ? "Revert to this snapshot" : reason}
+                onClick={() => revert(s)}
+              >
+                <IconRestart size={14} />
+                Revert
+              </ActionButton>
+            )}
+          </CapabilityGate>
+          {onDelete ? (
+            <CapabilityGate gate={gateVMAction("snapshot", caps, permissions)}>
+              {(allowed, reason) => (
+                <ActionButton
+                  size="sm"
+                  variant="ghost"
+                  disabled={!allowed}
+                  tooltip={allowed ? "Delete this snapshot" : reason}
+                  onClick={() => onDelete(s)}
+                >
+                  <IconTrash size={14} />
+                  Delete
+                </ActionButton>
+              )}
+            </CapabilityGate>
+          ) : null}
+        </div>
       ),
     },
   ];
@@ -879,17 +955,21 @@ function VMEventsCard({ detail }: { detail: VMDetail }) {
 function ConfigurePanel({
   detail,
   hotPlug,
+  diskResize,
   onReconfigure,
   onAddDisk,
   onAddNic,
   onMountIso,
+  onResizeDisk,
 }: {
   detail: VMDetail;
   hotPlug: import("../lib/rbac").GateResult;
+  diskResize?: import("../lib/rbac").GateResult;
   onReconfigure: () => void;
   onAddDisk: () => void;
   onAddNic: () => void;
   onMountIso: () => void;
+  onResizeDisk?: (disk: VMDisk) => void;
 }) {
   const disks = detail.disks ?? [];
   const nics = detail.nics ?? [];
@@ -913,6 +993,24 @@ function ConfigurePanel({
     { key: "format", header: "Format", cell: (d) => (d.format ? <span className="chip">{d.format}</span> : <span className="muted">—</span>) },
     { key: "bus", header: "Bus / Storage", cell: (d) => (d.storageId ? <span className="mono text-xs muted">{d.storageId}</span> : <span className="muted">—</span>) },
     { key: "path", header: "Path", cell: (d) => (d.path ? <span className="mono text-xs muted truncate" style={{ maxWidth: 260, display: "inline-block" }} title={d.path}>{d.path}</span> : <span className="muted">—</span>) },
+    ...(onResizeDisk
+      ? [{
+          key: "resize",
+          header: "",
+          align: "right" as const,
+          width: "110px",
+          cell: (d: VMDisk) => (
+            <CapabilityGate gate={diskResize ?? hotPlug}>
+              {(allowed: boolean, reason?: string) => (
+                <ActionButton size="sm" variant="ghost" disabled={!allowed} tooltip={allowed ? "Resize disk (grow)" : reason} onClick={() => onResizeDisk(d)}>
+                  <IconEdit size={14} />
+                  Resize
+                </ActionButton>
+              )}
+            </CapabilityGate>
+          ),
+        }]
+      : []),
   ];
 
   const nicColumns: Column<VMNic>[] = [

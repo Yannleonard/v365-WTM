@@ -1191,6 +1191,8 @@ export type VMCapability =
   | "network_write"
   | "storage_write"
   | "hotplug"
+  | "disk_resize"
+  | "guest_agent"
   | "readonly"
   | (string & {});
 
@@ -1433,6 +1435,22 @@ export interface VMMigrateRequest {
 export interface VMReconfigureRequest {
   vcpus?: number;
   memoryMb?: number;
+}
+
+// Body for POST /vm/providers/{pid}/vms/{vmId}/disks/{diskId}/resize. Online
+// disk grow only — the backend returns 422 if capacityGb is <= the current size.
+export interface VMDiskResizeRequest {
+  capacityGb: number;
+}
+
+// Guest-agent reported info (GET .../guest). agentConnected is false on demo /
+// agent-less VMs — the UI then shows a subtle "not connected" hint rather than
+// an error, and hostname / ipAddresses are best-effort (may be empty).
+export interface GuestInfo {
+  hostname?: string;
+  osName?: string;
+  agentConnected: boolean;
+  ipAddresses?: string[];
 }
 
 // One disk in a VMSpec (wizard). capacityGb is required; format/storageId pick

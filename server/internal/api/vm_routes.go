@@ -25,6 +25,9 @@ func (s *Server) mountVMRoutes(pr chi.Router) {
 		Get("/vm/providers/{providerID}/vms/{vmID}", s.VMDetailHandler)
 	pr.With(az.RequirePermission("vm.read", scopeFromProvider)).
 		Get("/vm/providers/{providerID}/vms/{vmID}/snapshots", s.VMSnapshots)
+	// Guest-agent info (qemu-ga): in-guest hostname/OS/IPs + agent-connected flag.
+	pr.With(az.RequirePermission("vm.read", scopeFromProvider)).
+		Get("/vm/providers/{providerID}/vms/{vmID}/guest", s.VMGuestInfo)
 	pr.With(az.RequirePermission("vm.metrics.read", scopeFromProvider)).
 		Get("/vm/providers/{providerID}/vms/{vmID}/metrics", s.VMMetrics)
 	pr.With(az.RequirePermission("vm.read", scopeFromProvider)).
@@ -53,6 +56,9 @@ func (s *Server) mountVMRoutes(pr chi.Router) {
 		Post("/vm/providers/{providerID}/vms/{vmID}/snapshots", s.VMSnapshotCreate)
 	pr.With(az.AuditWrap("vm.snapshot.revert"), az.RequireAAL, az.RequirePermission("vm.snapshot", scopeFromProvider)).
 		Post("/vm/providers/{providerID}/vms/{vmID}/snapshots/{snapID}/revert", s.VMSnapshotRevert)
+	// Delete a SINGLE snapshot (DomainSnapshotDelete). Operator-grade (vm.snapshot).
+	pr.With(az.AuditWrap("vm.snapshot.delete"), az.RequireAAL, az.RequirePermission("vm.snapshot", scopeFromProvider)).
+		Delete("/vm/providers/{providerID}/vms/{vmID}/snapshots/{snapID}", s.VMSnapshotDelete)
 	pr.With(az.AuditWrap("vm.clone"), az.RequireAAL, az.RequirePermission("vm.clone", scopeFromProvider)).
 		Post("/vm/providers/{providerID}/vms/{vmID}/clone", s.VMClone)
 
@@ -101,4 +107,10 @@ func (s *Server) mountVMRoutes(pr chi.Router) {
 		Post("/vm/providers/{providerID}/vms/{vmID}/iso", s.VMISOMount)
 	pr.With(az.AuditWrap("vm.iso.unmount"), az.RequireAAL, az.RequirePermission("vm.hotplug", scopeFromProvider)).
 		Delete("/vm/providers/{providerID}/vms/{vmID}/iso", s.VMISOUnmount)
+
+	// Online disk resize (DomainBlockResize): grow a disk on a RUNNING VM (no
+	// reboot). Operator-grade, gated by the dedicated vm.disk.resize permission. The
+	// handler type-asserts DiskResizer + CapDiskResize, else 405.
+	pr.With(az.AuditWrap("vm.disk.resize"), az.RequireAAL, az.RequirePermission("vm.disk.resize", scopeFromProvider)).
+		Post("/vm/providers/{providerID}/vms/{vmID}/disks/{diskID}/resize", s.VMDiskResize)
 }

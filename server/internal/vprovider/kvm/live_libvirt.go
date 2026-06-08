@@ -89,7 +89,8 @@ func NewLiveWithID(id, endpoint string) (*Provider, error) {
 // fulfils: graphical console (<graphics> in domain XML), virtual-network write
 // (NetworkDefineXML/Create/Destroy/Undefine), storage/ISO write (StorageVol*) and
 // hot-plug device management (DomainAttach/Detach/UpdateDeviceFlags, LIVE|CONFIG).
-const LiveCaps = FullCaps | vp.CapConsole | vp.CapNetworkWrite | vp.CapStorageWrite | vp.CapHotPlug
+const LiveCaps = FullCaps | vp.CapConsole | vp.CapNetworkWrite | vp.CapStorageWrite | vp.CapHotPlug |
+	vp.CapGuestAgent | vp.CapDiskResize
 
 // newLiveBackend dials libvirt and runs the RPC handshake (the official
 // New(conn)+Connect() sequence).
@@ -327,7 +328,49 @@ func (b *liveBackend) describeDomain(l *libvirt.Libvirt, d libvirt.Domain, nodeI
 	} else {
 		b.fail(err)
 	}
+	// Best-effort guest IPs: prefer the qemu-guest-agent, fall back to the DHCP
+	// lease source, then ARP. ALL of these fail silently when the guest is off or
+	// the agent is absent — they only ENRICH the VM, never block normalization.
+	if libvirtState(state) == domRunning {
+		ld.IPs = b.domainIPs(l, d)
+	}
 	return ld
+}
+
+// domainIPs returns the guest IPs (loopback filtered) via, in order:
+// DomainInterfaceAddresses source=AGENT (qemu-ga), then source=LEASE (libvirt
+// dnsmasq leases), then source=ARP. Returns nil silently when none answer.
+func (b *liveBackend) domainIPs(l *libvirt.Libvirt, d libvirt.Domain) []string {
+	for _, src := range []libvirt.DomainInterfaceAddressesSource{
+		libvirt.DomainInterfaceAddressesSrcAgent,
+		libvirt.DomainInterfaceAddressesSrcLease,
+		libvirt.DomainInterfaceAddressesSrcArp,
+	} {
+		ifaces, err := l.DomainInterfaceAddresses(d, uint32(src), 0)
+		if err != nil {
+			continue // source unavailable (e.g. no agent) -> try the next one
+		}
+		ips := ipsFromInterfaces(ifaces)
+		if len(ips) > 0 {
+			return ips
+		}
+	}
+	return nil
+}
+
+// ipsFromInterfaces flattens DomainInterface addresses, skipping loopback.
+func ipsFromInterfaces(ifaces []libvirt.DomainInterface) []string {
+	var out []string
+	for _, iface := range ifaces {
+		for _, a := range iface.Addrs {
+			ip := strings.TrimSpace(a.Addr)
+			if ip == "" || strings.HasPrefix(ip, "127.") || ip == "::1" {
+				continue
+			}
+			out = append(out, ip)
+		}
+	}
+	return out
 }
 
 func (b *liveBackend) getDomain(uuid string) (*libvirtDomain, bool) {
@@ -654,18 +697,63 @@ func (b *liveBackend) listSnapshots(uuid string) []vp.Snapshot {
 		b.fail(err)
 		return nil
 	}
+	// Resolve the CURRENT snapshot name once (DomainHasCurrentSnapshot tells us one
+	// exists; its name is the one whose XML carries <active>1</active>, which we read
+	// per-snapshot below).
 	out := make([]vp.Snapshot, 0, len(snaps))
 	for _, s := range snaps {
-		out = append(out, vp.Snapshot{
-			ID:   s.Name,
-			VMID: uuid,
-			Name: s.Name,
-		})
+		snap := vp.Snapshot{ID: s.Name, VMID: uuid, Name: s.Name}
+		// DomainSnapshotGetXMLDesc gives <parent>, <description>, <state> (memory),
+		// <creationTime> and <active> (== current) so the UI can render a TREE.
+		if raw, xerr := l.DomainSnapshotGetXMLDesc(s, 0); xerr == nil {
+			applySnapshotXML(&snap, raw)
+		}
+		out = append(out, snap)
 	}
 	return out
 }
 
-func (b *liveBackend) createSnapshot(uuid string, snap vp.Snapshot) error {
+// snapshotXML is the subset of a <domainsnapshot> we read for the tree.
+type snapshotXML struct {
+	Name         string `xml:"name"`
+	Description  string `xml:"description"`
+	State        string `xml:"state"`        // "running"/"paused" => has memory; "shutoff"/"disk-snapshot" => no memory
+	CreationTime int64  `xml:"creationTime"` // unix seconds
+	Active       int    `xml:"active"`       // 1 == current snapshot
+	Parent       struct {
+		Name string `xml:"name"`
+	} `xml:"parent"`
+	Memory struct {
+		Snapshot string `xml:"snapshot,attr"` // "internal"/"external" when memory captured; "no" otherwise
+	} `xml:"memory"`
+}
+
+// applySnapshotXML enriches a Snapshot from its <domainsnapshot> XML.
+func applySnapshotXML(s *vp.Snapshot, raw string) {
+	var sx snapshotXML
+	if err := xml.Unmarshal([]byte(raw), &sx); err != nil {
+		return
+	}
+	if sx.Description != "" {
+		s.Description = sx.Description
+	}
+	s.ParentID = sx.Parent.Name
+	s.IsCurrent = sx.Active == 1
+	// A snapshot has memory state when it was taken on a running/paused domain (its
+	// <state> is running/paused) or it explicitly recorded a <memory snapshot=.../>.
+	switch strings.ToLower(sx.State) {
+	case "running", "paused", "pmsuspended":
+		s.HasMemory = true
+	}
+	if sx.Memory.Snapshot != "" && !strings.EqualFold(sx.Memory.Snapshot, "no") {
+		s.HasMemory = true
+	}
+	if sx.CreationTime > 0 {
+		s.CreatedAt = time.Unix(sx.CreationTime, 0).UTC()
+	}
+}
+
+func (b *liveBackend) createSnapshot(uuid string, snap vp.Snapshot, opts vp.SnapshotOptions) error {
 	l, dom, ok := b.domainHandle(uuid)
 	if !ok {
 		if l == nil {
@@ -674,9 +762,43 @@ func (b *liveBackend) createSnapshot(uuid string, snap vp.Snapshot) error {
 		return vp.ErrNotFound
 	}
 	xmlDesc := renderSnapshotXML(snap)
+	// App-consistent (quiesced) snapshot: pass VIR_DOMAIN_SNAPSHOT_CREATE_QUIESCE so
+	// libvirt asks the qemu-guest-agent to fsfreeze the guest filesystems first. This
+	// only works when the agent is present + the domain is running; if the agent is
+	// absent libvirt fails the QUIESCE attempt, so we retry WITHOUT the flag (a
+	// crash-consistent snapshot) rather than failing the operation outright.
+	var flags libvirt.DomainSnapshotCreateFlags
+	if opts.Quiesce {
+		flags |= libvirt.DomainSnapshotCreateQuiesce
+	}
 	// DomainSnapshotCreateXML fails (and MUST surface) for e.g. a diskless domain:
 	// "internal and full system snapshots require all disks to be selected".
-	if _, err := l.DomainSnapshotCreateXML(dom, xmlDesc, 0); err != nil {
+	if _, err := l.DomainSnapshotCreateXML(dom, xmlDesc, uint32(flags)); err != nil {
+		if opts.Quiesce {
+			// Fall back to a non-quiesced snapshot (agent not present / not frozen).
+			if _, ferr := l.DomainSnapshotCreateXML(dom, xmlDesc, 0); ferr == nil {
+				return nil
+			}
+		}
+		b.fail(err)
+		return mapLibvirtErr(err)
+	}
+	return nil
+}
+
+// deleteSnapshot removes a SINGLE snapshot (DomainSnapshotDelete with no flags).
+// libvirt re-parents the deleted snapshot's children and consolidates the disk
+// chain (a DomainBlockCommit-equivalent) internally for external/disk snapshots.
+func (b *liveBackend) deleteSnapshot(uuid, snapID string) error {
+	l, dom, ok := b.domainHandle(uuid)
+	if !ok {
+		if l == nil {
+			return errNoConn
+		}
+		return vp.ErrNotFound
+	}
+	snap := libvirt.DomainSnapshot{Name: snapID, Dom: dom}
+	if err := l.DomainSnapshotDelete(snap, 0); err != nil {
 		b.fail(err)
 		return mapLibvirtErr(err)
 	}
@@ -699,6 +821,183 @@ func (b *liveBackend) setCurrentSnapshot(uuid, snapID string) (bool, error) {
 		return false, mapLibvirtErr(err)
 	}
 	return true, nil
+}
+
+// --- guest agent (qemu-guest-agent over libvirt) ---
+
+// guestInfo queries the in-guest agent for hostname + OS (DomainGetGuestInfo) and
+// guest IPs (DomainInterfaceAddresses source=AGENT). When the agent is not present
+// it returns AgentConnected=false WITHOUT an error (the contract's soft fallback);
+// the only hard errors returned are connection/not-found ones.
+func (b *liveBackend) guestInfo(uuid string) (*vp.GuestInfo, error) {
+	l, dom, ok := b.domainHandle(uuid)
+	if !ok {
+		if l == nil {
+			return nil, errNoConn
+		}
+		return nil, vp.ErrNotFound
+	}
+	gi := &vp.GuestInfo{}
+	// DomainGetGuestInfo(types=HOSTNAME|OS). A missing/disconnected agent makes this
+	// fail with VIR_ERR_AGENT_UNRESPONSIVE / "guest agent is not connected" — treat
+	// that as the soft "agent absent" state, not a transport failure.
+	types := uint32(libvirt.DomainGuestInfoHostname | libvirt.DomainGuestInfoOs)
+	params, err := l.DomainGetGuestInfo(dom, types, 0)
+	if err != nil {
+		gi.AgentConnected = false
+		gi.Note = "qemu-guest-agent not connected: " + friendlyAgentErr(err)
+		return gi, nil
+	}
+	gi.AgentConnected = true
+	for _, p := range params {
+		val := typedParamString(p.Value)
+		switch p.Field {
+		case libvirt.DomainGuestInfoHostnameHostname:
+			gi.Hostname = val
+		case libvirt.DomainGuestInfoOsPrettyName:
+			gi.OS = val
+		case libvirt.DomainGuestInfoOsName:
+			if gi.OS == "" {
+				gi.OS = val
+			}
+		}
+	}
+	// Guest IPs from the agent (best-effort; the agent answered above so this should
+	// too, but tolerate a partial reply).
+	if ifaces, ierr := l.DomainInterfaceAddresses(dom, uint32(libvirt.DomainInterfaceAddressesSrcAgent), 0); ierr == nil {
+		gi.IPAddresses = ipsFromInterfaces(ifaces)
+	}
+	return gi, nil
+}
+
+// guestShutdown attempts a graceful shutdown through the qemu-guest-agent first
+// (DomainShutdownFlags GUEST_AGENT — a clean OS shutdown), falling back to ACPI
+// (the power button) and finally a hard destroy if neither is honored. Returns
+// whether the agent path was taken.
+func (b *liveBackend) guestShutdown(uuid string) (bool, error) {
+	l, dom, ok := b.domainHandle(uuid)
+	if !ok {
+		if l == nil {
+			return false, errNoConn
+		}
+		return false, vp.ErrNotFound
+	}
+	// 1) Guest-agent driven clean shutdown.
+	if err := l.DomainShutdownFlags(dom, libvirt.DomainShutdownGuestAgent); err == nil {
+		return true, nil
+	}
+	// 2) ACPI power button (works without the agent if the guest has acpid).
+	if err := l.DomainShutdownFlags(dom, libvirt.DomainShutdownAcpiPowerBtn); err == nil {
+		return false, nil
+	}
+	// 3) Plain shutdown (libvirt picks a method), else hard destroy.
+	if err := l.DomainShutdown(dom); err == nil {
+		return false, nil
+	}
+	if err := l.DomainDestroy(dom); err != nil {
+		b.fail(err)
+		return false, mapLibvirtErr(err)
+	}
+	return false, nil
+}
+
+// typedParamString extracts the string value out of a libvirt TypedParamValue
+// (its concrete value lives in the .I interface field).
+func typedParamString(v libvirt.TypedParamValue) string {
+	switch t := v.I.(type) {
+	case string:
+		return t
+	case fmt.Stringer:
+		return t.String()
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", t)
+	}
+}
+
+// friendlyAgentErr extracts the libvirt message for an agent failure.
+func friendlyAgentErr(err error) string {
+	var le libvirt.Error
+	if errorAs(err, &le) {
+		return le.Message
+	}
+	return err.Error()
+}
+
+// --- online disk resize ---
+
+// resizeDisk grows the disk identified by diskID to newCapacityGB via
+// DomainBlockResize on the live domain block device. The underlying StorageVol is
+// grown first (StorageVolResize) so the qcow2/raw file actually has room. Shrinking
+// is rejected (ErrInvalidSpec) before any write. Works on a RUNNING domain (online
+// resize); also valid while shut off (CONFIG-only effect).
+func (b *liveBackend) resizeDisk(uuid, diskID string, newCapacityGB float64) error {
+	l, dom, ok := b.domainHandle(uuid)
+	if !ok {
+		if l == nil {
+			return errNoConn
+		}
+		return vp.ErrNotFound
+	}
+	dk, found := b.findDisk(l, dom, diskID)
+	if !found {
+		return vp.ErrNotFound
+	}
+	newBytes := uint64(newCapacityGB * bytesPerGB)
+	// Determine current capacity (to reject a shrink) and whether the domain is live.
+	running := false
+	if st, _, serr := l.DomainGetState(dom, 0); serr == nil {
+		s := libvirtState(st)
+		running = s == domRunning || s == domBlocked
+	}
+	if dk.source != "" {
+		if vol, verr := l.StorageVolLookupByPath(dk.source); verr == nil {
+			if _, capBytes, _, ierr := l.StorageVolGetInfo(vol); ierr == nil {
+				if newBytes < capBytes {
+					return fmt.Errorf("%w: cannot shrink disk from %d to %d bytes (online shrink is unsafe)", vp.ErrInvalidSpec, capBytes, newBytes)
+				}
+			}
+			// Grow the backing volume ONLY when the domain is shut off. While the
+			// domain is RUNNING, qemu holds an exclusive write lock on the image, so a
+			// separate StorageVolResize (qemu-img resize) would fail "Failed to get
+			// write lock". In that case DomainBlockResize below grows the qcow2 in
+			// place through the running qemu process itself, which is the correct
+			// online path. For raw/offline disks the volume resize is what extends the
+			// file, so we keep it for the shut-off case.
+			if !running {
+				if rerr := l.StorageVolResize(vol, newBytes, 0); rerr != nil {
+					b.fail(rerr)
+					return mapResizeErr(rerr)
+				}
+			}
+		}
+	}
+	// DomainBlockResize takes the disk's TARGET dev (e.g. "vda") and a size; with the
+	// BYTES flag the size is interpreted as bytes (default is KiB). On a RUNNING
+	// domain qemu grows the qcow2 in place and surfaces the new size to the guest
+	// (true online resize); on a shut-off domain it resizes the just-grown image.
+	if err := l.DomainBlockResize(dom, dk.target, newBytes, libvirt.DomainBlockResizeBytes); err != nil {
+		b.fail(err)
+		return mapResizeErr(err)
+	}
+	return nil
+}
+
+// mapResizeErr maps a block-resize failure to a contract sentinel, recognizing the
+// libvirt "shrink" rejection as an invalid spec (422) rather than an opaque 500.
+func mapResizeErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	var le libvirt.Error
+	if errorAs(err, &le) {
+		m := strings.ToLower(le.Message)
+		if strings.Contains(m, "shrink") || strings.Contains(m, "smaller") || strings.Contains(m, "cannot decrease") {
+			return fmt.Errorf("%w: %s", vp.ErrInvalidSpec, le.Message)
+		}
+	}
+	return mapLibvirtErr(err)
 }
 
 // --- host/cluster identity ---

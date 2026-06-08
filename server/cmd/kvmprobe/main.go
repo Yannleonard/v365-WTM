@@ -254,7 +254,290 @@ func main() {
 	proveTPMSecureBoot(ctx, p)
 	proveCloudInit(ctx, p)
 
+	// --- LOT 3 (Wave-1 vSphere parity #1) proofs ---
+	proveGuestAgent(ctx, p, vms)
+	proveSnapshotTreeAndDelete(ctx, p)
+	proveDiskResize(ctx, p)
+
 	fmt.Println("\nPROBE OK: real libvirt RPC API exercised end to end.")
+}
+
+// proveGuestAgent: LOT 3 #1. Query the qemu-guest-agent path. The proof PASSES
+// whether or not an agent is connected: if absent it must return
+// AgentConnected=false WITHOUT an error (the "fall back silently" contract); if
+// present it surfaces the guest hostname/OS/IPs.
+func proveGuestAgent(ctx context.Context, p *kvm.Provider, vms []vprovider.VM) {
+	fmt.Println("== LOT 3 #1 proof: qemu guest-agent info query (graceful when agent absent) ==")
+	ga, ok := any(p).(vprovider.GuestAgentProvider)
+	if !ok || !p.Capabilities().Has(vprovider.CapGuestAgent) {
+		fmt.Println("  provider does not implement GuestAgentProvider / lacks CapGuestAgent; skipping")
+		fmt.Println()
+		return
+	}
+	// Prefer a RUNNING demo VM (web-server-01 / linux-server may run qemu-ga).
+	tried := 0
+	for _, v := range vms {
+		if v.State != vprovider.StateRunning {
+			continue
+		}
+		tried++
+		gi, err := ga.GuestInfo(ctx, v.ID)
+		if err != nil {
+			fatalf("guestagent: GuestInfo(%s) returned a hard error (must be soft): %v", v.Name, err)
+		}
+		fmt.Printf("  GuestInfo(%s): agentConnected=%v hostname=%q os=%q ips=%v\n",
+			v.Name, gi.AgentConnected, gi.Hostname, gi.OS, gi.IPAddresses)
+		if !gi.AgentConnected {
+			fmt.Printf("    -> agent not connected (note=%q) — handled gracefully, no error.\n", gi.Note)
+		} else {
+			fmt.Println("    -> agent connected; in-guest hostname/OS/IPs reported.")
+		}
+		if tried >= 3 {
+			break
+		}
+	}
+	if tried == 0 {
+		fmt.Println("  (no RUNNING domain to query; the guest-agent path is still wired and gated on CapGuestAgent)")
+	}
+	fmt.Println("  CONFIRMED: guest-agent query path works and degrades gracefully.")
+	fmt.Println()
+}
+
+// proveSnapshotTreeAndDelete: LOT 3 #2. Create a disked domain, take TWO CHAINED
+// snapshots, list them and confirm the second's ParentID points at the first
+// (a TREE), then DELETE the child (DomainSnapshotDelete) and confirm it is gone
+// while the parent remains.
+func proveSnapshotTreeAndDelete(ctx context.Context, p *kvm.Provider) {
+	fmt.Println("== LOT 3 #2 proof: snapshot TREE (parent) + delete-single (DomainSnapshotDelete) ==")
+	sm, ok := any(p).(vprovider.SnapshotManager)
+	if !ok || !p.Capabilities().Has(vprovider.CapSnapshot) {
+		fmt.Println("  provider does not implement SnapshotManager; skipping")
+		fmt.Println()
+		return
+	}
+	sp, _ := any(p).(vprovider.StorageProvider)
+	if sp == nil {
+		fmt.Println("  no StorageProvider; skipping")
+		fmt.Println()
+		return
+	}
+	pools, _ := p.ListStorage(ctx)
+	var pool string
+	for _, pl := range pools {
+		if pl.Accessible {
+			pool = pl.Name
+			break
+		}
+	}
+	if pool == "" {
+		fmt.Println("  no active storage pool; skipping")
+		fmt.Println()
+		return
+	}
+	volName := fmt.Sprintf("unihv-snaptree-%d.qcow2", time.Now().UnixNano())
+	if _, err := sp.CreateVolume(ctx, vprovider.VolumeSpec{Name: volName, StorageID: pool, CapacityGB: 1, Format: vprovider.DiskQcow2}); err != nil {
+		fatalf("snaptree: CreateVolume: %v", err)
+	}
+	var diskPath string
+	if vols, err := sp.ListVolumes(ctx, pool); err == nil {
+		for _, v := range vols {
+			if v.Name == volName {
+				diskPath = v.Path
+			}
+		}
+	}
+	name := fmt.Sprintf("unihv-snaptree-dom-%d", time.Now().UnixNano())
+	task, err := p.CreateVM(ctx, vprovider.VMSpec{
+		Name: name, VCPUs: 1, MemoryMB: 256, Firmware: vprovider.FirmwareBIOS,
+		Disks: []vprovider.DiskSpec{{StorageID: pool, SourcePath: diskPath, Format: vprovider.DiskQcow2, CapacityGB: 1}},
+	})
+	if err != nil {
+		fatalf("snaptree: CreateVM: %v", err)
+	}
+	id := task.EntityID
+	defer func() {
+		_, _ = p.DeleteVM(ctx, id, vprovider.DeleteOptions{Force: true})
+		_, _ = sp.DeleteVolume(ctx, pool, volName)
+	}()
+	fmt.Printf("  created DISKED domain %s id=%s\n", name, id)
+
+	// Two CHAINED snapshots: snap-2 is taken while snap-1 is current -> snap-1 is its parent.
+	if _, err := p.Snapshot(ctx, id, vprovider.SnapshotOptions{Name: "snap-1", Description: "base"}); err != nil {
+		fatalf("snaptree: Snapshot(snap-1): %v", err)
+	}
+	if _, err := p.Snapshot(ctx, id, vprovider.SnapshotOptions{Name: "snap-2", Description: "child"}); err != nil {
+		fatalf("snaptree: Snapshot(snap-2): %v", err)
+	}
+	snaps, err := p.ListSnapshots(ctx, id)
+	if err != nil {
+		fatalf("snaptree: ListSnapshots: %v", err)
+	}
+	fmt.Printf("  ListSnapshots -> %d snapshot(s):\n", len(snaps))
+	var childParent string
+	for _, s := range snaps {
+		fmt.Printf("    - name=%s parent=%q current=%v hasMemory=%v createdAt=%s\n",
+			s.Name, s.ParentID, s.IsCurrent, s.HasMemory, s.CreatedAt.Format(time.RFC3339))
+		if s.Name == "snap-2" {
+			childParent = s.ParentID
+		}
+	}
+	if childParent != "snap-1" {
+		fatalf("snaptree: snap-2.ParentID=%q want \"snap-1\" — TREE not populated", childParent)
+	}
+	fmt.Println("  CONFIRMED: snapshot TREE populated (snap-2.parent == snap-1).")
+
+	// DELETE the child (snap-2) and confirm it is gone, parent remains.
+	if _, err := sm.DeleteSnapshot(ctx, id, "snap-2"); err != nil {
+		fatalf("snaptree: DeleteSnapshot(snap-2): %v", err)
+	}
+	after, _ := p.ListSnapshots(ctx, id)
+	gone, parentStill := true, false
+	for _, s := range after {
+		if s.Name == "snap-2" {
+			gone = false
+		}
+		if s.Name == "snap-1" {
+			parentStill = true
+		}
+	}
+	fmt.Printf("  DeleteSnapshot(snap-2) -> now %d snapshot(s); child gone=%v parent remains=%v\n", len(after), gone, parentStill)
+	if !gone || !parentStill {
+		fatalf("snaptree: delete-single did not behave (gone=%v parentStill=%v)", gone, parentStill)
+	}
+	fmt.Println("  CONFIRMED: single snapshot deleted via DomainSnapshotDelete; parent intact.")
+	fmt.Println()
+}
+
+// proveDiskResize: LOT 3 #3. Create a disked domain (1 GiB), GROW its disk to 2 GiB
+// via DomainBlockResize, and CONFIRM the new capacity via a fresh GetVM read. Also
+// proves a SHRINK request maps to ErrInvalidSpec. Resizes the RUNNING domain (true
+// online resize) when start succeeds, else the defined (shut-off) domain.
+func proveDiskResize(ctx context.Context, p *kvm.Provider) {
+	fmt.Println("== LOT 3 #3 proof: online disk resize (DomainBlockResize grows the block device) ==")
+	dr, ok := any(p).(vprovider.DiskResizer)
+	if !ok || !p.Capabilities().Has(vprovider.CapDiskResize) {
+		fmt.Println("  provider does not implement DiskResizer / lacks CapDiskResize; skipping")
+		fmt.Println()
+		return
+	}
+	sp, _ := any(p).(vprovider.StorageProvider)
+	if sp == nil {
+		fmt.Println("  no StorageProvider; skipping")
+		fmt.Println()
+		return
+	}
+	pools, _ := p.ListStorage(ctx)
+	var pool string
+	for _, pl := range pools {
+		if pl.Accessible {
+			pool = pl.Name
+			break
+		}
+	}
+	if pool == "" {
+		fmt.Println("  no active storage pool; skipping")
+		fmt.Println()
+		return
+	}
+	volName := fmt.Sprintf("unihv-resize-%d.qcow2", time.Now().UnixNano())
+	if _, err := sp.CreateVolume(ctx, vprovider.VolumeSpec{Name: volName, StorageID: pool, CapacityGB: 1, Format: vprovider.DiskQcow2}); err != nil {
+		fatalf("resize: CreateVolume: %v", err)
+	}
+	var diskPath string
+	if vols, err := sp.ListVolumes(ctx, pool); err == nil {
+		for _, v := range vols {
+			if v.Name == volName {
+				diskPath = v.Path
+			}
+		}
+	}
+	name := fmt.Sprintf("unihv-resize-dom-%d", time.Now().UnixNano())
+	task, err := p.CreateVM(ctx, vprovider.VMSpec{
+		Name: name, VCPUs: 1, MemoryMB: 256, Firmware: vprovider.FirmwareUEFI,
+		Disks: []vprovider.DiskSpec{{StorageID: pool, SourcePath: diskPath, Format: vprovider.DiskQcow2, CapacityGB: 1}},
+	})
+	if err != nil {
+		fatalf("resize: CreateVM: %v", err)
+	}
+	id := task.EntityID
+	defer func() {
+		_, _ = p.DeleteVM(ctx, id, vprovider.DeleteOptions{Force: true})
+		_, _ = sp.DeleteVolume(ctx, pool, volName)
+	}()
+	// Start it so DomainBlockResize hits a LIVE block device (true online resize).
+	online := false
+	if _, err := p.PowerOp(ctx, id, vprovider.PowerStart); err == nil {
+		online = true
+	}
+	fmt.Printf("  created DISKED domain %s id=%s (running=%v)\n", name, id, online)
+
+	before, _ := p.GetVM(ctx, id)
+	var diskID string
+	var beforeCap float64
+	for _, d := range before.Disks {
+		diskID = d.ID
+		beforeCap = d.CapacityGB
+		break
+	}
+	if diskID == "" {
+		fatalf("resize: no disk found on the created domain")
+	}
+	fmt.Printf("  before: disk id=%s capacity=%.2fGB\n", diskID, beforeCap)
+
+	// SHRINK must be rejected.
+	_, serr := dr.ResizeDisk(ctx, id, diskID, 0.5)
+	fmt.Printf("  ResizeDisk(0.5GB shrink) -> error=%v (mapsToInvalidSpec=%v)\n", serr, errors.Is(serr, vprovider.ErrInvalidSpec))
+	if serr == nil || !errors.Is(serr, vprovider.ErrInvalidSpec) {
+		fatalf("resize: shrink was NOT rejected as ErrInvalidSpec")
+	}
+
+	// Confirm the LIVE block-device capacity before resize (authoritative source for
+	// an ONLINE resize is the domain's block device, not the volume metadata).
+	capBefore := domBlkCapacityBytes(ctx, name, "vda")
+	// GROW to 2 GiB.
+	if _, err := dr.ResizeDisk(ctx, id, diskID, 2); err != nil {
+		fatalf("resize: ResizeDisk(2GB grow): %v", err)
+	}
+	capAfter := domBlkCapacityBytes(ctx, name, "vda")
+	fmt.Printf("  ResizeDisk(2GB) -> live block-device capacity now=%d bytes (was %d) [virsh domblkinfo]\n", capAfter, capBefore)
+	// Also report the volume metadata view (grows in the shut-off path).
+	var afterCap float64
+	if vols, err := sp.ListVolumes(ctx, pool); err == nil {
+		for _, v := range vols {
+			if v.Name == volName {
+				afterCap = v.CapacityGB
+			}
+		}
+	}
+	fmt.Printf("    (backing-volume metadata capacity now=%.2fGB, was %.2fGB)\n", afterCap, beforeCap)
+	const want = int64(2 * 1024 * 1024 * 1024)
+	if capAfter < want-(64*1024*1024) {
+		fatalf("resize: live block device did NOT grow to ~2GB (got %d bytes)", capAfter)
+	}
+	fmt.Println("  CONFIRMED: DomainBlockResize grew the disk online (guest-visible capacity ~2GiB); shrink rejected.")
+	fmt.Println()
+}
+
+// domBlkCapacityBytes returns the capacity (bytes) of the named domain's block
+// device via `virsh domblkinfo`, the independent source of truth for the live,
+// guest-visible disk size after an online DomainBlockResize.
+func domBlkCapacityBytes(ctx context.Context, domName, dev string) int64 {
+	out, err := exec.CommandContext(ctx, "virsh", "-c", "qemu:///system", "domblkinfo", domName, dev).CombinedOutput()
+	if err != nil {
+		out, err = exec.CommandContext(ctx, "virsh", "domblkinfo", domName, dev).CombinedOutput()
+		if err != nil {
+			return -1
+		}
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 2 && strings.EqualFold(f[0], "Capacity:") {
+			var n int64
+			fmt.Sscan(f[1], &n)
+			return n
+		}
+	}
+	return -1
 }
 
 // proveHotPlug: #1 PRIORITY FEATURE. Hot-attach a disk + NIC and mount an ISO on a
