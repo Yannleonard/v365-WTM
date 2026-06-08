@@ -122,4 +122,27 @@ func (s *Server) mountVMRoutes(pr chi.Router) {
 		Post("/vm/providers/{providerID}/vms/{vmID}/template", s.VMMarkTemplate)
 	pr.With(az.RequirePermission("vm.read", scopeFromProvider)).
 		Get("/vm/providers/{providerID}/templates", s.VMTemplates)
+
+	// --- Lot 5A: CPU/memory resource control + per-disk QoS + live storage migration.
+	// Operator-grade (day-to-day allocation tuning). Each handler type-asserts the
+	// optional provider interface + its cap bit, else 405. ---
+	pr.With(az.AuditWrap("vm.resource"), az.RequireAAL, az.RequirePermission("vm.resource", scopeFromProvider)).
+		Post("/vm/providers/{providerID}/vms/{vmID}/resources", s.VMSetResources)
+	pr.With(az.AuditWrap("vm.disk.qos"), az.RequireAAL, az.RequirePermission("vm.disk.qos", scopeFromProvider)).
+		Post("/vm/providers/{providerID}/vms/{vmID}/disks/{diskID}/qos", s.VMDiskQoS)
+	pr.With(az.AuditWrap("vm.storage.migrate"), az.RequireAAL, az.RequirePermission("vm.storage.migrate", scopeFromProvider)).
+		Post("/vm/providers/{providerID}/vms/{vmID}/disks/{diskID}/migrate", s.VMStorageMigrate)
+
+	// --- Lot 5A: resource pools (persisted construct). List/assign are read+reconfigure
+	// grade; create/update/delete are admin-grade pool management (gated by vm.resource).
+	pr.With(az.RequirePermission("vm.read", nil)).
+		Get("/vm/pools", s.VMPools)
+	pr.With(az.AuditWrap("vm.pool.create"), az.RequireAAL, az.RequirePermission("vm.resource", nil)).
+		Post("/vm/pools", s.VMPoolCreate)
+	pr.With(az.AuditWrap("vm.pool.update"), az.RequireAAL, az.RequirePermission("vm.resource", nil)).
+		Put("/vm/pools/{poolID}", s.VMPoolUpdate)
+	pr.With(az.AuditWrap("vm.pool.delete"), az.RequireAAL, az.RequirePermission("vm.resource", nil)).
+		Delete("/vm/pools/{poolID}", s.VMPoolDelete)
+	pr.With(az.AuditWrap("vm.pool.assign"), az.RequireAAL, az.RequirePermission("vm.resource", scopeFromProvider)).
+		Post("/vm/providers/{providerID}/vms/{vmID}/pool", s.VMPoolAssign)
 }

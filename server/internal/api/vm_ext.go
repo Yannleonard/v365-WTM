@@ -2,13 +2,18 @@ package api
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/gtek-it/castor/server/internal/authz"
+	"github.com/gtek-it/castor/server/internal/store"
 	"github.com/gtek-it/castor/server/internal/vprovider"
 )
+
+// labelPool is the VM label that assigns a VM to a resource pool (Lot 5A).
+const labelPool = "unihv.pool"
 
 // --- console ---
 
@@ -439,6 +444,94 @@ func (s *Server) VMMarkTemplate(w http.ResponseWriter, r *http.Request) {
 	ok(w, task)
 }
 
+// --- Lot 5A: CPU/memory resource control + per-disk QoS + live storage migration ---
+
+// VMSetResources applies CPU/memory reservation/limit/shares to a VM (<cputune>/
+// <memtune>). Requires ResourceController + CapResourceControl.
+func (s *Server) VMSetResources(w http.ResponseWriter, r *http.Request) {
+	p, found := s.resolveVMProvider(w, r)
+	if !found {
+		return
+	}
+	rc, impl := p.(vprovider.ResourceController)
+	if !impl || !p.Capabilities().Has(vprovider.CapResourceControl) {
+		authz.WriteError(w, r, authz.ErrMethodNotAllowed)
+		return
+	}
+	var spec vprovider.ResourceSpec
+	if err := decodeJSON(w, r, &spec); err != nil {
+		authz.WriteError(w, r, err)
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 30*time.Second)
+	defer cancel()
+	task, err := rc.SetResources(ctx, chi.URLParam(r, "vmID"), spec)
+	if err != nil {
+		authz.WriteError(w, r, vmProviderError(err))
+		return
+	}
+	ok(w, task)
+}
+
+// VMDiskQoS sets a disk's IOPS/bandwidth throttle (<iotune>) on an existing disk
+// (no reboot). Requires DiskQoSManager + CapDiskQoS.
+func (s *Server) VMDiskQoS(w http.ResponseWriter, r *http.Request) {
+	p, found := s.resolveVMProvider(w, r)
+	if !found {
+		return
+	}
+	qm, impl := p.(vprovider.DiskQoSManager)
+	if !impl || !p.Capabilities().Has(vprovider.CapDiskQoS) {
+		authz.WriteError(w, r, authz.ErrMethodNotAllowed)
+		return
+	}
+	var qos vprovider.DiskQoS
+	if err := decodeJSON(w, r, &qos); err != nil {
+		authz.WriteError(w, r, err)
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 30*time.Second)
+	defer cancel()
+	task, err := qm.SetDiskQoS(ctx, chi.URLParam(r, "vmID"), chi.URLParam(r, "diskID"), qos)
+	if err != nil {
+		authz.WriteError(w, r, vmProviderError(err))
+		return
+	}
+	ok(w, task)
+}
+
+// vmStorageMigrateBody is the live storage-migration request body.
+type vmStorageMigrateBody struct {
+	TargetStorageID string `json:"targetStorageId"`
+}
+
+// VMStorageMigrate live-migrates a VM's disk to another storage pool/path (no
+// downtime; DomainBlockCopy + pivot). Requires StorageMigrator + CapStorageMigrate.
+func (s *Server) VMStorageMigrate(w http.ResponseWriter, r *http.Request) {
+	p, found := s.resolveVMProvider(w, r)
+	if !found {
+		return
+	}
+	sm, impl := p.(vprovider.StorageMigrator)
+	if !impl || !p.Capabilities().Has(vprovider.CapStorageMigrate) {
+		authz.WriteError(w, r, authz.ErrMethodNotAllowed)
+		return
+	}
+	var body vmStorageMigrateBody
+	if err := decodeJSON(w, r, &body); err != nil {
+		authz.WriteError(w, r, err)
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 10*time.Minute)
+	defer cancel()
+	task, err := sm.MigrateStorage(ctx, chi.URLParam(r, "vmID"), chi.URLParam(r, "diskID"), body.TargetStorageID)
+	if err != nil {
+		authz.WriteError(w, r, vmProviderError(err))
+		return
+	}
+	ok(w, task)
+}
+
 // VMTemplates lists the provider's TEMPLATE VMs (those carrying the
 // "unihv.template=true" Label). Reuses ListVMs with a label filter so the result is
 // the SAME normalized VM shape the list view already renders. Requires CapTemplates.
@@ -461,5 +554,175 @@ func (s *Server) VMTemplates(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ok(w, vms)
+}
+
+// --- Lot 5A: resource pools (persisted, assignable, reported) ---
+
+// poolView merges a stored pool with its live member count + aggregate usage so the
+// UI can show "budget vs. used". MemberVMIDs are the VMs labeled unihv.pool=<id>.
+type poolView struct {
+	store.ResourcePool
+	MemberVMIDs   []string `json:"memberVmIds"`
+	MemberCount   int      `json:"memberCount"`
+	UsedVCPUs     int      `json:"usedVcpus"`
+	UsedMemoryMB  int64    `json:"usedMemoryMb"`
+	Note          string   `json:"note,omitempty"`
+}
+
+// poolMembers lists the VMs assigned to a pool (label unihv.pool=<id>) on the pool's
+// provider, returning ids + aggregate vCPU/memory. Best-effort: a provider read
+// failure yields an empty member set (the pool definition is still valid).
+func (s *Server) poolMembers(r *http.Request, pl *store.ResourcePool) ([]string, int, int64) {
+	p, ok := s.vreg.Get(pl.ProviderID)
+	if !ok {
+		return nil, 0, 0
+	}
+	ctx, cancel := contextWithTimeout(r, 10*time.Second)
+	defer cancel()
+	vms, err := p.ListVMs(ctx, vprovider.ListOptions{Labels: map[string]string{labelPool: pl.ID}})
+	if err != nil {
+		return nil, 0, 0
+	}
+	ids := make([]string, 0, len(vms))
+	var vcpu int
+	var mem int64
+	for _, v := range vms {
+		ids = append(ids, v.ID)
+		vcpu += v.VCPUs
+		mem += v.MemoryMB
+	}
+	return ids, vcpu, mem
+}
+
+func (s *Server) toPoolView(r *http.Request, pl *store.ResourcePool) poolView {
+	ids, vcpu, mem := s.poolMembers(r, pl)
+	return poolView{
+		ResourcePool: *pl,
+		MemberVMIDs:  ids,
+		MemberCount:  len(ids),
+		UsedVCPUs:    vcpu,
+		UsedMemoryMB: mem,
+		Note:         "Pool limits are an advisory/reported allocation budget; plain libvirt has no native parent-cgroup pool enforcement.",
+	}
+}
+
+// poolInput is the create/update resource-pool request body.
+type poolInput struct {
+	Name        string `json:"name"`
+	ProviderID  string `json:"providerId"`
+	CPUShares   int64  `json:"cpuShares"`
+	CPULimitMHz int64  `json:"cpuLimitMhz"`
+	MemShares   int64  `json:"memShares"`
+	MemLimitMB  int64  `json:"memLimitMb"`
+	Notes       string `json:"notes"`
+}
+
+// VMPools lists resource pools (optionally filtered by ?providerId=) with members.
+func (s *Server) VMPools(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.store.ListResourcePools(r.Context(), r.URL.Query().Get("providerId"))
+	if err != nil {
+		authz.WriteError(w, r, err)
+		return
+	}
+	out := make([]poolView, 0, len(rows))
+	for _, p := range rows {
+		out = append(out, s.toPoolView(r, p))
+	}
+	ok(w, out)
+}
+
+// VMPoolCreate creates a resource pool.
+func (s *Server) VMPoolCreate(w http.ResponseWriter, r *http.Request) {
+	var in poolInput
+	if err := decodeJSON(w, r, &in); err != nil {
+		authz.WriteError(w, r, err)
+		return
+	}
+	if strings.TrimSpace(in.Name) == "" || strings.TrimSpace(in.ProviderID) == "" {
+		authz.WriteError(w, r, authz.Errorf(authz.ErrValidation, "name and providerId are required"))
+		return
+	}
+	if _, ok := s.vreg.Get(in.ProviderID); !ok {
+		authz.WriteError(w, r, authz.Errorf(authz.ErrValidation, "unknown hypervisor provider: "+in.ProviderID))
+		return
+	}
+	rec := &store.ResourcePool{
+		ID: store.NewUUID(), Name: in.Name, ProviderID: in.ProviderID,
+		CPUShares: in.CPUShares, CPULimitMHz: in.CPULimitMHz,
+		MemShares: in.MemShares, MemLimitMB: in.MemLimitMB, Notes: in.Notes,
+	}
+	if err := s.store.CreateResourcePool(r.Context(), rec); err != nil {
+		authz.WriteError(w, r, err)
+		return
+	}
+	created(w, s.toPoolView(r, rec))
+}
+
+// VMPoolUpdate updates a pool's budget + notes.
+func (s *Server) VMPoolUpdate(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "poolID")
+	rec, err := s.store.GetResourcePool(r.Context(), id)
+	if err != nil {
+		authz.WriteError(w, r, err)
+		return
+	}
+	var in poolInput
+	if err := decodeJSON(w, r, &in); err != nil {
+		authz.WriteError(w, r, err)
+		return
+	}
+	rec.CPUShares, rec.CPULimitMHz = in.CPUShares, in.CPULimitMHz
+	rec.MemShares, rec.MemLimitMB = in.MemShares, in.MemLimitMB
+	rec.Notes = in.Notes
+	if err := s.store.UpdateResourcePool(r.Context(), rec); err != nil {
+		authz.WriteError(w, r, err)
+		return
+	}
+	ok(w, s.toPoolView(r, rec))
+}
+
+// VMPoolDelete removes a pool. Member VMs keep running; their unihv.pool label is
+// left as-is (clearing labels is a reconfigure the caller can do separately).
+func (s *Server) VMPoolDelete(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.DeleteResourcePool(r.Context(), chi.URLParam(r, "poolID")); err != nil {
+		authz.WriteError(w, r, err)
+		return
+	}
+	noContent(w)
+}
+
+// vmPoolAssignBody assigns/unassigns a VM to a pool via the unihv.pool label.
+type vmPoolAssignBody struct {
+	PoolID string `json:"poolId"` // "" to UNASSIGN (clear the label to empty)
+}
+
+// VMPoolAssign assigns the VM to a pool (or clears it) by setting the unihv.pool
+// label through a real ReconfigureVM call (which persists the label on the domain).
+func (s *Server) VMPoolAssign(w http.ResponseWriter, r *http.Request) {
+	p, found := s.resolveVMProvider(w, r)
+	if !found {
+		return
+	}
+	var body vmPoolAssignBody
+	if err := decodeJSON(w, r, &body); err != nil {
+		authz.WriteError(w, r, err)
+		return
+	}
+	if body.PoolID != "" {
+		if _, err := s.store.GetResourcePool(r.Context(), body.PoolID); err != nil {
+			authz.WriteError(w, r, err)
+			return
+		}
+	}
+	ctx, cancel := contextWithTimeout(r, 30*time.Second)
+	defer cancel()
+	task, err := p.ReconfigureVM(ctx, chi.URLParam(r, "vmID"), vprovider.VMReconfigureSpec{
+		Labels: map[string]string{labelPool: body.PoolID},
+	})
+	if err != nil {
+		authz.WriteError(w, r, vmProviderError(err))
+		return
+	}
+	ok(w, task)
 }
 

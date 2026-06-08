@@ -281,6 +281,7 @@ export function VirtualMachines() {
           onDelete={actions.triggerDelete}
           onDeploy={actions.triggerDeploy}
           onMarkTemplate={actions.markTemplate}
+          onBackup={actions.triggerBackup}
         />
       ),
     },

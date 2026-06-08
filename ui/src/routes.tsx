@@ -13,6 +13,7 @@ import { Bootstrap } from "./views/Bootstrap";
 import { Dashboard } from "./views/Dashboard";
 import { FinOps } from "./views/FinOps";
 import { Insights } from "./views/Insights";
+import { Alarms } from "./views/Alarms";
 import { Hosts } from "./views/Hosts";
 import { Workloads } from "./views/Workloads";
 import { WorkloadDetail } from "./views/WorkloadDetail";
@@ -22,10 +23,12 @@ import { VMCreateWizard } from "./views/VMCreateWizard";
 import { VMNetworks } from "./views/VMNetworks";
 import { VMStorage } from "./views/VMStorage";
 import { VMClusters } from "./views/VMClusters";
+import { ResourcePools } from "./views/ResourcePools";
 import { HypervisorConnections } from "./views/HypervisorConnections";
 import { StorageBackends } from "./views/StorageBackends";
 import { Migration } from "./views/Migration";
 import { Replication } from "./views/Replication";
+import { VMBackups } from "./views/VMBackups";
 import { Stacks } from "./views/Stacks";
 import { StackEditor } from "./views/StackEditor";
 import { Marketplace } from "./views/Marketplace";
@@ -75,6 +78,14 @@ export const router = createBrowserRouter([
         element: (
           <RequirePerm anyOf={["insights.read", "*"]}>
             <Insights />
+          </RequirePerm>
+        ),
+      },
+      {
+        path: "alarms",
+        element: (
+          <RequirePerm anyOf={["alarms.read", "*"]}>
+            <Alarms />
           </RequirePerm>
         ),
       },
@@ -146,6 +157,14 @@ export const router = createBrowserRouter([
         ),
       },
       {
+        path: "resource-pools",
+        element: (
+          <RequirePerm anyOf={["vm.read", "*"]}>
+            <ResourcePools />
+          </RequirePerm>
+        ),
+      },
+      {
         path: "migration",
         element: (
           <RequirePerm anyOf={["v2v.read", "*"]}>
@@ -158,6 +177,14 @@ export const router = createBrowserRouter([
         element: (
           <RequirePerm anyOf={["replication.read", "*"]}>
             <Replication />
+          </RequirePerm>
+        ),
+      },
+      {
+        path: "vm-backups",
+        element: (
+          <RequirePerm anyOf={["vm.backup", "*"]}>
+            <VMBackups />
           </RequirePerm>
         ),
       },

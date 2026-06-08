@@ -1195,6 +1195,9 @@ export type VMCapability =
   | "guest_agent"
   | "maintenance"
   | "templates"
+  | "resource_control" // Lot 5A: CPU/mem reservation/limit/shares (<cputune>/<memtune>)
+  | "disk_qos" // Lot 5A: per-disk IOPS/bandwidth throttle (<iotune>)
+  | "storage_migrate" // Lot 5A: live storage migration (DomainBlockCopy + pivot)
   | "readonly"
   | (string & {});
 
@@ -1437,6 +1440,70 @@ export interface VMMigrateRequest {
 export interface VMReconfigureRequest {
   vcpus?: number;
   memoryMb?: number;
+  resources?: ResourceSpec; // Lot 5A: CPU/mem reservation/limit/shares
+}
+
+// CPU/memory resource allocation (Lot 5A) — vSphere-style reservation/limit/shares
+// (libvirt <cputune>/<memtune>). Zero/omitted fields mean "unset / hypervisor
+// default". POST .../vms/{vmId}/resources, and also accepted inside a reconfigure.
+export interface ResourceSpec {
+  cpuShares?: number;
+  cpuReservationMhz?: number;
+  cpuLimitMhz?: number;
+  memoryShares?: number;
+  memoryReservationMb?: number;
+  memoryLimitMb?: number;
+}
+
+// Per-disk QoS (Lot 5A) — IOPS / bandwidth throttling (libvirt <iotune>). 0 =
+// unlimited. POST .../vms/{vmId}/disks/{diskId}/qos. total* take precedence over the
+// read/write pair when both are set.
+export interface DiskQoS {
+  readIops?: number;
+  writeIops?: number;
+  totalIops?: number;
+  readBytesSec?: number;
+  writeBytesSec?: number;
+  totalBytesSec?: number;
+}
+
+// Body for POST .../vms/{vmId}/disks/{diskId}/migrate — live storage migration of a
+// running VM's disk to another storage pool (no downtime; DomainBlockCopy + pivot).
+export interface VMStorageMigrateRequest {
+  targetStorageId: string;
+}
+
+// A resource pool (Lot 5A): a named, provider-scoped grouping of VMs with an
+// AGGREGATE CPU/memory shares + limit budget. Members join via the unihv.pool=<id>
+// label. The budget is an advisory/reported allocation contract (plain libvirt has no
+// native parent-cgroup pool). The view adds live member count + aggregate usage.
+export interface ResourcePool {
+  id: string;
+  name: string;
+  providerId: string;
+  cpuShares: number;
+  cpuLimitMhz: number;
+  memShares: number;
+  memLimitMb: number;
+  notes?: string;
+  createdAt: number;
+  updatedAt: number;
+  memberVmIds: string[];
+  memberCount: number;
+  usedVcpus: number;
+  usedMemoryMb: number;
+  note?: string;
+}
+
+// Create/update body for a resource pool.
+export interface ResourcePoolInput {
+  name: string;
+  providerId: string;
+  cpuShares?: number;
+  cpuLimitMhz?: number;
+  memShares?: number;
+  memLimitMb?: number;
+  notes?: string;
 }
 
 // Body for POST /vm/providers/{pid}/vms/{vmId}/disks/{diskId}/resize. Online
@@ -1778,6 +1845,79 @@ export interface InsightsFeed {
   generatedAt: string; // RFC3339
 }
 
+/* ===================== Alarms (vSphere-style threshold rules) ===================== */
+
+export type AlarmSeverity = "info" | "warning" | "critical";
+export type AlarmTarget = "vm" | "host" | "datastore";
+export type AlarmMetric = "cpu" | "memory" | "disk" | "storage_pct" | "state";
+export type AlarmComparator = "gt" | "lt" | "eq";
+export type AlarmChannelType = "webhook" | "email-stub";
+
+// A user-defined alarm definition (GET/POST /alarms/definitions).
+export interface AlarmDefinition {
+  id: string;
+  name: string;
+  target: AlarmTarget;
+  metric: AlarmMetric;
+  comparator: AlarmComparator;
+  threshold: number;
+  stateValue?: string;
+  durationSec: number;
+  severity: AlarmSeverity;
+  enabled: boolean;
+  notifyChannelIds: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+// Body for create/update an alarm definition.
+export interface AlarmDefinitionInput {
+  name: string;
+  target: AlarmTarget;
+  metric: AlarmMetric;
+  comparator: AlarmComparator;
+  threshold: number;
+  stateValue?: string;
+  durationSec: number;
+  severity: AlarmSeverity;
+  enabled: boolean;
+  notifyChannelIds: string[];
+}
+
+// A currently-firing alarm instance (GET /alarms/active).
+export interface AlarmInstance {
+  id: string;
+  definitionId: string;
+  definitionName: string;
+  objectId: string;
+  objectName: string;
+  objectType: AlarmTarget;
+  severity: AlarmSeverity;
+  metric: AlarmMetric;
+  state: "active" | "cleared";
+  value: number;
+  stateRaw?: string;
+  raisedAt: string; // RFC3339
+  clearedAt?: string;
+  lastNotifiedAt?: string;
+}
+
+// A notification channel (GET/POST /alarms/channels).
+export interface AlarmChannel {
+  id: string;
+  name: string;
+  type: AlarmChannelType;
+  config: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface AlarmChannelInput {
+  name: string;
+  type: AlarmChannelType;
+  config: string;
+}
+
 /* ===================== V2V migration (cross-hypervisor) ===================== */
 
 // Body for POST /v2v/preflight and POST /v2v/migrate. The same shape drives
@@ -1899,6 +2039,79 @@ export interface ReplicationPolicyView {
   createdAt: number;
   updatedAt: number;
   state?: ReplicationState;
+}
+
+/* ===================== Scheduled VM backups (Lot 5B) ===================== */
+
+// One stored disk image inside a backup.
+export interface VMBackupDisk {
+  key: string;
+  sizeBytes: number;
+  format?: string;
+}
+
+// VMBackup is a produced backup artifact set (GET /vm-backups): a point-in-time
+// snapshot of a VM whose disk(s) were exported (qcow2) and pushed to a storage
+// backend under keyPrefix. status is pending|completed|error.
+export interface VMBackup {
+  id: string;
+  vmId: string;
+  vmName?: string;
+  providerId: string;
+  backendId: string;
+  policyId?: string;
+  keyPrefix: string;
+  sizeBytes: number;
+  diskCount: number;
+  disks?: VMBackupDisk[];
+  guestOs?: string;
+  firmware?: string;
+  status: "pending" | "completed" | "error" | (string & {});
+  error?: string;
+  createdAt: number;
+}
+
+// Body for POST /vm-backups/run ("Back up now").
+export interface VMBackupRunInput {
+  providerId: string;
+  vmId: string;
+  backendId: string;
+}
+
+// Body for POST /vm-backups/{id}/restore (import a backup as a NEW VM).
+export interface VMBackupRestoreInput {
+  targetProviderId: string;
+  targetHostId?: string;
+  targetName?: string;
+  powerOn?: boolean;
+}
+
+// VMBackupPolicy is a scheduled-backup definition (GET /vm-backup-policies).
+export interface VMBackupPolicy {
+  id: string;
+  name: string;
+  providerId: string;
+  vmId: string;
+  backendId: string;
+  intervalSeconds: number;
+  retentionCount: number;
+  enabled: boolean;
+  status: string;
+  lastRunAt?: number;
+  lastError?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+// Body for POST /vm-backup-policies (create).
+export interface VMBackupPolicyInput {
+  name: string;
+  providerId: string;
+  vmId: string;
+  backendId: string;
+  intervalSeconds: number;
+  retentionCount: number;
+  enabled: boolean;
 }
 
 /* ===================== Error envelope ===================== */

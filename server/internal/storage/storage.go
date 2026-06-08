@@ -28,12 +28,17 @@ const (
 	TypeSMB       Type = "smb"
 	TypeAzureBlob Type = "azureblob"
 	TypeS3        Type = "s3"
+	// TypeLocal is a plain LOCAL FILESYSTEM directory on the UniHV host (or an
+	// already-mounted SAN/NAS path). It needs no libvirt pool and no cloud
+	// credentials — only a base directory (Target) — and exists primarily as a
+	// backup TARGET for the VM backup engine. Connectivity = the dir is writable.
+	TypeLocal Type = "local"
 )
 
 // ValidType reports whether t is a known storage backend type.
 func ValidType(t string) bool {
 	switch Type(t) {
-	case TypeNFS, TypeISCSI, TypeSMB, TypeAzureBlob, TypeS3:
+	case TypeNFS, TypeISCSI, TypeSMB, TypeAzureBlob, TypeS3, TypeLocal:
 		return true
 	default:
 		return false
@@ -96,6 +101,8 @@ func New(cfg Config) (Backend, error) {
 		return newAzureBackend(cfg)
 	case TypeS3:
 		return newS3Backend(cfg)
+	case TypeLocal:
+		return newLocalBackend(cfg)
 	default:
 		return nil, fmt.Errorf("%w: %q", ErrUnsupported, cfg.Type)
 	}
@@ -134,6 +141,10 @@ func (c Config) Validate() error {
 		}
 		if strings.TrimSpace(c.Region) == "" {
 			return errors.New("s3 requires a region")
+		}
+	case TypeLocal:
+		if strings.TrimSpace(c.Target) == "" {
+			return errors.New("local requires a base directory (target)")
 		}
 	default:
 		return fmt.Errorf("%w: %q", ErrUnsupported, c.Type)

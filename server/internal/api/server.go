@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/gtek-it/castor/server/internal/alarms"
 	"github.com/gtek-it/castor/server/internal/authz"
+	bk "github.com/gtek-it/castor/server/internal/backup"
 	"github.com/gtek-it/castor/server/internal/cache"
 	"github.com/gtek-it/castor/server/internal/config"
 	"github.com/gtek-it/castor/server/internal/inventory"
@@ -40,6 +42,14 @@ type Server struct {
 	// replEng drives cross-hypervisor VM replication (DR): scheduled V2V cycles +
 	// RPO tracking + failover. It reuses the V2V migrate pipeline under the hood.
 	replEng *replication.Engine
+	// alarmEng drives vSphere-style threshold ALARMS: a ticker evaluates user
+	// definitions over the unified inventory/metrics, raises/clears stateful
+	// instances and fires notification channels. Started in StartAlarmEngine.
+	alarmEng *alarms.Engine
+	// backupEng drives scheduled VM BACKUPS (Lot 5B): snapshot -> export -> store to
+	// a storage backend, with retention pruning + restore. Scheduling starts in
+	// LoadVMBackupPolicies (called from main after providers are registered).
+	backupEng *bk.Engine
 }
 
 // NewServer constructs the API server. vreg is the hypervisor registry (may be an
@@ -64,6 +74,21 @@ func NewServer(cfg *config.Config, st *store.Store, az *authz.Deps, guard *authz
 	// persists per-policy DR summaries to the store. Scheduling starts in
 	// LoadReplicationPolicies (called from main after providers are registered).
 	s.replEng = replication.New(vreg, nil, st)
+	// Alarms engine: evaluates threshold rules over the unified inventory + per-VM/
+	// host metrics. The store adapter bridges the durable alarm tables; the metrics
+	// adapter resolves the latest metric sample via the hypervisor registry.
+	s.alarmEng = alarms.New(
+		s.agg,
+		alarmMetricsAdapter{vreg: vreg},
+		alarmStoreAdapter{st: st},
+		&alarms.HTTPNotifier{},
+		30*time.Second,
+	)
+	// Backup engine (Lot 5B): snapshot -> export -> store to a storage backend.
+	// Resolves storage backends (opening sealed secrets) + persists backup rows via
+	// the API adapters; reuses the qemu-img converter. Scheduling starts in
+	// LoadVMBackupPolicies (called from main after providers are registered).
+	s.backupEng = bk.New(vreg, backupBackendResolver{s: s}, backupRecorder{s: s}, nil, store.NewUUID)
 	return s
 }
 

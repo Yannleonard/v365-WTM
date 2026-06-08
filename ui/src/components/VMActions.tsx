@@ -41,6 +41,7 @@ import {
   IconChevronDown,
   IconRefresh,
   IconStacks,
+  IconDownload,
 } from "./icons";
 
 /** Everything the bar/menu drives — all already provided by useVMActions(). */
@@ -62,6 +63,8 @@ export interface VMActionHandlers {
   // VM from a template (reuses Clone); onMarkTemplate toggles the template marking.
   onDeploy?: (vm: VM) => void;
   onMarkTemplate?: (vm: VM, isTemplate: boolean) => void;
+  // Backup (Lot 5B). Optional — opens the "Back up now" backend picker.
+  onBackup?: (vm: VM) => void;
 }
 
 interface Props extends VMActionHandlers {
@@ -312,6 +315,12 @@ function ActionsMenu(props: Props & { compact?: boolean }) {
   const gMigrate = gateVMAction("migrate", caps, permissions);
   const gTemplate = gateVMTemplate(caps, permissions);
   const gDelete = deleteGate(vm, gateVMAction("delete_vm", caps, permissions), permissions);
+  // Backup (Lot 5B) is gated by vm.backup (export-class; reuses the snapshot/export
+  // capabilities). A read-only provider that cannot export is excluded.
+  const canBackupPerm = (permissions ?? []).includes("vm.backup") || (permissions ?? []).includes("*");
+  const gBackup: GateResult = canBackupPerm
+    ? { allowed: true, reason: "" }
+    : { allowed: false, reason: "You lack the vm.backup permission" };
   const isTemplate = vm.labels?.["unihv.template"] === "true";
 
   const close = () => {
@@ -454,6 +463,9 @@ function ActionsMenu(props: Props & { compact?: boolean }) {
             : null}
           {item("Clone…", <IconClone size={15} />, gClone, () => props.onClone(vm))}
           {item("Migrate…", <IconMigrate size={15} />, gMigrate, () => props.onMigrate(vm))}
+          {props.onBackup
+            ? item("Back up now…", <IconDownload size={15} />, gBackup, () => props.onBackup!(vm))
+            : null}
           <div className="menu-divider" />
           {item("Delete", <IconTrash size={15} />, gDelete, () => props.onDelete(vm), { danger: true })}
         </div>

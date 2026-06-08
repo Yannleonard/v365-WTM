@@ -151,6 +151,7 @@ export function VirtualMachineDetail() {
             onMountIso={actions.triggerMountIso}
             onEjectIso={actions.ejectIso}
             onDelete={actions.triggerDelete}
+            onBackup={actions.triggerBackup}
             onConsole={consoleGate.allowed ? () => setTab("console") : undefined}
             onRefresh={() => query.refetch()}
           />

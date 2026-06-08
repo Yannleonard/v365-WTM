@@ -47,6 +47,7 @@ import type {
   VM,
   VMDetail,
   VMProvider,
+  ResourcePool,
   HvConn,
   StorageBackend,
   VMCapability,
@@ -60,10 +61,15 @@ import type {
   Volume,
   V2VProgress,
   ReplicationPolicyView,
+  VMBackup,
+  VMBackupPolicy,
   FinOpsSummary,
   RightsizingResponse,
   RateCard,
   InsightsFeed,
+  AlarmDefinition,
+  AlarmInstance,
+  AlarmChannel,
 } from "./types";
 
 export const DEFAULT_HOST = "local";
@@ -136,10 +142,16 @@ export const qk = {
   v2vJob: (id: string) => ["v2v", "job", id] as const,
   replicationPolicies: ["replication", "policies"] as const,
   replicationPolicy: (id: string) => ["replication", "policy", id] as const,
+  vmPools: (providerId?: string) => ["vm-pools", providerId ?? "all"] as const,
+  vmBackups: (vmId?: string) => ["vm-backups", vmId ?? "all"] as const,
+  vmBackupPolicies: ["vm-backup-policies"] as const,
   finopsSummary: ["finops", "summary"] as const,
   finopsRightsizing: ["finops", "rightsizing"] as const,
   finopsRateCard: ["finops", "ratecard"] as const,
   insights: ["insights"] as const,
+  alarmDefinitions: ["alarms", "definitions"] as const,
+  alarmsActive: ["alarms", "active"] as const,
+  alarmChannels: ["alarms", "channels"] as const,
 };
 
 const POLL = 8000; // background refresh cadence for live-ish lists
@@ -544,6 +556,16 @@ export function useVMProviders(opts?: Partial<UseQueryOptions<VMProvider[]>>) {
   });
 }
 
+/** Resource pools (Lot 5A) — persisted CPU/mem allocation groupings + live members. */
+export function useVMPools(providerId?: string, opts?: Partial<UseQueryOptions<ResourcePool[]>>) {
+  return useQuery<ResourcePool[]>({
+    queryKey: qk.vmPools(providerId),
+    queryFn: () => api.vmPools(providerId),
+    refetchInterval: POLL,
+    ...opts,
+  });
+}
+
 /** Registered hypervisor connections (admin; secrets never present). Live-ish so
  *  the connect/register status settles in the list shortly after a create. */
 export function useHvConnections(opts?: Partial<UseQueryOptions<HvConn[]>>) {
@@ -714,6 +736,29 @@ export function useReplicationPolicy(
   });
 }
 
+/* ===================== Scheduled VM backups (Lot 5B) ===================== */
+
+/** VM backups (optionally filtered by vmId). Polled so pending -> completed
+ *  settles in the list shortly after a "Back up now". */
+export function useVMBackups(vmId?: string, opts?: Partial<UseQueryOptions<VMBackup[]>>) {
+  return useQuery<VMBackup[]>({
+    queryKey: qk.vmBackups(vmId),
+    queryFn: () => api.vmBackups(vmId),
+    refetchInterval: 5000,
+    ...opts,
+  });
+}
+
+/** Scheduled-backup policies + their last-run summary. Polled. */
+export function useVMBackupPolicies(opts?: Partial<UseQueryOptions<VMBackupPolicy[]>>) {
+  return useQuery<VMBackupPolicy[]>({
+    queryKey: qk.vmBackupPolicies,
+    queryFn: () => api.vmBackupPolicies(),
+    refetchInterval: 5000,
+    ...opts,
+  });
+}
+
 /* ===================== FinOps + Insights ===================== */
 
 /** Unified cost overview (totals, breakdowns, top spenders, savings). Live-ish. */
@@ -755,6 +800,41 @@ export function useInsights(opts?: Partial<UseQueryOptions<InsightsFeed>>) {
     queryFn: () => api.insights(),
     refetchInterval: 30_000,
     staleTime: 15_000,
+    ...opts,
+  });
+}
+
+/* ===================== Alarms (threshold rules + notifications) ===================== */
+
+/** All alarm definitions (user rules). */
+export function useAlarmDefinitions(opts?: Partial<UseQueryOptions<AlarmDefinition[]>>) {
+  return useQuery<AlarmDefinition[]>({
+    queryKey: qk.alarmDefinitions,
+    queryFn: () => api.alarmDefinitions(),
+    ...opts,
+  });
+}
+
+/** Currently-firing alarm instances. Polled (the engine ticks server-side). */
+export function useActiveAlarms(
+  enabled = true,
+  opts?: Partial<UseQueryOptions<AlarmInstance[]>>,
+) {
+  return useQuery<AlarmInstance[]>({
+    queryKey: qk.alarmsActive,
+    queryFn: () => api.alarmsActive(),
+    enabled,
+    refetchInterval: 15_000,
+    staleTime: 5_000,
+    ...opts,
+  });
+}
+
+/** Notification channels. */
+export function useAlarmChannels(opts?: Partial<UseQueryOptions<AlarmChannel[]>>) {
+  return useQuery<AlarmChannel[]>({
+    queryKey: qk.alarmChannels,
+    queryFn: () => api.alarmChannels(),
     ...opts,
   });
 }

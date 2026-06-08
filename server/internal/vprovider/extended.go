@@ -215,6 +215,40 @@ type TemplateManager interface {
 	MarkTemplate(ctx context.Context, vmID string, isTemplate bool) (*Task, error)
 }
 
+// --- Lot 5A: CPU/memory resource control + per-disk QoS + live storage migration ---
+
+// ResourceController is implemented by providers that can apply vSphere-style
+// CPU/memory resource ALLOCATION (reservation/limit/shares) to a VM. For KVM this
+// renders <cputune> (shares/period/quota) + <memtune> (hard_limit/soft_limit/
+// min_guarantee) onto the persistent domain config (and the live cgroup where
+// libvirt permits). The current applied values are surfaced back through GetVM's
+// Labels (the VM struct is frozen). Requires CapResourceControl.
+type ResourceController interface {
+	// SetResources applies the CPU/memory resource-allocation spec to the VM. Zero
+	// fields are treated as "unset / leave at hypervisor default".
+	SetResources(ctx context.Context, vmID string, spec ResourceSpec) (*Task, error)
+}
+
+// DiskQoSManager is implemented by providers that can change per-disk QoS (IOPS /
+// bandwidth throttling, libvirt <iotune>) on an EXISTING disk WITHOUT a reboot
+// (KVM: DomainSetBlockIoTune / DomainUpdateDeviceFlags on the disk). Requires
+// CapDiskQoS.
+type DiskQoSManager interface {
+	// SetDiskQoS sets the QoS limits on the disk identified by diskID. A zeroed QoS
+	// clears all limits (unthrottled).
+	SetDiskQoS(ctx context.Context, vmID, diskID string, qos DiskQoS) (*Task, error)
+}
+
+// StorageMigrator is implemented by providers that can move a VM's disk to another
+// storage pool/datastore (or path) with NO downtime — a LIVE storage migration
+// (KVM: DomainBlockCopy to the new path, then pivot). Requires CapStorageMigrate.
+type StorageMigrator interface {
+	// MigrateStorage live-migrates the disk identified by diskID onto targetStorageID
+	// (a pool name) or, when the provider exposes a single pool, an explicit target
+	// path. The VM stays running; the copy is mirrored then pivoted.
+	MigrateStorage(ctx context.Context, vmID, diskID, targetStorageID string) (*Task, error)
+}
+
 // Capability bits for the optional interfaces (continue the CapabilityMatrix).
 // They are defined here (not in capability.go) to keep the extension self-contained;
 // being in the same package they share the same iota space is NOT required because
@@ -240,6 +274,15 @@ const (
 	// (TemplateManager) + clone-from-template (the existing Clone op produces a
 	// fresh non-template VM). Lot 4A.
 	CapTemplates CapabilityMatrix = 1 << 39
+	// CapResourceControl declares CPU/memory resource ALLOCATION (reservation/limit/
+	// shares) via <cputune>/<memtune> (ResourceController). Lot 5A.
+	CapResourceControl CapabilityMatrix = 1 << 40
+	// CapDiskQoS declares per-disk IOPS/bandwidth throttling via <iotune>
+	// (DiskQoSManager) — changeable on an existing disk with no reboot. Lot 5A.
+	CapDiskQoS CapabilityMatrix = 1 << 41
+	// CapStorageMigrate declares LIVE storage migration: move a running VM's disk to
+	// another pool/path via DomainBlockCopy + pivot (StorageMigrator). Lot 5A.
+	CapStorageMigrate CapabilityMatrix = 1 << 42
 )
 
 // extTokens maps the extension capability bits to wire tokens (appended to the
@@ -256,6 +299,9 @@ var extTokens = []struct {
 	{CapDiskResize, "disk_resize"},
 	{CapMaintenance, "maintenance"},
 	{CapTemplates, "templates"},
+	{CapResourceControl, "resource_control"},
+	{CapDiskQoS, "disk_qos"},
+	{CapStorageMigrate, "storage_migrate"},
 }
 
 // ExtStrings returns the active EXTENSION capability tokens (console/network_write/

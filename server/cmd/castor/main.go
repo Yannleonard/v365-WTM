@@ -204,6 +204,12 @@ func run() error {
 	// Start the cross-hypervisor replication (DR) engine and resume enabled policies
 	// (scheduled V2V cycles + RPO tracking). After connections so providers exist.
 	apiServer.LoadReplicationPolicies(rootCtx)
+	// Start the scheduled VM backup engine (Lot 5B) and resume enabled policies
+	// (snapshot -> export -> store to a storage backend, with retention pruning).
+	apiServer.LoadVMBackupPolicies(rootCtx)
+	// Start the vSphere-style alarms engine: resume persisted active alarms and run
+	// the threshold-evaluation ticker over the unified inventory/metrics.
+	apiServer.StartAlarmEngine(rootCtx)
 	handler := apiServer.Router()
 
 	// 7. HTTP server with sane timeouts.

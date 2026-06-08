@@ -116,6 +116,11 @@ import type {
   VMMigrateRequest,
   VMReconfigureRequest,
   VMDiskResizeRequest,
+  ResourceSpec,
+  DiskQoS,
+  VMStorageMigrateRequest,
+  ResourcePool,
+  ResourcePoolInput,
   GuestInfo,
   VMSpec,
   VMSpecDisk,
@@ -133,10 +138,20 @@ import type {
   ReplicationPolicyView,
   ReplicationCycle,
   ReplicationState,
+  VMBackup,
+  VMBackupRunInput,
+  VMBackupRestoreInput,
+  VMBackupPolicy,
+  VMBackupPolicyInput,
   FinOpsSummary,
   RightsizingResponse,
   RateCard,
   InsightsFeed,
+  AlarmDefinition,
+  AlarmDefinitionInput,
+  AlarmInstance,
+  AlarmChannel,
+  AlarmChannelInput,
   VMBulkRequest,
   VMBulkResponse,
   ApiTokenRecord,
@@ -873,6 +888,33 @@ export const api = {
   vmDiskResize: (pid: string, vmId: string, diskId: string, body: VMDiskResizeRequest) =>
     post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/disks/${encId(diskId)}/resize`, body),
 
+  /* ---- Lot 5A: CPU/mem resource control + per-disk QoS + live storage migration ---- */
+  // Apply CPU/memory reservation/limit/shares (<cputune>/<memtune>). Gated on the
+  // "resource_control" cap + vm.resource. Returns a Task.
+  vmSetResources: (pid: string, vmId: string, body: ResourceSpec) =>
+    post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/resources`, body),
+  // Set per-disk IOPS/bandwidth throttle (<iotune>) on an existing disk (no reboot).
+  // Gated on the "disk_qos" cap + vm.disk.qos.
+  vmDiskQoS: (pid: string, vmId: string, diskId: string, body: DiskQoS) =>
+    post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/disks/${encId(diskId)}/qos`, body),
+  // Live-migrate a running VM's disk to another storage pool (no downtime). Gated on
+  // the "storage_migrate" cap + vm.storage.migrate.
+  vmStorageMigrate: (pid: string, vmId: string, diskId: string, body: VMStorageMigrateRequest) =>
+    post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/disks/${encId(diskId)}/migrate`, body),
+
+  /* ---- Lot 5A: resource pools (persisted, assignable, reported) ---- */
+  // List pools (optionally one provider); create/update/delete manage the budget;
+  // assign sets/clears a VM's unihv.pool label via a reconfigure. List is read-grade;
+  // mutations are gated on vm.resource.
+  vmPools: (providerId?: string) =>
+    get<ResourcePool[]>(`/vm/pools${providerId ? qs({ providerId }) : ""}`),
+  vmPoolCreate: (body: ResourcePoolInput) => post<ResourcePool>("/vm/pools", body),
+  vmPoolUpdate: (poolId: string, body: ResourcePoolInput) =>
+    put<ResourcePool>(`/vm/pools/${encId(poolId)}`, body),
+  vmPoolDelete: (poolId: string) => del<void>(`/vm/pools/${encId(poolId)}`),
+  vmPoolAssign: (pid: string, vmId: string, poolId: string) =>
+    post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/pool`, { poolId }),
+
   /* ---- guest agent (IP / hostname / OS) ---- */
   // GuestInfo reported by the in-guest agent. agentConnected:false on demo VMs —
   // the caller renders a "not connected" hint, not an error. Gated on "guest_agent".
@@ -906,6 +948,22 @@ export const api = {
   replicationFailover: (id: string) =>
     post<ReplicationState>(`/replication/policies/${encId(id)}/failover`, {}),
 
+  /* ---- Scheduled VM backups (Lot 5B) ---- */
+  // Back up a VM (snapshot -> export -> store to a storage backend) on demand or on
+  // a schedule, with retention. List/run/delete + policy CRUD use vm.backup;
+  // restore (imports a NEW VM) is admin-grade (vm.backup.restore).
+  vmBackups: (vmId?: string) =>
+    get<VMBackup[]>(`/vm-backups${vmId ? `?vmId=${encodeURIComponent(vmId)}` : ""}`),
+  vmBackupRun: (body: VMBackupRunInput) => post<VMBackup>("/vm-backups/run", body),
+  vmBackupDelete: (id: string) => del<void>(`/vm-backups/${encId(id)}`),
+  vmBackupRestore: (id: string, body: VMBackupRestoreInput) =>
+    post<{ vmId: string }>(`/vm-backups/${encId(id)}/restore`, body),
+  vmBackupPolicies: () => get<VMBackupPolicy[]>("/vm-backup-policies"),
+  vmBackupPolicyCreate: (body: VMBackupPolicyInput) =>
+    post<VMBackupPolicy>("/vm-backup-policies", body),
+  vmBackupPolicyRun: (id: string) => post<{ ok: boolean }>(`/vm-backup-policies/${encId(id)}/run`, {}),
+  vmBackupPolicyDelete: (id: string) => del<void>(`/vm-backup-policies/${encId(id)}`),
+
   /* ---- FinOps (unified cost & rightsizing) ---- */
   // Cost overview (totals, by-domain/hypervisor/cluster/host breakdowns, top
   // spenders, headline savings) computed across VMs AND containers in one pass.
@@ -918,6 +976,21 @@ export const api = {
 
   /* ---- Insights (drift / health / best-practice feed) ---- */
   insights: () => get<InsightsFeed>("/insights"),
+
+  /* ---- Alarms (vSphere-style threshold rules + notifications) ---- */
+  // Definitions are user rules; active returns the current firing instances; a
+  // channel POSTs notifications (webhook) on raise/clear. Writes are admin-grade.
+  alarmDefinitions: () => get<AlarmDefinition[]>("/alarms/definitions"),
+  alarmDefinitionCreate: (body: AlarmDefinitionInput) =>
+    post<AlarmDefinition>("/alarms/definitions", body),
+  alarmDefinitionUpdate: (id: string, body: AlarmDefinitionInput) =>
+    put<AlarmDefinition>(`/alarms/definitions/${encId(id)}`, body),
+  alarmDefinitionDelete: (id: string) => del<void>(`/alarms/definitions/${encId(id)}`),
+  alarmsActive: () => get<AlarmInstance[]>("/alarms/active"),
+  alarmChannels: () => get<AlarmChannel[]>("/alarms/channels"),
+  alarmChannelCreate: (body: AlarmChannelInput) => post<AlarmChannel>("/alarms/channels", body),
+  alarmChannelDelete: (id: string) => del<void>(`/alarms/channels/${encId(id)}`),
+  alarmChannelTest: (id: string) => post<ActionResult>(`/alarms/channels/${encId(id)}/test`, {}),
 
   /* ---- API tokens (scoped personal access tokens, Lot 4B) ---- */
   // List the caller's active tokens (metadata only; the raw value is shown ONCE

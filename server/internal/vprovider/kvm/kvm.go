@@ -132,6 +132,17 @@ type extBackend interface {
 	// online disk resize: DomainBlockResize on the running domain's block device
 	// (growing the underlying StorageVol first when needed).
 	resizeDisk(uuid, diskID string, newCapacityGB float64) error
+
+	// --- Lot 5A ---
+	// setResources applies CPU/memory resource allocation (reservation/limit/shares)
+	// to the persistent (and, where possible, live) domain via <cputune>/<memtune>.
+	setResources(uuid string, spec vp.ResourceSpec) error
+	// setDiskQoS changes the per-disk <iotune> throttle on an EXISTING disk via
+	// DomainUpdateDeviceFlags (LIVE|CONFIG), no reboot.
+	setDiskQoS(uuid, diskID string, qos vp.DiskQoS) error
+	// migrateStorage live-migrates the disk to targetStorageID (pool) / path via
+	// DomainBlockCopy + pivot (DomainBlockJobAbort PIVOT).
+	migrateStorage(uuid, diskID, targetStorageID string) error
 }
 
 // Provider is the KVM/libvirt HypervisorProvider. The core is CGO-free; the
@@ -393,11 +404,14 @@ func (p *Provider) CreateVM(ctx context.Context, spec vp.VMSpec) (*vp.Task, erro
 	}
 	for i, dk := range spec.Disks {
 		d.Disks = append(d.Disks, libvirtDisk{
-			Target:   "vd" + string(rune('a'+i)),
-			Driver:   string(normalizeDiskFormat(string(dk.Format))),
-			Source:   dk.SourcePath,
-			Pool:     dk.StorageID,
-			CapBytes: int64(dk.CapacityGB * bytesPerGB),
+			Target:       "vd" + string(rune('a'+i)),
+			Driver:       string(normalizeDiskFormat(string(dk.Format))),
+			Source:       dk.SourcePath,
+			Pool:         dk.StorageID,
+			CapBytes:     int64(dk.CapacityGB * bytesPerGB),
+			QoS:          dk.QoS,
+			Provisioning: dk.Provisioning,
+			Discard:      dk.Discard,
 		})
 	}
 	for _, n := range spec.NICs {
@@ -506,15 +520,30 @@ func (p *Provider) ReconfigureVM(ctx context.Context, vmID string, spec vp.VMRec
 	}
 	for i, dk := range spec.AddDisks {
 		d.Disks = append(d.Disks, libvirtDisk{
-			Target:   "vd" + string(rune('a'+len(d.Disks)+i)),
-			Driver:   string(normalizeDiskFormat(string(dk.Format))),
-			Source:   dk.SourcePath,
-			Pool:     dk.StorageID,
-			CapBytes: int64(dk.CapacityGB * bytesPerGB),
+			Target:       "vd" + string(rune('a'+len(d.Disks)+i)),
+			Driver:       string(normalizeDiskFormat(string(dk.Format))),
+			Source:       dk.SourcePath,
+			Pool:         dk.StorageID,
+			CapBytes:     int64(dk.CapacityGB * bytesPerGB),
+			QoS:          dk.QoS,
+			Provisioning: dk.Provisioning,
+			Discard:      dk.Discard,
 		})
 	}
 	for _, n := range spec.AddNICs {
 		d.NICs = append(d.NICs, libvirtNIC{MAC: n.MAC, Network: n.NetworkID, Model: n.Model, Link: true})
+	}
+	// Resource control (Lot 5A): apply CPU/memory reservation/limit/shares via the
+	// live backend's <cputune>/<memtune>. CONFIG (+LIVE cgroup where libvirt allows).
+	if spec.Resources != nil {
+		if e, ok := p.ext(); ok && p.caps.Has(vp.CapResourceControl) {
+			if err := e.setResources(vmID, *spec.Resources); err != nil {
+				return nil, err
+			}
+		}
+		// Keep the model consistent (no-op for the live backend, correct for the sim).
+		rs := *spec.Resources
+		d.Resources = &rs
 	}
 	if spec.Labels != nil {
 		if d.Labels == nil {
@@ -1162,6 +1191,76 @@ func (p *Provider) ResizeDisk(ctx context.Context, vmID, diskID string, newCapac
 	return p.finishTask("resizeDisk", vmID), nil
 }
 
+// --- extension: CPU/memory resource control (ResourceController, Lot 5A) ---
+
+// SetResources applies vSphere-style CPU/memory reservation/limit/shares to a VM via
+// libvirt <cputune>/<memtune>. Requires CapResourceControl + a live backend.
+func (p *Provider) SetResources(ctx context.Context, vmID string, spec vp.ResourceSpec) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapResourceControl) {
+		return nil, vp.ErrUnsupported
+	}
+	e, ok := p.ext()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if _, ok := p.backend.getDomain(vmID); !ok {
+		return nil, vp.ErrNotFound
+	}
+	if err := e.setResources(vmID, spec); err != nil {
+		return nil, err
+	}
+	return p.finishTask("setResources", vmID), nil
+}
+
+// --- extension: per-disk QoS (DiskQoSManager, Lot 5A) ---
+
+// SetDiskQoS changes a disk's IOPS/bandwidth throttle (<iotune>) on a RUNNING or
+// shut-off VM (DomainUpdateDeviceFlags LIVE|CONFIG). Requires CapDiskQoS + a live
+// backend. A zeroed QoS clears all limits.
+func (p *Provider) SetDiskQoS(ctx context.Context, vmID, diskID string, qos vp.DiskQoS) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapDiskQoS) {
+		return nil, vp.ErrUnsupported
+	}
+	e, ok := p.ext()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if _, ok := p.backend.getDomain(vmID); !ok {
+		return nil, vp.ErrNotFound
+	}
+	if strings.TrimSpace(diskID) == "" {
+		return nil, vp.ErrInvalidSpec
+	}
+	if err := e.setDiskQoS(vmID, diskID, qos); err != nil {
+		return nil, err
+	}
+	return p.finishTask("setDiskQoS", vmID), nil
+}
+
+// --- extension: live storage migration (StorageMigrator, Lot 5A) ---
+
+// MigrateStorage moves a VM's disk to another storage pool/path with NO downtime via
+// DomainBlockCopy + pivot. Requires CapStorageMigrate + a live backend.
+func (p *Provider) MigrateStorage(ctx context.Context, vmID, diskID, targetStorageID string) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapStorageMigrate) {
+		return nil, vp.ErrUnsupported
+	}
+	e, ok := p.ext()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if _, ok := p.backend.getDomain(vmID); !ok {
+		return nil, vp.ErrNotFound
+	}
+	if strings.TrimSpace(diskID) == "" || strings.TrimSpace(targetStorageID) == "" {
+		return nil, vp.ErrInvalidSpec
+	}
+	if err := e.migrateStorage(vmID, diskID, targetStorageID); err != nil {
+		return nil, err
+	}
+	return p.finishTask("migrateStorage", vmID), nil
+}
+
 // compile-time assertion: *Provider satisfies the contract.
 var _ vp.HypervisorProvider = (*Provider)(nil)
 
@@ -1176,4 +1275,7 @@ var (
 	_ vp.SnapshotManager     = (*Provider)(nil)
 	_ vp.DiskResizer         = (*Provider)(nil)
 	_ vp.TemplateManager     = (*Provider)(nil)
+	_ vp.ResourceController  = (*Provider)(nil)
+	_ vp.DiskQoSManager      = (*Provider)(nil)
+	_ vp.StorageMigrator     = (*Provider)(nil)
 )

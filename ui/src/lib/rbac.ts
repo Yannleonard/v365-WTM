@@ -377,6 +377,55 @@ export function gateVMTemplate(
 }
 
 /**
+ * Gate applying CPU/memory resource control (Lot 5A) — cap "resource_control" +
+ * vm.resource. Also gates resource-pool create/update/delete/assign (same perm).
+ * A read-only provider disables it.
+ */
+export function gateVMResource(
+  caps: VMCapability[] | undefined,
+  permissions: string[] | undefined,
+): GateResult {
+  if (hasVMCap(caps, "readonly")) return { allowed: false, reason: "This hypervisor is read-only" };
+  if (!hasVMCap(caps, "resource_control"))
+    return { allowed: false, reason: "Provider does not support resource control" };
+  if (!can(permissions, "vm.resource"))
+    return { allowed: false, reason: "You lack the vm.resource permission" };
+  return { allowed: true, reason: "" };
+}
+
+/**
+ * Gate per-disk QoS (Lot 5A) — cap "disk_qos" + vm.disk.qos. A read-only provider
+ * disables it.
+ */
+export function gateVMDiskQoS(
+  caps: VMCapability[] | undefined,
+  permissions: string[] | undefined,
+): GateResult {
+  if (hasVMCap(caps, "readonly")) return { allowed: false, reason: "This hypervisor is read-only" };
+  if (!hasVMCap(caps, "disk_qos"))
+    return { allowed: false, reason: "Provider does not support per-disk QoS" };
+  if (!can(permissions, "vm.disk.qos"))
+    return { allowed: false, reason: "You lack the vm.disk.qos permission" };
+  return { allowed: true, reason: "" };
+}
+
+/**
+ * Gate live storage migration (Lot 5A) — cap "storage_migrate" + vm.storage.migrate.
+ * A read-only provider disables it.
+ */
+export function gateVMStorageMigrate(
+  caps: VMCapability[] | undefined,
+  permissions: string[] | undefined,
+): GateResult {
+  if (hasVMCap(caps, "readonly")) return { allowed: false, reason: "This hypervisor is read-only" };
+  if (!hasVMCap(caps, "storage_migrate"))
+    return { allowed: false, reason: "Provider does not support live storage migration" };
+  if (!can(permissions, "vm.storage.migrate"))
+    return { allowed: false, reason: "You lack the vm.storage.migrate permission" };
+  return { allowed: true, reason: "" };
+}
+
+/**
  * Gate showing guest-agent info — cap "guest_agent" + vm.read (anyone who can
  * see the VM). Read-only does NOT disable it (it is a read affordance).
  */

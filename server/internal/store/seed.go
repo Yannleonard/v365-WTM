@@ -54,6 +54,9 @@ var AllReadPermissions = []string{
 	// UniHV FinOps cost & rightsizing + Insights feed (read-only analytics).
 	"finops.read",
 	"insights.read",
+	// UniHV vSphere-style alarms (read-only: definitions, channels, active alarms).
+	// Defining/editing alarms + channels is admin-grade (via "*").
+	"alarms.read",
 	"audit.read",
 	"settings.read",
 }
@@ -131,8 +134,15 @@ var operatorExtraPermissions = []string{
 	"vm.storage.write",// create/delete volumes, upload ISOs
 	"vm.hotplug",      // live hot-attach/detach disk & NIC, mount/eject ISO (no reboot)
 	"vm.disk.resize",  // grow a VM's disk online (DomainBlockResize)
+	"vm.resource",        // Lot 5A: CPU/mem reservation/limit/shares + resource pools
+	"vm.disk.qos",        // Lot 5A: per-disk IOPS/bandwidth throttle (<iotune>)
+	"vm.storage.migrate", // Lot 5A: live storage migration (DomainBlockCopy + pivot)
 	"v2v.migrate",     // run a cross-hypervisor V2V migration
 	"replication.write", // manage cross-hypervisor DR replication policies + failover
+	// Lot 5B: scheduled VM backups — list/run/delete + backup-policy CRUD
+	// (operator-grade, like vm.snapshot/vm.export). RESTORE (vm.backup.restore)
+	// imports a NEW VM and stays admin-only (via "*"), like vm.create/vm.delete.
+	"vm.backup",
 }
 
 // Seed inserts the built-in roles, the local host row, and default settings.

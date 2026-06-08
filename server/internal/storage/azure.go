@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -83,6 +84,155 @@ func (b *azureBackend) Test(ctx context.Context) error {
 		return fmt.Errorf("azureblob: list blobs failed: %s: %s", resp.Status, azureErrCode(string(body)))
 	}
 	return nil
+}
+
+// blobURL builds the blob URL (serviceURL/container/key), escaping key segments
+// while preserving "/" separators.
+func (b *azureBackend) blobURL(key string) string {
+	parts := strings.Split(strings.TrimPrefix(key, "/"), "/")
+	for i, p := range parts {
+		parts[i] = url.PathEscape(p)
+	}
+	return fmt.Sprintf("%s/%s/%s", b.serviceURL, url.PathEscape(b.container), strings.Join(parts, "/"))
+}
+
+// PutObject uploads r as a single block blob. Azure SharedKey signs Content-Length,
+// so the body length must be known: when size<0 the stream is buffered to measure
+// it (backup callers always pass a known size from a staged temp file). The single
+// Put Blob path supports up to ~5000 MiB, sufficient for typical exported images.
+func (b *azureBackend) PutObject(ctx context.Context, key string, r io.Reader, size int64) (int64, error) {
+	var body io.Reader = r
+	if size < 0 {
+		buf, err := io.ReadAll(r)
+		if err != nil {
+			return 0, fmt.Errorf("azureblob: buffer body: %w", err)
+		}
+		body = strings.NewReader(string(buf))
+		size = int64(len(buf))
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, b.blobURL(key), body)
+	if err != nil {
+		return 0, err
+	}
+	req.ContentLength = size
+	req.Header.Set("x-ms-blob-type", "BlockBlob")
+	req.Header.Set("Content-Type", "application/octet-stream")
+	if err := b.sign(req); err != nil {
+		return 0, err
+	}
+	resp, err := b.http.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("azureblob: put blob: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return 0, fmt.Errorf("azureblob: put blob failed: %s: %s", resp.Status, azureErrCode(string(rb)))
+	}
+	return size, nil
+}
+
+// GetObject opens a blob for reading (the caller closes the reader).
+func (b *azureBackend) GetObject(ctx context.Context, key string) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.blobURL(key), nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := b.sign(req); err != nil {
+		return nil, err
+	}
+	resp, err := b.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("azureblob: get blob: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("azureblob: get blob failed: %s: %s", resp.Status, azureErrCode(string(rb)))
+	}
+	return resp.Body, nil
+}
+
+// ListObjects lists blobs under prefix (List Blobs, paginated via NextMarker).
+func (b *azureBackend) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error) {
+	var out []ObjectInfo
+	marker := ""
+	for {
+		q := url.Values{}
+		q.Set("restype", "container")
+		q.Set("comp", "list")
+		q.Set("prefix", prefix)
+		if marker != "" {
+			q.Set("marker", marker)
+		}
+		target := fmt.Sprintf("%s/%s?%s", b.serviceURL, url.PathEscape(b.container), q.Encode())
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		if err != nil {
+			return nil, err
+		}
+		if err := b.sign(req); err != nil {
+			return nil, err
+		}
+		resp, err := b.http.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("azureblob: list blobs: %w", err)
+		}
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("azureblob: list blobs failed: %s: %s", resp.Status, azureErrCode(string(rb)))
+		}
+		var lr azureListResult
+		if err := xml.Unmarshal(rb, &lr); err != nil {
+			return nil, fmt.Errorf("azureblob: parse list result: %w", err)
+		}
+		for _, bl := range lr.Blobs.Blob {
+			out = append(out, ObjectInfo{Key: bl.Name, SizeBytes: bl.Properties.ContentLength})
+		}
+		if lr.NextMarker == "" {
+			break
+		}
+		marker = lr.NextMarker
+	}
+	return out, nil
+}
+
+// DeleteObject removes a blob (a 404 is treated as success for idempotency).
+func (b *azureBackend) DeleteObject(ctx context.Context, key string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, b.blobURL(key), nil)
+	if err != nil {
+		return err
+	}
+	if err := b.sign(req); err != nil {
+		return err
+	}
+	resp, err := b.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("azureblob: delete blob: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return fmt.Errorf("azureblob: delete blob failed: %s: %s", resp.Status, azureErrCode(string(rb)))
+	}
+	return nil
+}
+
+// azureListResult models the List Blobs XML response.
+type azureListResult struct {
+	XMLName    xml.Name `xml:"EnumerationResults"`
+	NextMarker string   `xml:"NextMarker"`
+	Blobs      struct {
+		Blob []struct {
+			Name       string `xml:"Name"`
+			Properties struct {
+				ContentLength int64 `xml:"Content-Length"`
+			} `xml:"Properties"`
+		} `xml:"Blob"`
+	} `xml:"Blobs"`
 }
 
 // sign adds the x-ms-date / x-ms-version headers and the SharedKey Authorization

@@ -100,7 +100,9 @@ func (s *Server) Router() http.Handler {
 			s.mountReplicationRoutes(pr)
 			s.mountHypervisorConnRoutes(pr)
 			s.mountStorageBackendRoutes(pr)
+			s.mountVMBackupRoutes(pr)
 			s.mountLot4BRoutes(pr)
+			s.mountAlarmRoutes(pr)
 
 			// Bulk operations (multi-select fan-out). Each target is re-gated inside
 			// the handler by the SAME permission the single action needs, so the route

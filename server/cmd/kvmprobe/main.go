@@ -29,7 +29,11 @@ func main() {
 		socket = os.Args[1]
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	// Generous overall budget: the probe now exercises many features end to end
+	// (lifecycle, hot-plug, TPM/secure-boot, cloud-init, sysprep, resource control,
+	// disk QoS, live storage migration), several of which start real domains and
+	// shell out to virsh — a tight 60s budget starves the later proofs.
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 
 	p, err := kvm.NewLive(socket)
@@ -263,6 +267,12 @@ func main() {
 	proveCPUTopology(ctx, p)
 	proveTemplates(ctx, p)
 	proveSysprep(ctx, p)
+
+	// --- LOT 5A proofs: resource control (cputune/memtune), per-disk QoS (iotune) +
+	// TRIM/discard, and LIVE storage migration (DomainBlockCopy + pivot). ---
+	proveResourceControl(ctx, p)
+	proveDiskQoSAndTrim(ctx, p)
+	proveStorageMigration(ctx, p)
 
 	fmt.Println("\nPROBE OK: real libvirt RPC API exercised end to end.")
 }
@@ -1577,4 +1587,240 @@ func volPath(ctx context.Context, sp vprovider.StorageProvider, pool, volName st
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "kvmprobe: "+format+"\n", args...)
 	os.Exit(1)
+}
+
+// proveResourceControl: LOT 5A #1. Create a domain, apply a ResourceSpec (CPU shares
+// + MHz limit, memory hard_limit + min_guarantee) via SetResources, then CONFIRM via
+// the live domain XML that <cputune><shares>/<quota> and <memtune><hard_limit>/
+// <min_guarantee> are present.
+func proveResourceControl(ctx context.Context, p *kvm.Provider) {
+	fmt.Println("== LOT 5A #1 proof: CPU/memory resource control (<cputune>/<memtune> in the live domain XML) ==")
+	rc, ok := any(p).(vprovider.ResourceController)
+	if !ok || !p.Capabilities().Has(vprovider.CapResourceControl) {
+		fmt.Println("  provider does not implement ResourceController / lacks CapResourceControl; skipping")
+		fmt.Println()
+		return
+	}
+	name := fmt.Sprintf("unihv-res-%d", time.Now().UnixNano())
+	task, err := p.CreateVM(ctx, vprovider.VMSpec{Name: name, VCPUs: 2, MemoryMB: 1024, Firmware: vprovider.FirmwareBIOS})
+	if err != nil {
+		fatalf("rescontrol: CreateVM: %v", err)
+	}
+	id := task.EntityID
+	defer func() { _, _ = p.DeleteVM(ctx, id, vprovider.DeleteOptions{Force: true}) }()
+	fmt.Printf("  created %s id=%s\n", name, id)
+
+	spec := vprovider.ResourceSpec{
+		CPUShares: 2048, CPULimitMHz: 1000,
+		MemoryLimitMB: 1024, MemoryReservationMB: 512,
+	}
+	if _, err := rc.SetResources(ctx, id, spec); err != nil {
+		fatalf("rescontrol: SetResources: %v", err)
+	}
+	xml := dumpXML(ctx, name)
+	hasShares := strings.Contains(xml, "<shares>2048</shares>")
+	hasQuota := strings.Contains(xml, "<quota>") && strings.Contains(xml, "<period>")
+	hasHard := strings.Contains(xml, "<hard_limit") && strings.Contains(xml, "1048576")
+	hasMin := strings.Contains(xml, "<min_guarantee")
+	fmt.Printf("  live XML: <cputune><shares>=%v <quota>/<period>=%v  <memtune><hard_limit>=%v <min_guarantee>=%v\n",
+		hasShares, hasQuota, hasHard, hasMin)
+	for _, line := range strings.Split(xml, "\n") {
+		l := strings.TrimSpace(line)
+		if strings.Contains(l, "cputune") || strings.Contains(l, "memtune") ||
+			strings.Contains(l, "<shares>") || strings.Contains(l, "<quota>") || strings.Contains(l, "<period>") ||
+			strings.Contains(l, "hard_limit") || strings.Contains(l, "min_guarantee") || strings.Contains(l, "soft_limit") {
+			fmt.Printf("    | %s\n", l)
+		}
+	}
+	if !hasShares || !hasHard {
+		fatalf("rescontrol: cputune/memtune NOT present in live XML — feature NOT proven")
+	}
+	// Confirm GetVM surfaces the applied values via Labels (frozen VM struct).
+	if v, gerr := p.GetVM(ctx, id); gerr == nil {
+		fmt.Printf("  GetVM Labels: cpu.shares=%s cpu.limitMhz=%s mem.limitMb=%s mem.reservationMb=%s\n",
+			v.Labels["unihv.res.cpu.shares"], v.Labels["unihv.res.cpu.limitMhz"],
+			v.Labels["unihv.res.mem.limitMb"], v.Labels["unihv.res.mem.reservationMb"])
+	}
+	fmt.Println("  CONFIRMED: <cputune>/<memtune> resource allocation applied to the live libvirt domain.")
+	fmt.Println()
+}
+
+// proveDiskQoSAndTrim: LOT 5A #2. Create a disked domain with discard='unmap' (TRIM)
+// + an <iotune>, START it, confirm both in the live XML, then CHANGE the QoS on the
+// running disk via SetDiskQoS and confirm the new <iotune> values.
+func proveDiskQoSAndTrim(ctx context.Context, p *kvm.Provider) {
+	fmt.Println("== LOT 5A #2 proof: per-disk QoS (<iotune>) + TRIM (discard='unmap') live on a running disk ==")
+	qm, ok := any(p).(vprovider.DiskQoSManager)
+	if !ok || !p.Capabilities().Has(vprovider.CapDiskQoS) {
+		fmt.Println("  provider does not implement DiskQoSManager / lacks CapDiskQoS; skipping")
+		fmt.Println()
+		return
+	}
+	sp, _ := any(p).(vprovider.StorageProvider)
+	pool := firstActivePool(ctx, p)
+	if sp == nil || pool == "" {
+		fmt.Println("  no StorageProvider/active pool; skipping")
+		fmt.Println()
+		return
+	}
+	volName := fmt.Sprintf("unihv-qos-%d.qcow2", time.Now().UnixNano())
+	if _, err := sp.CreateVolume(ctx, vprovider.VolumeSpec{Name: volName, StorageID: pool, CapacityGB: 1, Format: vprovider.DiskQcow2}); err != nil {
+		fatalf("diskqos: CreateVolume: %v", err)
+	}
+	diskPath := volPath(ctx, sp, pool, volName)
+	name := fmt.Sprintf("unihv-qos-dom-%d", time.Now().UnixNano())
+	task, err := p.CreateVM(ctx, vprovider.VMSpec{
+		Name: name, VCPUs: 1, MemoryMB: 256, Firmware: vprovider.FirmwareUEFI,
+		Disks: []vprovider.DiskSpec{{
+			StorageID: pool, SourcePath: diskPath, Format: vprovider.DiskQcow2, CapacityGB: 1,
+			Discard:  true,
+			QoS:      &vprovider.DiskQoS{TotalIOPS: 200, ReadBytesSec: 10 << 20},
+		}},
+	})
+	if err != nil {
+		fatalf("diskqos: CreateVM: %v", err)
+	}
+	id := task.EntityID
+	defer func() {
+		_, _ = p.DeleteVM(ctx, id, vprovider.DeleteOptions{Force: true})
+		_, _ = sp.DeleteVolume(ctx, pool, volName)
+	}()
+	running := false
+	if _, e := p.PowerOp(ctx, id, vprovider.PowerStart); e == nil {
+		running = true
+	}
+	fmt.Printf("  created+%s disked domain %s id=%s (TRIM on, iotune total_iops=200)\n",
+		map[bool]string{true: "started", false: "defined"}[running], name, id)
+
+	xml := dumpXML(ctx, name)
+	hasDiscard := strings.Contains(xml, "discard='unmap'")
+	hasIotune := strings.Contains(xml, "<iotune>") && strings.Contains(xml, "<total_iops_sec>200</total_iops_sec>")
+	fmt.Printf("  live XML: discard='unmap'=%v  <iotune> total_iops_sec=200=%v\n", hasDiscard, hasIotune)
+	for _, line := range strings.Split(xml, "\n") {
+		l := strings.TrimSpace(line)
+		if strings.Contains(l, "iotune") || strings.Contains(l, "iops") || strings.Contains(l, "bytes_sec") || strings.Contains(l, "discard=") {
+			fmt.Printf("    | %s\n", l)
+		}
+	}
+	if !hasDiscard || !hasIotune {
+		fatalf("diskqos: discard/iotune NOT present in live XML — feature NOT proven")
+	}
+
+	// Now CHANGE the QoS on the (running) disk to new values via SetDiskQoS.
+	d, _ := p.GetVM(ctx, id)
+	var diskID string
+	for _, dk := range d.Disks {
+		diskID = dk.ID
+		break
+	}
+	if diskID == "" {
+		fatalf("diskqos: no disk id resolved")
+	}
+	if _, err := qm.SetDiskQoS(ctx, id, diskID, vprovider.DiskQoS{TotalIOPS: 750, WriteBytesSec: 5 << 20}); err != nil {
+		fatalf("diskqos: SetDiskQoS: %v", err)
+	}
+	xml2 := dumpXML(ctx, name)
+	if !strings.Contains(xml2, "<total_iops_sec>750</total_iops_sec>") {
+		fatalf("diskqos: SetDiskQoS did NOT update <iotune> (want total_iops_sec=750)")
+	}
+	fmt.Println("  SetDiskQoS(total_iops=750) -> live <iotune> updated to 750 (no reboot).")
+	fmt.Println("  CONFIRMED: per-disk <iotune> QoS + discard='unmap' TRIM applied and retuned live.")
+	fmt.Println()
+}
+
+// proveStorageMigration: LOT 5A #3. Create + START a disked domain, then LIVE-migrate
+// its disk to a NEW file path (DomainBlockCopy + pivot) while the VM keeps running.
+// Confirm the running domain's disk <source> now points at the new path. Cleans up
+// both the new and old backing files.
+func proveStorageMigration(ctx context.Context, p *kvm.Provider) {
+	fmt.Println("== LOT 5A #3 proof: LIVE storage migration (DomainBlockCopy mirrors + pivots a running disk) ==")
+	sm, ok := any(p).(vprovider.StorageMigrator)
+	if !ok || !p.Capabilities().Has(vprovider.CapStorageMigrate) {
+		fmt.Println("  provider does not implement StorageMigrator / lacks CapStorageMigrate; skipping")
+		fmt.Println()
+		return
+	}
+	sp, _ := any(p).(vprovider.StorageProvider)
+	pool := firstActivePool(ctx, p)
+	if sp == nil || pool == "" {
+		fmt.Println("  no StorageProvider/active pool; skipping")
+		fmt.Println()
+		return
+	}
+	volName := fmt.Sprintf("unihv-stmig-src-%d.qcow2", time.Now().UnixNano())
+	if _, err := sp.CreateVolume(ctx, vprovider.VolumeSpec{Name: volName, StorageID: pool, CapacityGB: 1, Format: vprovider.DiskQcow2}); err != nil {
+		fatalf("stmig: CreateVolume(src): %v", err)
+	}
+	srcPath := volPath(ctx, sp, pool, volName)
+	name := fmt.Sprintf("unihv-stmig-dom-%d", time.Now().UnixNano())
+	task, err := p.CreateVM(ctx, vprovider.VMSpec{
+		Name: name, VCPUs: 1, MemoryMB: 256, Firmware: vprovider.FirmwareUEFI,
+		Disks: []vprovider.DiskSpec{{StorageID: pool, SourcePath: srcPath, Format: vprovider.DiskQcow2, CapacityGB: 1}},
+	})
+	if err != nil {
+		fatalf("stmig: CreateVM: %v", err)
+	}
+	id := task.EntityID
+	// The migration provisions a NEW volume in the pool; capture & delete it after.
+	migVolBefore := volumeNames(ctx, sp, pool)
+	defer func() {
+		_, _ = p.DeleteVM(ctx, id, vprovider.DeleteOptions{Force: true})
+		_, _ = sp.DeleteVolume(ctx, pool, volName)
+		// delete any *-migr-* leftover the migration created.
+		for _, vn := range volumeNames(ctx, sp, pool) {
+			if strings.Contains(vn, "-migr-") {
+				_, _ = sp.DeleteVolume(ctx, pool, vn)
+			}
+		}
+	}()
+	_ = migVolBefore
+	if _, err := p.PowerOp(ctx, id, vprovider.PowerStart); err != nil {
+		fmt.Printf("  (could not start domain: %v) — storage migration requires a RUNNING domain; skipping\n", err)
+		fmt.Println()
+		return
+	}
+	fmt.Printf("  created+started domain %s id=%s (disk src=%s)\n", name, id, srcPath)
+
+	// Resolve the disk id from GetVM, then migrate it onto the SAME pool (a new volume).
+	d, _ := p.GetVM(ctx, id)
+	var diskID, beforePath string
+	for _, dk := range d.Disks {
+		diskID, beforePath = dk.ID, dk.Path
+		break
+	}
+	if diskID == "" {
+		fatalf("stmig: no disk id resolved")
+	}
+	fmt.Printf("  migrating disk %s (was %s) -> pool %q via DomainBlockCopy+pivot ...\n", diskID, beforePath, pool)
+	if _, err := sm.MigrateStorage(ctx, id, diskID, pool); err != nil {
+		fatalf("stmig: MigrateStorage: %v", err)
+	}
+	// Confirm the running domain now uses a DIFFERENT backing file.
+	after, _ := p.GetVM(ctx, id)
+	var afterPath string
+	for _, dk := range after.Disks {
+		afterPath = dk.Path
+		break
+	}
+	stillRunning := after.State == vprovider.StateRunning
+	fmt.Printf("  after pivot: disk <source>=%s  domain still running=%v\n", afterPath, stillRunning)
+	if afterPath == "" || afterPath == beforePath {
+		fatalf("stmig: disk source did NOT change after migration (still %s) — pivot NOT proven", beforePath)
+	}
+	if !strings.Contains(afterPath, "-migr-") {
+		fmt.Printf("  NOTE: new path %s does not carry the -migr- token; confirming it differs from the source is sufficient.\n", afterPath)
+	}
+	fmt.Println("  CONFIRMED: running VM's disk live-migrated to a new file and pivoted (no downtime).")
+	fmt.Println()
+}
+
+// volumeNames lists the volume names in a pool (best-effort).
+func volumeNames(ctx context.Context, sp vprovider.StorageProvider, pool string) []string {
+	var out []string
+	if vols, err := sp.ListVolumes(ctx, pool); err == nil {
+		for _, v := range vols {
+			out = append(out, v.Name)
+		}
+	}
+	return out
 }

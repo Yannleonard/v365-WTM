@@ -10,7 +10,7 @@
 // Settings" hardware editor (vCPU / memory / disks / NICs / boot / firmware)
 // modeled on vCenter. Destructive delete keeps the small ConfirmDestructiveDialog.
 
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { toast, toastError } from "../lib/toast";
@@ -18,7 +18,7 @@ import { Drawer } from "../components/Drawer";
 import { ActionButton } from "../components/ActionButton";
 import { ConfirmDestructiveDialog } from "../components/ConfirmDestructiveDialog";
 import { TextField, SelectField } from "../components/Field";
-import { useVMStorage, useVMVolumes, useVMNetworks } from "../lib/hooks";
+import { useVMStorage, useVMVolumes, useVMNetworks, useStorageBackends } from "../lib/hooks";
 import { formatBytes } from "../lib/format";
 import {
   IconEdit,
@@ -37,6 +37,7 @@ import {
   IconCheck,
   IconScale,
   IconStacks,
+  IconDownload,
 } from "../components/icons";
 import type { VM, VMDisk, VMNic, VMPowerOp, VMSnapshot } from "../lib/types";
 
@@ -93,6 +94,44 @@ interface DeleteSnapForm {
   vm: VM;
   snap: VMSnapshot;
 }
+interface BackupForm {
+  vm: VM;
+  backendId: string;
+}
+
+// Lot 5A: resource-control + per-disk-QoS form shapes (string-backed inputs).
+interface ResForm {
+  cpuShares: string;
+  cpuReservationMhz: string;
+  cpuLimitMhz: string;
+  memShares: string;
+  memReservationMb: string;
+  memLimitMb: string;
+}
+interface QoSForm {
+  totalIops: string;
+  readIops: string;
+  writeIops: string;
+  totalMbps: string;
+  readMbps: string;
+  writeMbps: string;
+}
+
+// numOrUndef parses a positive number from a string field, else undefined ("unset").
+function numOrUndef(s: string): number | undefined {
+  const n = Number(s);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+// mbToBytes converts a MB/s string to bytes/sec (or undefined when unset).
+function mbToBytes(s: string): number | undefined {
+  const n = Number(s);
+  return Number.isFinite(n) && n > 0 ? Math.round(n * 1024 * 1024) : undefined;
+}
+// bytesToMb converts a bytes/sec label string to a MB/s input string ("" when unset).
+function bytesToMb(s: string | undefined): string {
+  const n = Number(s);
+  return Number.isFinite(n) && n > 0 ? String(Math.round(n / (1024 * 1024))) : "";
+}
 
 export function useVMActions() {
   const queryClient = useQueryClient();
@@ -122,6 +161,10 @@ export function useVMActions() {
   const [resize, setResize] = useState<ResizeDiskForm | null>(null);
   const [resizeBusy, setResizeBusy] = useState(false);
   const [delSnap, setDelSnap] = useState<DeleteSnapForm | null>(null);
+
+  // backup (Lot 5B): snapshot+export to a storage backend
+  const [backup, setBackup] = useState<BackupForm | null>(null);
+  const [backupBusy, setBackupBusy] = useState(false);
 
   const invalidate = (vm: VM) => {
     queryClient.invalidateQueries({ queryKey: ["vms", vm.providerId] });
@@ -174,6 +217,9 @@ export function useVMActions() {
   const triggerResizeDisk = (vm: VM, disk: VMDisk) =>
     setResize({ vm, disk, capacityGb: String(Math.max(1, Math.round(disk.capacityGb)) + 1) });
   const triggerDeleteSnapshot = (vm: VM, snap: VMSnapshot) => setDelSnap({ vm, snap });
+  // Back up now (Lot 5B): opens the backend picker; the server snapshots, exports
+  // the disk(s) to qcow2 and uploads to the chosen storage backend.
+  const triggerBackup = (vm: VM) => setBackup({ vm, backendId: "" });
 
   /* ---- templates (Lot 4A): mark / unmark a VM as a golden image (direct) ---- */
   const isTemplateVM = (vm: VM) => vm.labels?.["unihv.template"] === "true";
@@ -366,6 +412,21 @@ export function useVMActions() {
     } catch (err) {
       toastError("Delete snapshot failed", err);
       throw err;
+    }
+  };
+
+  const confirmBackup = async () => {
+    if (!backup || !backup.backendId) return;
+    setBackupBusy(true);
+    try {
+      await api.vmBackupRun({ providerId: backup.vm.providerId, vmId: backup.vm.id, backendId: backup.backendId });
+      toast.success("Backup complete", backup.vm.name);
+      queryClient.invalidateQueries({ queryKey: ["vm-backups"] });
+      setBackup(null);
+    } catch (err) {
+      toastError("Backup failed", err);
+    } finally {
+      setBackupBusy(false);
     }
   };
 
@@ -839,6 +900,45 @@ export function useVMActions() {
         onClose={() => setDelSnap(null)}
       />
 
+      {/* Back up now (Lot 5B): snapshot -> export -> store to a backend */}
+      <Drawer
+        open={backup !== null}
+        title="Back up now"
+        subtitle={backup ? `${backup.vm.name} · snapshot + export` : undefined}
+        icon={<IconDownload size={18} />}
+        busy={backupBusy}
+        onClose={() => setBackup(null)}
+        footer={
+          <>
+            <button className="btn" onClick={() => setBackup(null)} disabled={backupBusy}>
+              Cancel
+            </button>
+            <ActionButton
+              variant="primary"
+              loading={backupBusy}
+              disabled={!backup?.backendId}
+              onClick={confirmBackup}
+            >
+              <IconDownload size={14} />
+              Back up
+            </ActionButton>
+          </>
+        }
+      >
+        {backup ? (
+          <div className="drawer-section">
+            <div className="drawer-banner info">
+              <IconHelp size={15} />
+              <span>
+                Take a consistency snapshot, export the disk(s) to qcow2 and upload the artifact to the
+                chosen storage backend. The snapshot is dropped afterwards.
+              </span>
+            </div>
+            <BackendSelect value={backup.backendId} onChange={(v) => setBackup({ ...backup, backendId: v })} />
+          </div>
+        ) : null}
+      </Drawer>
+
       {/* Delete */}
       <ConfirmDestructiveDialog
         open={del !== null}
@@ -882,8 +982,26 @@ export function useVMActions() {
     // disk resize + delete-snapshot (Lot 3)
     triggerResizeDisk,
     triggerDeleteSnapshot,
+    // backup (Lot 5B)
+    triggerBackup,
     dialogs,
   };
+}
+
+// BackendSelect lists registered storage backends usable as backup targets.
+function BackendSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const q = useStorageBackends();
+  const backends = q.data ?? [];
+  return (
+    <SelectField label="Storage backend" value={value} onChange={(e) => onChange(e.target.value)}>
+      <option value="">Select a backend…</option>
+      {backends.map((b) => (
+        <option key={b.id} value={b.id}>
+          {b.name} ({b.type})
+        </option>
+      ))}
+    </SelectField>
+  );
 }
 
 /* ===================== Rich Reconfigure ("Edit Settings") ===================== */
@@ -971,6 +1089,81 @@ function ReconfigureBody({
   const [diskBusy, setDiskBusy] = useState(false);
   const [newNic, setNewNic] = useState<{ networkId: string; model: string } | null>(null);
   const [nicBusy, setNicBusy] = useState(false);
+
+  // Lot 5A: CPU/memory resource control. Initialized from the VM's surfaced
+  // unihv.res.* labels (the backend reports the applied <cputune>/<memtune> there).
+  const lbl = vm.labels ?? {};
+  const [res, setRes] = useState<ResForm>({
+    cpuShares: lbl["unihv.res.cpu.shares"] ?? "",
+    cpuReservationMhz: lbl["unihv.res.cpu.reservationMhz"] ?? "",
+    cpuLimitMhz: lbl["unihv.res.cpu.limitMhz"] ?? "",
+    memShares: lbl["unihv.res.mem.shares"] ?? "",
+    memReservationMb: lbl["unihv.res.mem.reservationMb"] ?? "",
+    memLimitMb: lbl["unihv.res.mem.limitMb"] ?? "",
+  });
+  const [resBusy, setResBusy] = useState(false);
+  const applyResources = async () => {
+    setResBusy(true);
+    try {
+      await api.vmSetResources(vm.providerId, vm.id, {
+        cpuShares: numOrUndef(res.cpuShares),
+        cpuReservationMhz: numOrUndef(res.cpuReservationMhz),
+        cpuLimitMhz: numOrUndef(res.cpuLimitMhz),
+        memoryShares: numOrUndef(res.memShares),
+        memoryReservationMb: numOrUndef(res.memReservationMb),
+        memoryLimitMb: numOrUndef(res.memLimitMb),
+      });
+      toast.success("Resource allocation applied", vm.name);
+      invalidate(vm);
+    } catch (err) {
+      toastError("Resource control failed", err);
+    } finally {
+      setResBusy(false);
+    }
+  };
+
+  // Lot 5A: per-disk QoS editor + live storage migration (one open row at a time).
+  const [qosFor, setQosFor] = useState<{ diskId: string; v: QoSForm } | null>(null);
+  const [qosBusy, setQosBusy] = useState(false);
+  const applyQoS = async () => {
+    if (!qosFor) return;
+    setQosBusy(true);
+    try {
+      await api.vmDiskQoS(vm.providerId, vm.id, qosFor.diskId, {
+        totalIops: numOrUndef(qosFor.v.totalIops),
+        readIops: numOrUndef(qosFor.v.readIops),
+        writeIops: numOrUndef(qosFor.v.writeIops),
+        totalBytesSec: mbToBytes(qosFor.v.totalMbps),
+        readBytesSec: mbToBytes(qosFor.v.readMbps),
+        writeBytesSec: mbToBytes(qosFor.v.writeMbps),
+      });
+      toast.success("Disk QoS applied", qosFor.diskId);
+      invalidate(vm);
+      setQosFor(null);
+    } catch (err) {
+      toastError("Disk QoS failed", err);
+    } finally {
+      setQosBusy(false);
+    }
+  };
+  const [migrateFor, setMigrateFor] = useState<{ diskId: string; target: string } | null>(null);
+  const [stMigBusy, setStMigBusy] = useState(false);
+  const applyStorageMigrate = async () => {
+    if (!migrateFor || !migrateFor.target.trim()) return;
+    setStMigBusy(true);
+    try {
+      await api.vmStorageMigrate(vm.providerId, vm.id, migrateFor.diskId, {
+        targetStorageId: migrateFor.target.trim(),
+      });
+      toast.success("Live storage migration started", migrateFor.diskId);
+      invalidate(vm);
+      setMigrateFor(null);
+    } catch (err) {
+      toastError("Storage migration failed", err);
+    } finally {
+      setStMigBusy(false);
+    }
+  };
 
   const cpuChanged = Number(form.vcpus) !== vm.vcpus && Number(form.vcpus) > 0;
   const memChanged = memoryMb > 0 && memoryMb !== vm.memoryMb;
@@ -1103,6 +1296,77 @@ function ReconfigureBody({
         </dl>
       </div>
 
+      {/* Resources — CPU/memory reservation, limit & shares (Lot 5A). Applies
+          independently of vCPU/memory via its own button (<cputune>/<memtune>). */}
+      <div className="drawer-section">
+        <div className="drawer-section-head">
+          <span className="drawer-section-title">
+            <IconScale size={15} /> Resource allocation
+          </span>
+          <ActionButton size="sm" variant="ghost" loading={resBusy} onClick={applyResources}>
+            <IconCheck size={13} /> Apply resources
+          </ActionButton>
+        </div>
+        <div className="drawer-banner info" style={{ marginBottom: "var(--sp-3)" }}>
+          <IconHelp size={15} />
+          <span>
+            Reservation, limit and shares control how this VM competes for host CPU &amp; memory
+            (<span className="mono">cputune</span>/<span className="mono">memtune</span>). Leave a field blank for the
+            hypervisor default. Limit is a hard cap; reservation is a guarantee; shares is a relative weight.
+          </span>
+        </div>
+        <div className="field-grid">
+          <TextField
+            label="CPU shares"
+            type="number"
+            min={0}
+            value={res.cpuShares}
+            placeholder="default"
+            onChange={(e) => setRes({ ...res, cpuShares: e.target.value })}
+          />
+          <TextField
+            label="CPU reservation (MHz)"
+            type="number"
+            min={0}
+            value={res.cpuReservationMhz}
+            placeholder="0 = none"
+            onChange={(e) => setRes({ ...res, cpuReservationMhz: e.target.value })}
+          />
+          <TextField
+            label="CPU limit (MHz)"
+            type="number"
+            min={0}
+            value={res.cpuLimitMhz}
+            placeholder="0 = unlimited"
+            onChange={(e) => setRes({ ...res, cpuLimitMhz: e.target.value })}
+          />
+          <TextField
+            label="Memory shares"
+            type="number"
+            min={0}
+            value={res.memShares}
+            placeholder="default"
+            onChange={(e) => setRes({ ...res, memShares: e.target.value })}
+          />
+          <TextField
+            label="Memory reservation (MB)"
+            type="number"
+            min={0}
+            value={res.memReservationMb}
+            placeholder="0 = none"
+            onChange={(e) => setRes({ ...res, memReservationMb: e.target.value })}
+          />
+          <TextField
+            label="Memory limit (MB)"
+            type="number"
+            min={0}
+            value={res.memLimitMb}
+            placeholder="0 = unlimited"
+            onChange={(e) => setRes({ ...res, memLimitMb: e.target.value })}
+          />
+        </div>
+      </div>
+
       {/* Disks */}
       <div className="drawer-section">
         <div className="drawer-section-head">
@@ -1124,8 +1388,12 @@ function ReconfigureBody({
           <span className="muted text-sm">No disks attached.</span>
         ) : null}
 
-        {disks.map((d: VMDisk) => (
-          <div key={d.id} className="device-row">
+        {disks.map((d: VMDisk) => {
+          const qp = "unihv.qos." + (d.label || "") + ".";
+          const qosActive = Object.keys(lbl).some((k) => k.startsWith(qp));
+          return (
+          <Fragment key={d.id}>
+          <div className="device-row">
             <span className="device-icon">
               <IconDisk size={16} />
             </span>
@@ -1135,8 +1403,49 @@ function ReconfigureBody({
                 <span>{formatBytes(d.capacityGb * 1024 ** 3, 0)}</span>
                 {d.format ? <span className="chip">{d.format}</span> : null}
                 {d.storageId ? <span className="mono">{d.storageId}</span> : null}
+                {qosActive ? <span className="chip">QoS</span> : null}
               </span>
             </div>
+            {/* Lot 5A: per-disk QoS (iotune) */}
+            <ActionButton
+              size="sm"
+              variant="ghost"
+              iconOnly
+              tooltip="Edit disk QoS (IOPS / bandwidth)"
+              aria-label="Edit disk QoS"
+              onClick={() =>
+                setQosFor(
+                  qosFor?.diskId === d.id
+                    ? null
+                    : {
+                        diskId: d.id,
+                        v: {
+                          totalIops: lbl[qp + "totalIops"] ?? "",
+                          readIops: lbl[qp + "readIops"] ?? "",
+                          writeIops: lbl[qp + "writeIops"] ?? "",
+                          totalMbps: bytesToMb(lbl[qp + "totalBps"]),
+                          readMbps: bytesToMb(lbl[qp + "readBps"]),
+                          writeMbps: bytesToMb(lbl[qp + "writeBps"]),
+                        },
+                      },
+                )
+              }
+            >
+              <IconScale size={14} />
+            </ActionButton>
+            {/* Lot 5A: live storage migration */}
+            <ActionButton
+              size="sm"
+              variant="ghost"
+              iconOnly
+              tooltip="Migrate disk to another storage (live)"
+              aria-label="Migrate storage"
+              onClick={() =>
+                setMigrateFor(migrateFor?.diskId === d.id ? null : { diskId: d.id, target: "" })
+              }
+            >
+              <IconMigrate size={14} />
+            </ActionButton>
             <ActionButton
               size="sm"
               variant="ghost"
@@ -1150,7 +1459,104 @@ function ReconfigureBody({
               <IconTrash size={14} />
             </ActionButton>
           </div>
-        ))}
+
+          {/* QoS editor (inline, one at a time) */}
+          {qosFor?.diskId === d.id ? (
+            <div className="device-add">
+              <div className="field-grid">
+                <TextField
+                  label="Total IOPS"
+                  type="number"
+                  min={0}
+                  value={qosFor.v.totalIops}
+                  placeholder="0 = unlimited"
+                  onChange={(e) => setQosFor({ ...qosFor, v: { ...qosFor.v, totalIops: e.target.value } })}
+                />
+                <TextField
+                  label="Total bandwidth (MB/s)"
+                  type="number"
+                  min={0}
+                  value={qosFor.v.totalMbps}
+                  placeholder="0 = unlimited"
+                  onChange={(e) => setQosFor({ ...qosFor, v: { ...qosFor.v, totalMbps: e.target.value } })}
+                />
+                <TextField
+                  label="Read IOPS"
+                  type="number"
+                  min={0}
+                  value={qosFor.v.readIops}
+                  onChange={(e) => setQosFor({ ...qosFor, v: { ...qosFor.v, readIops: e.target.value } })}
+                />
+                <TextField
+                  label="Write IOPS"
+                  type="number"
+                  min={0}
+                  value={qosFor.v.writeIops}
+                  onChange={(e) => setQosFor({ ...qosFor, v: { ...qosFor.v, writeIops: e.target.value } })}
+                />
+                <TextField
+                  label="Read bandwidth (MB/s)"
+                  type="number"
+                  min={0}
+                  value={qosFor.v.readMbps}
+                  onChange={(e) => setQosFor({ ...qosFor, v: { ...qosFor.v, readMbps: e.target.value } })}
+                />
+                <TextField
+                  label="Write bandwidth (MB/s)"
+                  type="number"
+                  min={0}
+                  value={qosFor.v.writeMbps}
+                  onChange={(e) => setQosFor({ ...qosFor, v: { ...qosFor.v, writeMbps: e.target.value } })}
+                />
+              </div>
+              <span className="field-hint">Total* limits override the read/write pair. Blank or 0 clears a limit. Applies live, no reboot.</span>
+              <div className="row" style={{ justifyContent: "flex-end", gap: "var(--sp-2)" }}>
+                <button className="btn btn-sm" onClick={() => setQosFor(null)} disabled={qosBusy}>
+                  Cancel
+                </button>
+                <ActionButton size="sm" variant="primary" loading={qosBusy} onClick={applyQoS}>
+                  Apply QoS
+                </ActionButton>
+              </div>
+            </div>
+          ) : null}
+
+          {/* Live storage migration (inline) */}
+          {migrateFor?.diskId === d.id ? (
+            <div className="device-add">
+              <div className="drawer-banner info" style={{ marginBottom: "var(--sp-2)" }}>
+                <IconHelp size={15} />
+                <span>
+                  Live-migrate this disk to another storage pool with no downtime (DomainBlockCopy + pivot).
+                  The VM must be running.
+                </span>
+              </div>
+              <StoragePoolSelect
+                pid={vm.providerId}
+                value={migrateFor.target}
+                onChange={(v) => setMigrateFor({ ...migrateFor, target: v })}
+                label="Target storage pool"
+                allowEmpty
+              />
+              <div className="row" style={{ justifyContent: "flex-end", gap: "var(--sp-2)" }}>
+                <button className="btn btn-sm" onClick={() => setMigrateFor(null)} disabled={stMigBusy}>
+                  Cancel
+                </button>
+                <ActionButton
+                  size="sm"
+                  variant="primary"
+                  loading={stMigBusy}
+                  disabled={!migrateFor.target.trim()}
+                  onClick={applyStorageMigrate}
+                >
+                  Migrate disk
+                </ActionButton>
+              </div>
+            </div>
+          ) : null}
+          </Fragment>
+          );
+        })}
 
         {newDisk ? (
           <div className="device-add">

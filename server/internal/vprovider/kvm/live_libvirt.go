@@ -90,7 +90,7 @@ func NewLiveWithID(id, endpoint string) (*Provider, error) {
 // (NetworkDefineXML/Create/Destroy/Undefine), storage/ISO write (StorageVol*) and
 // hot-plug device management (DomainAttach/Detach/UpdateDeviceFlags, LIVE|CONFIG).
 const LiveCaps = FullCaps | vp.CapConsole | vp.CapNetworkWrite | vp.CapStorageWrite | vp.CapHotPlug |
-	vp.CapGuestAgent | vp.CapDiskResize
+	vp.CapGuestAgent | vp.CapDiskResize | vp.CapResourceControl | vp.CapDiskQoS | vp.CapStorageMigrate
 
 // newLiveBackend dials libvirt and runs the RPC handshake (the official
 // New(conn)+Connect() sequence).
@@ -485,7 +485,9 @@ func (b *liveBackend) defineDomain(d *libvirtDomain) error {
 			format = "qcow2"
 		}
 		volName := fmt.Sprintf("%s-%s.%s", sanitizeBridge(d.Name), dk.Target, format)
-		path, err := b.provisionVolume(poolName, volName, dk.CapBytes, format)
+		// thick -> full preallocation; thin (default) -> sparse.
+		thick := strings.EqualFold(dk.Provisioning, "thick")
+		path, err := b.provisionVolumeProv(poolName, volName, dk.CapBytes, format, thick)
 		if err != nil {
 			return err
 		}
@@ -1593,6 +1595,13 @@ func (c *cleanupReadCloser) Close() error {
 // size-only disks. If a volume of that name already exists, its existing path is
 // returned (idempotent).
 func (b *liveBackend) provisionVolume(poolName, volName string, capBytes int64, format string) (string, error) {
+	return b.provisionVolumeProv(poolName, volName, capBytes, format, false)
+}
+
+// provisionVolumeProv is provisionVolume with an explicit thick/thin choice: thick
+// emits <allocation>==<capacity> + <preallocation> so qemu-img fully preallocates
+// the image (vs the default sparse/thin allocation==0). Lot 5A.
+func (b *liveBackend) provisionVolumeProv(poolName, volName string, capBytes int64, format string, thick bool) (string, error) {
 	pool, err := b.poolHandle(poolName)
 	if err != nil {
 		return "", err
@@ -1612,7 +1621,7 @@ func (b *liveBackend) provisionVolume(poolName, volName string, capBytes int64, 
 			return p, nil
 		}
 	}
-	xmlDesc := renderVolumeXML(volName, format, uint64(capBytes))
+	xmlDesc := renderVolumeXMLProv(volName, format, uint64(capBytes), thick)
 	vol, err := l.StorageVolCreateXML(pool, xmlDesc, 0)
 	if err != nil {
 		b.fail(err)
@@ -1753,7 +1762,8 @@ func (b *liveBackend) attachDisk(uuid string, spec vp.DiskSpec) error {
 			poolName = "default"
 		}
 		volName := fmt.Sprintf("%s-hotdisk-%d.%s", sanitizeBridge(uuid), time.Now().UnixNano(), format)
-		path, err := b.provisionVolume(poolName, volName, int64(spec.CapacityGB*bytesPerGB), format)
+		thick := strings.EqualFold(spec.Provisioning, "thick")
+		path, err := b.provisionVolumeProv(poolName, volName, int64(spec.CapacityGB*bytesPerGB), format, thick)
 		if err != nil {
 			return err
 		}
@@ -1761,7 +1771,7 @@ func (b *liveBackend) attachDisk(uuid string, spec vp.DiskSpec) error {
 	}
 	// Pick the next free virtio target (vdb, vdc, ...) from the live domain XML.
 	target := b.nextDiskTarget(l, dom)
-	xmlDesc := renderDiskDeviceXML(target, format, source)
+	xmlDesc := renderHotDiskDeviceXML(target, format, source, spec.Discard, spec.QoS)
 	if err := l.DomainAttachDeviceFlags(dom, xmlDesc, hotPlugFlags); err != nil {
 		b.fail(err)
 		return mapLibvirtErr(err)
@@ -2132,15 +2142,31 @@ func appendNetworkIP(sb *strings.Builder, cidr string) {
 	fmt.Fprintf(sb, "  </ip>\n")
 }
 
-// renderVolumeXML builds a libvirt <volume> for StorageVolCreateXML.
+// renderVolumeXML builds a libvirt <volume> for StorageVolCreateXML (thin/sparse).
 func renderVolumeXML(name, format string, sizeBytes uint64) string {
+	return renderVolumeXMLProv(name, format, sizeBytes, false)
+}
+
+// renderVolumeXMLProv builds a libvirt <volume>. thick=true preallocates the full
+// capacity (<allocation>==<capacity> + <permissions>-free full <preallocation>),
+// thin (default) leaves <allocation>0 so the image is sparse. Lot 5A.
+func renderVolumeXMLProv(name, format string, sizeBytes uint64, thick bool) string {
+	alloc := uint64(0)
+	if thick {
+		alloc = sizeBytes
+	}
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "<volume>\n")
 	fmt.Fprintf(&sb, "  <name>%s</name>\n", xmlEscape(name))
 	fmt.Fprintf(&sb, "  <capacity unit='bytes'>%d</capacity>\n", sizeBytes)
-	fmt.Fprintf(&sb, "  <allocation unit='bytes'>0</allocation>\n")
+	fmt.Fprintf(&sb, "  <allocation unit='bytes'>%d</allocation>\n", alloc)
 	fmt.Fprintf(&sb, "  <target>\n")
 	fmt.Fprintf(&sb, "    <format type='%s'/>\n", xmlEscape(format))
+	// preallocation=full forces qemu-img to allocate every block (thick); omitted for
+	// thin so the image stays sparse.
+	if thick {
+		fmt.Fprintf(&sb, "    <allocation>full</allocation>\n")
+	}
 	fmt.Fprintf(&sb, "  </target>\n")
 	fmt.Fprintf(&sb, "</volume>\n")
 	return sb.String()
@@ -2298,11 +2324,23 @@ type domainXML struct {
 	Metadata struct {
 		Template string `xml:"template"`
 	} `xml:"metadata"`
+	// CPUTune / MemTune carry the Lot 5A resource-control values surfaced back to GetVM.
+	CPUTune struct {
+		Shares int64 `xml:"shares"`
+		Period int64 `xml:"period"`
+		Quota  int64 `xml:"quota"`
+	} `xml:"cputune"`
+	MemTune struct {
+		HardLimit    tuneVal `xml:"hard_limit"`
+		SoftLimit    tuneVal `xml:"soft_limit"`
+		MinGuarantee tuneVal `xml:"min_guarantee"`
+	} `xml:"memtune"`
 	Devices struct {
 		Disks []struct {
 			Device string `xml:"device,attr"`
 			Driver struct {
-				Type string `xml:"type,attr"`
+				Type    string `xml:"type,attr"`
+				Discard string `xml:"discard,attr"`
 			} `xml:"driver"`
 			Source struct {
 				File string `xml:"file,attr"`
@@ -2312,6 +2350,14 @@ type domainXML struct {
 			Target struct {
 				Dev string `xml:"dev,attr"`
 			} `xml:"target"`
+			IoTune struct {
+				ReadIOPS      int64 `xml:"read_iops_sec"`
+				WriteIOPS     int64 `xml:"write_iops_sec"`
+				TotalIOPS     int64 `xml:"total_iops_sec"`
+				ReadBytesSec  int64 `xml:"read_bytes_sec"`
+				WriteBytesSec int64 `xml:"write_bytes_sec"`
+				TotalBytesSec int64 `xml:"total_bytes_sec"`
+			} `xml:"iotune"`
 		} `xml:"disk"`
 		Interfaces []struct {
 			Type string `xml:"type,attr"`
@@ -2330,6 +2376,20 @@ type domainXML struct {
 			} `xml:"link"`
 		} `xml:"interface"`
 	} `xml:"devices"`
+}
+
+// tuneVal is a <memtune> sub-element carrying a value + optional unit attr (KiB by
+// default; libvirt also accepts bytes/MiB...). kib() returns the value in KiB.
+type tuneVal struct {
+	Unit  string `xml:"unit,attr"`
+	Value int64  `xml:",chardata"`
+}
+
+func (t tuneVal) kib() int64 {
+	if t.Value <= 0 {
+		return 0
+	}
+	return toKiB(t.Value, t.Unit)
 }
 
 // applyDomainXML enriches a libvirtDomain from its <domain> XML.
@@ -2379,6 +2439,27 @@ func applyDomainXML(d *libvirtDomain, raw string) {
 	if strings.EqualFold(strings.TrimSpace(dx.Metadata.Template), "true") {
 		d.IsTemplate = true
 	}
+	// Resource control (Lot 5A): reflect <cputune>/<memtune> back so GetVM surfaces the
+	// applied reservation/limit/shares (via Labels in normalizeDomain).
+	if ct := dx.CPUTune; ct.Shares > 0 || ct.Quota > 0 || ct.Period > 0 {
+		if d.Resources == nil {
+			d.Resources = &vp.ResourceSpec{}
+		}
+		d.Resources.CPUShares = ct.Shares
+		if ct.Quota > 0 && ct.Period > 0 {
+			d.Resources.CPULimitMHz = (ct.Quota * hostCPUMHzForTune) / ct.Period
+		}
+	}
+	if mt := dx.MemTune; mt.HardLimit.kib() > 0 || mt.SoftLimit.kib() > 0 || mt.MinGuarantee.kib() > 0 {
+		if d.Resources == nil {
+			d.Resources = &vp.ResourceSpec{}
+		}
+		d.Resources.MemoryLimitMB = mt.HardLimit.kib() / 1024
+		d.Resources.MemoryReservationMB = mt.MinGuarantee.kib() / 1024
+		if mt.SoftLimit.kib() > 0 {
+			d.Resources.MemoryShares = mt.SoftLimit.kib() / 1024
+		}
+	}
 	for _, dk := range dx.Devices.Disks {
 		if dk.Device == "cdrom" {
 			continue
@@ -2387,12 +2468,23 @@ func applyDomainXML(d *libvirtDomain, raw string) {
 		if src == "" {
 			src = dk.Source.Dev
 		}
-		d.Disks = append(d.Disks, libvirtDisk{
-			Target: dk.Target.Dev,
-			Driver: dk.Driver.Type,
-			Source: src,
-			Pool:   dk.Source.Pool,
-		})
+		ld := libvirtDisk{
+			Target:  dk.Target.Dev,
+			Driver:  dk.Driver.Type,
+			Source:  src,
+			Pool:    dk.Source.Pool,
+			Discard: strings.EqualFold(dk.Driver.Discard, "unmap"),
+		}
+		// Per-disk QoS (Lot 5A): surface the live <iotune> back.
+		it := dk.IoTune
+		if it.ReadIOPS > 0 || it.WriteIOPS > 0 || it.TotalIOPS > 0 ||
+			it.ReadBytesSec > 0 || it.WriteBytesSec > 0 || it.TotalBytesSec > 0 {
+			ld.QoS = &vp.DiskQoS{
+				ReadIOPS: it.ReadIOPS, WriteIOPS: it.WriteIOPS, TotalIOPS: it.TotalIOPS,
+				ReadBytesSec: it.ReadBytesSec, WriteBytesSec: it.WriteBytesSec, TotalBytesSec: it.TotalBytesSec,
+			}
+		}
+		d.Disks = append(d.Disks, ld)
 	}
 	for _, nic := range dx.Devices.Interfaces {
 		net := nic.Source.Network
@@ -2555,6 +2647,13 @@ func renderDomainXML(d *libvirtDomain) string {
 			fmt.Fprintf(&sb, "  <cpu mode='%s'/>\n", mode)
 		}
 	}
+	// CPU/memory resource control (Lot 5A): <cputune> (shares/period/quota) +
+	// <memtune> (hard_limit/soft_limit/min_guarantee). Both are top-level <domain>
+	// children, emitted only when a ResourceSpec requests them.
+	if r := d.Resources; r != nil {
+		fmt.Fprintf(&sb, "%s", renderCputuneEl(r, hostCPUMHzForTune))
+		fmt.Fprintf(&sb, "%s", renderMemtuneEl(r))
+	}
 	// Always use the modern q35 machine type so EVERY UniHV-created VM supports PCIe
 	// hot-plug (live add/remove of disks & NICs). i440fx's pci.0 bus cannot hotplug,
 	// so we no longer emit it. UEFI adds the efi firmware loader.
@@ -2617,9 +2716,14 @@ func renderDomainXML(d *libvirtDomain) string {
 		}
 		if dk.Source != "" {
 			fmt.Fprintf(&sb, "    <disk type='file' device='disk'>\n")
-			fmt.Fprintf(&sb, "      <driver name='qemu' type='%s'/>\n", xmlEscape(driver))
+			// <driver> carries discard='unmap' (TRIM passthrough, Lot 5A) when requested.
+			fmt.Fprintf(&sb, "      %s\n", renderDiskDriverEl(driver, dk.Discard))
 			fmt.Fprintf(&sb, "      <source file='%s'/>\n", xmlEscape(dk.Source))
 			fmt.Fprintf(&sb, "      <target dev='%s' bus='virtio'/>\n", xmlEscape(target))
+			// <iotune> per-disk QoS (IOPS/bandwidth throttling, Lot 5A).
+			if iot := renderIotuneEl(dk.QoS); iot != "" {
+				fmt.Fprintf(&sb, "%s", indentLines(iot, "      "))
+			}
 			fmt.Fprintf(&sb, "    </disk>\n")
 		}
 	}

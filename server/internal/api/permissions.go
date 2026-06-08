@@ -123,6 +123,12 @@ var permissionCatalog = []string{
 	"vm.hotplug",
 	// Online disk resize (grow a VM's disk live via DomainBlockResize). Operator-grade.
 	"vm.disk.resize",
+	// Lot 5A: CPU/memory resource control (<cputune>/<memtune> reservation/limit/
+	// shares) + resource-pool management; per-disk QoS (<iotune> IOPS/bandwidth); live
+	// storage migration (DomainBlockCopy + pivot). Operator-grade allocation tuning.
+	"vm.resource",
+	"vm.disk.qos",
+	"vm.storage.migrate",
 	// Lot 4A: mark/unmark a VM as a golden-image template. Admin-grade
 	// (provisioning-class); clone-from-template reuses vm.clone.
 	"vm.template",
@@ -138,11 +144,23 @@ var permissionCatalog = []string{
 	// credential management — admin-grade infrastructure configuration.
 	"storage.backend.read",
 	"storage.backend.write",
+	// Lot 5B: scheduled VM backups (snapshot+export to a storage backend with
+	// retention). vm.backup covers list/run/delete + backup-policy CRUD
+	// (operator-grade, like vm.snapshot/vm.export). vm.backup.restore imports a
+	// backup as a NEW VM (provisioning-class), so it is admin-grade (via "*").
+	"vm.backup",
+	"vm.backup.restore",
 	// UniHV FinOps (unified cost & rightsizing) + Insights (drift/health rules
 	// feed). Reads are viewer-grade analytics over the unified inventory; editing
 	// the rate card / thresholds reuses settings.update (admin-grade).
 	"finops.read",
 	"insights.read",
+	// UniHV vSphere-style ALARMS (threshold-driven, stateful health rules over the
+	// unified inventory/metrics). Read lists definitions/channels + current firing
+	// alarms; write covers definition/channel CRUD + sending a test notification —
+	// admin-grade (only the "*" grant satisfies it).
+	"alarms.read",
+	"alarms.write",
 	// audit & settings
 	"audit.read",
 	"settings.read",

@@ -256,6 +256,23 @@ type DiskSpec struct {
 	Format     DiskFormat `json:"format,omitempty"` // "" = hypervisor default
 	StorageID  string     `json:"storageId,omitempty"`
 	SourcePath string     `json:"sourcePath,omitempty"` // import an existing disk image
+
+	// QoS, when non-nil, sets per-disk IOPS/bandwidth limits (libvirt <iotune>).
+	QoS *DiskQoS `json:"qos,omitempty"`
+	// Provisioning selects thin (sparse) or thick (preallocated). "" = hypervisor default.
+	Provisioning string `json:"provisioning,omitempty"` // "thin" | "thick"
+	// Discard enables TRIM/UNMAP passthrough (reclaims freed blocks).
+	Discard bool `json:"discard,omitempty"`
+}
+
+// DiskQoS is normalized per-disk throughput/IOPS limits (0 = unlimited).
+type DiskQoS struct {
+	ReadIOPS   int64 `json:"readIops,omitempty"`
+	WriteIOPS  int64 `json:"writeIops,omitempty"`
+	TotalIOPS  int64 `json:"totalIops,omitempty"`
+	ReadBytesSec  int64 `json:"readBytesSec,omitempty"`
+	WriteBytesSec int64 `json:"writeBytesSec,omitempty"`
+	TotalBytesSec int64 `json:"totalBytesSec,omitempty"`
 }
 
 // NICSpec is a NIC to create/attach.
@@ -272,6 +289,23 @@ type VMReconfigureSpec struct {
 	AddDisks []DiskSpec `json:"addDisks,omitempty"`
 	AddNICs  []NICSpec  `json:"addNics,omitempty"`
 	Labels   map[string]string `json:"labels,omitempty"`
+
+	// Resources, when non-nil, sets vSphere-style CPU/memory reservation, limit and
+	// shares (libvirt <cputune>/<memtune>). Nil leaves them unchanged.
+	Resources *ResourceSpec `json:"resources,omitempty"`
+}
+
+// ResourceSpec is normalized CPU/memory resource control (reservation/limit/shares),
+// the vSphere resource-allocation model. Zero fields mean "unset / hypervisor default".
+type ResourceSpec struct {
+	// CPU shares (relative weight), reservation and limit in MHz (0 = unset).
+	CPUShares      int64 `json:"cpuShares,omitempty"`
+	CPUReservationMHz int64 `json:"cpuReservationMhz,omitempty"`
+	CPULimitMHz    int64 `json:"cpuLimitMhz,omitempty"`
+	// Memory shares (relative weight), reservation (guaranteed) and limit in MB.
+	MemoryShares      int64 `json:"memoryShares,omitempty"`
+	MemoryReservationMB int64 `json:"memoryReservationMb,omitempty"`
+	MemoryLimitMB     int64 `json:"memoryLimitMb,omitempty"`
 }
 
 // CloneSpec is the normalized clone specification.

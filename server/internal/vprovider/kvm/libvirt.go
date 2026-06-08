@@ -12,6 +12,8 @@
 package kvm
 
 import (
+	"strconv"
+
 	vp "github.com/gtek-it/castor/server/internal/vprovider"
 )
 
@@ -150,6 +152,13 @@ type libvirtDomain struct {
 	// When set, renderDomainXML attaches it as an additional read-only cdrom so the
 	// Windows installer/specialize pass reads autounattend.xml from a CD.
 	SysprepISO string
+
+	// --- CPU/memory resource control (Lot 5A) ---
+	// Resources, when non-nil, requests vSphere-style CPU/memory reservation/limit/
+	// shares. renderDomainXML emits <cputune> (shares/period/quota) + <memtune>
+	// (hard_limit/soft_limit/min_guarantee); ReconfigureVM/SetResources applies it
+	// to the live+config domain. nil leaves the host scheduler defaults.
+	Resources *vp.ResourceSpec
 }
 
 // unihvMetadataNS is the metadata namespace UniHV uses on libvirt domains.
@@ -165,6 +174,13 @@ type libvirtDisk struct {
 	Source   string // file path
 	Pool     string // owning storage pool name -> StorageID
 	CapBytes int64  // capacity in bytes
+	// --- per-disk QoS + provisioning + TRIM (Lot 5A) ---
+	// QoS, when non-nil, renders an <iotune> throttle block (IOPS/bandwidth).
+	QoS *vp.DiskQoS
+	// Provisioning is "thin" (sparse) or "thick" (preallocation=full at create time).
+	Provisioning string
+	// Discard enables TRIM/UNMAP passthrough (<driver discard='unmap'/>).
+	Discard bool
 }
 
 // libvirtNIC subsets an <interface> element.
@@ -227,10 +243,11 @@ func (p *Provider) normalizeDomain(d *libvirtDomain) vp.VM {
 		IPAddresses: append([]string(nil), d.IPs...),
 		Labels:      d.Labels,
 	}
-	// Surface template + CPU topology through Labels (the VM struct is frozen). The
-	// UI reads Labels["unihv.template"] for the template badge and the cpu.* labels
-	// for the topology summary. We copy-on-write so we never mutate the backend map.
-	if d.IsTemplate || d.CPU != nil {
+	// Surface template + CPU topology + resource control through Labels (the VM struct
+	// is frozen). The UI reads Labels["unihv.template"] for the template badge, the
+	// cpu.* labels for the topology summary, and the res.* / qos.* labels for the
+	// Lot 5A Resources/QoS panels. We copy-on-write so we never mutate the backend map.
+	if d.IsTemplate || d.CPU != nil || d.Resources != nil || diskHasQoS(d.Disks) {
 		lbls := map[string]string{}
 		for k, val := range d.Labels {
 			lbls[k] = val
@@ -250,6 +267,25 @@ func (p *Provider) normalizeDomain(d *libvirtDomain) vp.VM {
 			}
 			if c.Model != "" {
 				lbls["unihv.cpu.model"] = c.Model
+			}
+		}
+		if r := d.Resources; r != nil {
+			putI64(lbls, "unihv.res.cpu.shares", r.CPUShares)
+			putI64(lbls, "unihv.res.cpu.reservationMhz", r.CPUReservationMHz)
+			putI64(lbls, "unihv.res.cpu.limitMhz", r.CPULimitMHz)
+			putI64(lbls, "unihv.res.mem.shares", r.MemoryShares)
+			putI64(lbls, "unihv.res.mem.reservationMb", r.MemoryReservationMB)
+			putI64(lbls, "unihv.res.mem.limitMb", r.MemoryLimitMB)
+		}
+		for _, dk := range d.Disks {
+			if q := dk.QoS; q != nil {
+				prefix := "unihv.qos." + dk.Target + "."
+				putI64(lbls, prefix+"readIops", q.ReadIOPS)
+				putI64(lbls, prefix+"writeIops", q.WriteIOPS)
+				putI64(lbls, prefix+"totalIops", q.TotalIOPS)
+				putI64(lbls, prefix+"readBps", q.ReadBytesSec)
+				putI64(lbls, prefix+"writeBps", q.WriteBytesSec)
+				putI64(lbls, prefix+"totalBps", q.TotalBytesSec)
 			}
 		}
 		v.Labels = lbls
@@ -278,6 +314,24 @@ func (p *Provider) normalizeDomain(d *libvirtDomain) vp.VM {
 	}
 	v.SnapshotCount = len(p.backend.listSnapshots(d.UUID))
 	return v
+}
+
+// diskHasQoS reports whether any disk carries a non-nil QoS (so normalizeDomain
+// knows it must materialize the Labels map).
+func diskHasQoS(disks []libvirtDisk) bool {
+	for _, d := range disks {
+		if d.QoS != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// putI64 sets lbls[key]=itoa(v) only for a positive v (so unset fields stay absent).
+func putI64(lbls map[string]string, key string, v int64) {
+	if v > 0 {
+		lbls[key] = strconv.FormatInt(v, 10)
+	}
 }
 
 // normalizeDiskFormat maps a libvirt <driver type='...'> to the contract format.

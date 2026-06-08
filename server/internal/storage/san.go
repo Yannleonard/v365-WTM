@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"time"
@@ -77,6 +78,55 @@ func (b *sanBackend) Test(ctx context.Context) error {
 	// Tear the live pool down (best-effort): the probe must not leave it mounted.
 	_ = l.StoragePoolDestroy(pool)
 	return nil
+}
+
+// fsDelegate returns a filesystem ObjectStore rooted at this SAN/NAS pool's
+// mountpoint. NFS/SMB pools, once started by libvirt, mount at a deterministic
+// path under /var/lib/libvirt/storage/<pool>, so backup artifacts are addressed
+// there as plain files. iSCSI exposes raw block devices (no object namespace) and
+// is therefore NOT an object store.
+func (b *sanBackend) fsDelegate() (*localBackend, error) {
+	if b.cfg.Type == TypeISCSI {
+		return nil, fmt.Errorf("storage: iscsi backend does not support object operations (raw block target)")
+	}
+	mount := "/var/lib/libvirt/storage/" + sanitizeName(b.poolName)
+	return &localBackend{base: mount}, nil
+}
+
+// PutObject stores key under the mounted NFS/SMB pool path.
+func (b *sanBackend) PutObject(ctx context.Context, key string, r io.Reader, size int64) (int64, error) {
+	d, err := b.fsDelegate()
+	if err != nil {
+		return 0, err
+	}
+	return d.PutObject(ctx, key, r, size)
+}
+
+// GetObject reads key from the mounted NFS/SMB pool path.
+func (b *sanBackend) GetObject(ctx context.Context, key string) (io.ReadCloser, error) {
+	d, err := b.fsDelegate()
+	if err != nil {
+		return nil, err
+	}
+	return d.GetObject(ctx, key)
+}
+
+// ListObjects lists artifacts under prefix on the mounted NFS/SMB pool path.
+func (b *sanBackend) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error) {
+	d, err := b.fsDelegate()
+	if err != nil {
+		return nil, err
+	}
+	return d.ListObjects(ctx, prefix)
+}
+
+// DeleteObject removes key from the mounted NFS/SMB pool path.
+func (b *sanBackend) DeleteObject(ctx context.Context, key string) error {
+	d, err := b.fsDelegate()
+	if err != nil {
+		return err
+	}
+	return d.DeleteObject(ctx, key)
 }
 
 // renderPoolXML builds libvirt <pool type='netfs'|'iscsi'|...> XML for a SAN/NAS

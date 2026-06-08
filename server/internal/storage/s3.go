@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -32,6 +33,7 @@ type s3Backend struct {
 
 const s3Service = "s3"
 const emptyPayloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" // sha256("")
+const unsignedPayload = "UNSIGNED-PAYLOAD"                                                  // SigV4 streaming sentinel
 
 func newS3Backend(cfg Config) (Backend, error) {
 	if err := cfg.Validate(); err != nil {
@@ -78,6 +80,152 @@ func (b *s3Backend) Test(ctx context.Context) error {
 		return fmt.Errorf("s3: list objects failed: %s: %s", resp.Status, s3ErrCode(string(body)))
 	}
 	return nil
+}
+
+// objURL builds the path-style object URL (endpoint/bucket/key), escaping each
+// key segment so "/" separators are preserved in the path.
+func (b *s3Backend) objURL(key string) string {
+	parts := strings.Split(strings.TrimPrefix(key, "/"), "/")
+	for i, p := range parts {
+		parts[i] = url.PathEscape(p)
+	}
+	return fmt.Sprintf("%s/%s/%s", b.endpoint, url.PathEscape(b.bucket), strings.Join(parts, "/"))
+}
+
+// PutObject uploads r under key using a single PutObject with an UNSIGNED-PAYLOAD
+// body so multi-GB images stream without buffering. size sets Content-Length when
+// known (>=0); otherwise the http client uses chunked transfer.
+func (b *s3Backend) PutObject(ctx context.Context, key string, r io.Reader, size int64) (int64, error) {
+	cr := &countingReader{r: r}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, b.objURL(key), cr)
+	if err != nil {
+		return 0, err
+	}
+	if size >= 0 {
+		req.ContentLength = size
+	}
+	if err := b.signV4(req, unsignedPayload, time.Now().UTC()); err != nil {
+		return 0, err
+	}
+	resp, err := b.http.Do(req)
+	if err != nil {
+		return cr.n, fmt.Errorf("s3: put object: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return cr.n, fmt.Errorf("s3: put object failed: %s: %s", resp.Status, s3ErrCode(string(body)))
+	}
+	return cr.n, nil
+}
+
+// GetObject opens key for reading (the caller closes the returned reader).
+func (b *s3Backend) GetObject(ctx context.Context, key string) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.objURL(key), nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := b.signV4(req, emptyPayloadHash, time.Now().UTC()); err != nil {
+		return nil, err
+	}
+	resp, err := b.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("s3: get object: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("s3: get object failed: %s: %s", resp.Status, s3ErrCode(string(body)))
+	}
+	return resp.Body, nil
+}
+
+// ListObjects returns every object under prefix (ListObjectsV2, paginated).
+func (b *s3Backend) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error) {
+	var out []ObjectInfo
+	token := ""
+	for {
+		q := url.Values{}
+		q.Set("list-type", "2")
+		q.Set("prefix", prefix)
+		if token != "" {
+			q.Set("continuation-token", token)
+		}
+		target := fmt.Sprintf("%s/%s?%s", b.endpoint, url.PathEscape(b.bucket), q.Encode())
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		if err != nil {
+			return nil, err
+		}
+		if err := b.signV4(req, emptyPayloadHash, time.Now().UTC()); err != nil {
+			return nil, err
+		}
+		resp, err := b.http.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("s3: list objects: %w", err)
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("s3: list objects failed: %s: %s", resp.Status, s3ErrCode(string(body)))
+		}
+		var lr s3ListResult
+		if err := xml.Unmarshal(body, &lr); err != nil {
+			return nil, fmt.Errorf("s3: parse list result: %w", err)
+		}
+		for _, c := range lr.Contents {
+			out = append(out, ObjectInfo{Key: c.Key, SizeBytes: c.Size})
+		}
+		if !lr.IsTruncated || lr.NextContinuationToken == "" {
+			break
+		}
+		token = lr.NextContinuationToken
+	}
+	return out, nil
+}
+
+// DeleteObject removes key (DELETE; a missing key returns 204 so it is idempotent).
+func (b *s3Backend) DeleteObject(ctx context.Context, key string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, b.objURL(key), nil)
+	if err != nil {
+		return err
+	}
+	if err := b.signV4(req, emptyPayloadHash, time.Now().UTC()); err != nil {
+		return err
+	}
+	resp, err := b.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("s3: delete object: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return fmt.Errorf("s3: delete object failed: %s: %s", resp.Status, s3ErrCode(string(body)))
+	}
+	return nil
+}
+
+// s3ListResult / s3Object model the ListObjectsV2 XML response.
+type s3ListResult struct {
+	XMLName               xml.Name   `xml:"ListBucketResult"`
+	IsTruncated           bool       `xml:"IsTruncated"`
+	NextContinuationToken string     `xml:"NextContinuationToken"`
+	Contents              []s3Object `xml:"Contents"`
+}
+type s3Object struct {
+	Key  string `xml:"Key"`
+	Size int64  `xml:"Size"`
+}
+
+// countingReader counts the bytes read through it (for byte accounting on upload).
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // signV4 signs req with AWS SigV4 for the s3 service, setting x-amz-date,

@@ -14,7 +14,7 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../lib/api";
-import { useHosts } from "../lib/hooks";
+import { useHosts, useActiveAlarms } from "../lib/hooks";
 import { StatusDot } from "./StatusDot";
 import { Spinner } from "./Spinner";
 import { humanizeAction, timeAgo } from "../lib/format";
@@ -50,6 +50,9 @@ export function RecentTasksBar() {
     refetchInterval: 15_000,
   });
   const { data: hosts } = useHosts();
+  // Real vSphere-style alarms (engine-evaluated threshold rules). The Alarms tab
+  // surfaces these firing instances alongside degraded hosts + recent failures.
+  const { data: activeAlarms } = useActiveAlarms();
 
   const rows: AuditEntry[] = (auditQ.data?.items ?? []).filter((r) => r.targetType !== "auth");
   const tasks = rows.filter((r) => {
@@ -58,11 +61,15 @@ export function RecentTasksBar() {
     return true;
   });
 
-  // Alarms: degraded/disconnected hosts + recent error/denied audit rows.
+  // Alarms: REAL engine alarms (firing instances) + degraded/disconnected hosts +
+  // recent error/denied audit rows.
+  const firingAlarms = activeAlarms ?? [];
   const hostAlarms = (hosts ?? []).filter((h) => h.degraded || h.status !== "connected");
   const auditAlarms = rows.filter((r) => r.result === "error" || r.result === "denied").slice(0, 12);
-  const criticalCount = hostAlarms.filter((h) => h.status !== "connected").length;
-  const alarmTotal = hostAlarms.length + auditAlarms.length;
+  const criticalCount =
+    firingAlarms.filter((a) => a.severity === "critical").length +
+    hostAlarms.filter((h) => h.status !== "connected").length;
+  const alarmTotal = firingAlarms.length + hostAlarms.length + auditAlarms.length;
 
   const toggle = () => {
     setCollapsed((v) => {
@@ -132,6 +139,26 @@ export function RecentTasksBar() {
               <div className="tasksbar-empty">No active alarms.</div>
             ) : (
               <>
+                {firingAlarms.map((a) => {
+                  const critical = a.severity === "critical";
+                  const valueText =
+                    a.metric === "state"
+                      ? `state = ${a.stateRaw}`
+                      : a.metric === "storage_pct" || a.metric === "cpu" || a.metric === "memory"
+                        ? `${a.metric} ${a.value.toFixed(0)}%`
+                        : `${a.metric} ${a.value.toFixed(0)}`;
+                  return (
+                    <div key={`alarm-${a.id}`} className="task-row">
+                      <span style={{ color: critical ? "var(--danger)" : "var(--warning)" }}><IconAlert size={14} /></span>
+                      <span className="task-name">{a.definitionName}</span>
+                      <span className="task-target truncate">
+                        {a.objectType} {a.objectName} — {valueText}
+                      </span>
+                      <span className="task-actor">{a.severity}</span>
+                      <span className="task-time">{timeAgo(a.raisedAt)}</span>
+                    </div>
+                  );
+                })}
                 {hostAlarms.map((h) => {
                   const critical = h.status !== "connected";
                   return (
