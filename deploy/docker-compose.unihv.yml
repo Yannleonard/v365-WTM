@@ -13,7 +13,8 @@
 #   embedded SQLite still holds auth/RBAC/audit for the zero-config path.
 # - Redis backs sessions/cache/async task queue.
 # - Mount the Docker socket to manage the local container engine; register real
-#   hypervisor connections via the UI/API. Set UNIHV_DEMO_HYPERVISOR=false in prod.
+#   real hypervisor connections via the UI/API (Connections page). No demo/sim data
+#   is ever loaded by the server — only real hypervisors you register.
 # =============================================================================
 
 services:
@@ -45,7 +46,6 @@ services:
       UNIHV_REDIS_ADDR: "redis:6379"
       # Demo hypervisors populate the console out of the box. Disable in production
       # and register real KVM/Hyper-V/Xen/ESXi connections.
-      UNIHV_DEMO_HYPERVISOR: "${UNIHV_DEMO_HYPERVISOR:-true}"
       # Integrated VM console bridge (VNC for KVM/ESXi/Xen, RDP for Hyper-V) via guacd.
       UNIHV_GUACD_ADDR: "guacd:4822"
       CASTOR_SELF_CONTAINER_ID: "unihv"
