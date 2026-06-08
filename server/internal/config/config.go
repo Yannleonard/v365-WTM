@@ -125,7 +125,7 @@ func Load() *Config {
 		SelfContainerID:        os.Getenv("CASTOR_SELF_CONTAINER_ID"),
 		AllowedOrigins:         envList("CASTOR_ALLOWED_ORIGINS"),
 		EnableSwarm:            envBool("CASTOR_ENABLE_SWARM", true),
-		DemoHypervisor:         envBool("UNIHV_DEMO_HYPERVISOR", true),
+		DemoHypervisor:         envBool("UNIHV_DEMO_HYPERVISOR", false),
 		DockerSnapshotInterval: envDur("CASTOR_DOCKER_SNAPSHOT_INTERVAL", 10*time.Second),
 		SwarmSnapshotInterval:  envDur("CASTOR_SWARM_SNAPSHOT_INTERVAL", 15*time.Second),
 		K8sSnapshotInterval:    envDur("CASTOR_K8S_SNAPSHOT_INTERVAL", 15*time.Second),

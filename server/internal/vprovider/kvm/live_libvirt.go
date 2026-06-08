@@ -63,11 +63,18 @@ type liveBackend struct {
 // endpoint is a unix socket path (default /var/run/libvirt/libvirt-sock when
 // empty) or a "host:port" / "tcp://host:port" for libvirt's TCP transport.
 func NewLive(endpoint string) (*Provider, error) {
+	return NewLiveWithID("kvm-live", endpoint)
+}
+
+// NewLiveWithID is like NewLive but uses the given provider id, so the connection-
+// management layer can key the registry by the connection id (multiple libvirt
+// endpoints then coexist without colliding on a fixed id).
+func NewLiveWithID(id, endpoint string) (*Provider, error) {
 	be, err := newLiveBackend(endpoint)
 	if err != nil {
 		return nil, err
 	}
-	return New("kvm-live", WithBackend(be)), nil
+	return New(id, WithBackend(be)), nil
 }
 
 // newLiveBackend dials libvirt and runs the RPC handshake (the official

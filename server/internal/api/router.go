@@ -89,6 +89,7 @@ func (s *Server) Router() http.Handler {
 			s.mountStackRoutes(pr)
 			s.mountVMRoutes(pr)
 			s.mountMigrateRoutes(pr)
+			s.mountHypervisorConnRoutes(pr)
 		})
 	})
 

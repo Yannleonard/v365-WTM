@@ -206,6 +206,9 @@ func run() error {
 
 	// 6. API server + router (REST + WS + embedded UI).
 	apiServer := api.NewServer(cfg, st, azDeps, guard, mgr, reg, vreg)
+	// Connect + register all enabled persisted hypervisor connections (real
+	// providers: KVM/libvirt, Hyper-V/WMI, ESXi/govmomi, Xen/XAPI). Best-effort.
+	apiServer.LoadHypervisorConnections(rootCtx)
 	handler := apiServer.Router()
 
 	// 7. HTTP server with sane timeouts.
