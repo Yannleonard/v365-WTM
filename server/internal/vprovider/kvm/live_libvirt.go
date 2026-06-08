@@ -1387,6 +1387,17 @@ func renderDomainXML(d *libvirtDomain) string {
 			fmt.Fprintf(&sb, "    </disk>\n")
 		}
 	}
+	// Boot CD-ROM from an ISO (the wizard's bootIso maps to d.BootISO). Placed
+	// before NICs; marked bootable so an empty disk boots the installer.
+	if d.BootISO != "" {
+		fmt.Fprintf(&sb, "    <disk type='file' device='cdrom'>\n")
+		fmt.Fprintf(&sb, "      <driver name='qemu' type='raw'/>\n")
+		fmt.Fprintf(&sb, "      <source file='%s'/>\n", xmlEscape(d.BootISO))
+		fmt.Fprintf(&sb, "      <target dev='sda' bus='sata'/>\n")
+		fmt.Fprintf(&sb, "      <readonly/>\n")
+		fmt.Fprintf(&sb, "      <boot order='1'/>\n")
+		fmt.Fprintf(&sb, "    </disk>\n")
+	}
 	for _, nic := range d.NICs {
 		if nic.Network == "" {
 			continue
@@ -1404,6 +1415,12 @@ func renderDomainXML(d *libvirtDomain) string {
 		fmt.Fprintf(&sb, "    </interface>\n")
 	}
 	fmt.Fprintf(&sb, "    <console type='pty'/>\n")
+	// Always attach a VNC graphical console + a video adapter so every VM created
+	// through UniHV has a usable console (the Console feature reads this <graphics>).
+	// autoport='yes' lets libvirt pick a free port; listen 0.0.0.0 so the console
+	// proxy can reach it. (See ConsoleProvider.Console.)
+	fmt.Fprintf(&sb, "    <graphics type='vnc' port='-1' autoport='yes' listen='0.0.0.0'/>\n")
+	fmt.Fprintf(&sb, "    <video><model type='cirrus'/></video>\n")
 	fmt.Fprintf(&sb, "  </devices>\n")
 	fmt.Fprintf(&sb, "</domain>\n")
 	return sb.String()

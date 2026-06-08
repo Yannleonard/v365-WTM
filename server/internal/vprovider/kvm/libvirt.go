@@ -106,7 +106,8 @@ type libvirtDomain struct {
 	NICs     []libvirtNIC
 	IPs      []string
 	Labels   map[string]string
-	Created  int64 // unix seconds
+	Created  int64  // unix seconds
+	BootISO  string // optional boot CD-ROM ISO path (from VMSpec.BootISO)
 }
 
 // libvirtDisk subsets a <disk> element.

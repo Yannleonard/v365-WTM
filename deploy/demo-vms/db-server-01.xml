@@ -1,0 +1,10 @@
+<domain type="qemu">
+  <name>db-server-01</name>
+  <memory unit="MiB">4096</memory>
+  <vcpu>4</vcpu>
+  <os><type arch="x86_64" machine="pc">hvm</type></os>
+  <devices>
+    <graphics type="vnc" port="-1" autoport="yes" listen="0.0.0.0"/>
+    <video><model type="cirrus"/></video>
+  </devices>
+</domain>

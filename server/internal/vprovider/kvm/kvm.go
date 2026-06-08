@@ -298,6 +298,7 @@ func (p *Provider) CreateVM(ctx context.Context, spec vp.VMSpec) (*vp.Task, erro
 		Firmware: spec.Firmware,
 		Labels:   spec.Labels,
 		Created:  time.Now().UTC().Unix(),
+		BootISO:  spec.BootISO,
 	}
 	for i, dk := range spec.Disks {
 		d.Disks = append(d.Disks, libvirtDisk{
