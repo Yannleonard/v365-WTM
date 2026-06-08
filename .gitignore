@@ -74,3 +74,6 @@ workflow-output.json
 
 # --- Claude Code session/internal files (never publish) ----------------------
 .claude/
+test/e2e/node_modules/
+test/e2e/package*.json
+test/e2e/shots/
