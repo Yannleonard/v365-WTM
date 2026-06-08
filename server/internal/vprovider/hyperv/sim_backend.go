@@ -116,6 +116,10 @@ func (b *simBackend) seed() {
 
 func (b *simBackend) version() string { return simVersion }
 
+// isLive reports false: this is the in-memory test fake, so ExportVM may safely
+// return its placeholder stream (used only by hardware-free conformance tests).
+func (b *simBackend) isLive() bool { return false }
+
 func (b *simBackend) healthy() bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()

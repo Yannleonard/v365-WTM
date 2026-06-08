@@ -308,6 +308,10 @@ func (l *liveBackend) consoleHost() string {
 
 func (l *liveBackend) version() string { return l.ver }
 
+// isLive reports true: this is the REAL WMI transport, so ExportVM must HARD-ERROR
+// (no real Export-VM/VHDX streaming is implemented yet) rather than fabricate a stub.
+func (l *liveBackend) isLive() bool { return true }
+
 func (l *liveBackend) healthy() bool {
 	if l.svc == nil {
 		return false

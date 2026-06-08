@@ -726,18 +726,27 @@ func (p *Provider) ExportVM(ctx context.Context, vmID string, format vp.DiskForm
 		GuestOS:    d.OSType,
 		Firmware:   d.Firmware,
 	}
-	// When the backend can export the REAL disk (live libvirt), stream the actual
-	// disk image converted to the requested format via qemu-img. This makes V2V a
-	// genuine disk migration. The sim backend has no real disk, so it falls back to
-	// a small placeholder stream (used only in hardware-free conformance tests).
+	// LIVE path: when the backend is the real libvirt backend (it implements
+	// extBackend; the in-memory sim backend does NOT), ExportVM must yield a REAL
+	// disk stream or a HARD ERROR — never a fabricated placeholder. A file-backed
+	// qcow2 disk exports for real via qemu-img. A non-file disk (block/LVM
+	// <source dev>, network/RBD/iSCSI) has no real export path, so exportDisk
+	// returns errNoRealDisk and we surface a clear ErrUnsupported instead of
+	// streaming a worthless stub (which would record backup/V2V as false-success).
 	if eb, ok := p.backend.(extBackend); ok {
-		if rc, size, err := eb.exportDisk(vmID, format); err == nil {
+		rc, size, err := eb.exportDisk(vmID, format)
+		if err == nil {
 			info.SizeBytes = size
 			return rc, info, nil
-		} else if err != errNoRealDisk {
-			return nil, nil, mapExportErr(err)
 		}
+		if err == errNoRealDisk {
+			return nil, nil, fmt.Errorf("%w: disk source type not supported for export; only file-backed disks can be exported", vp.ErrUnsupported)
+		}
+		return nil, nil, mapExportErr(err)
 	}
+	// SIM/in-memory backend ONLY: there is no real disk, so a tiny placeholder
+	// stream is returned. This path is reached EXCLUSIVELY by the hardware-free
+	// conformance/unit tests; it can never run when a live backend is attached.
 	payload := fmt.Sprintf("KVMEXPORT\x00provider=%s\x00domain=%s\x00format=%s\n", p.id, vmID, format)
 	info.SizeBytes = int64(len(payload))
 	return io.NopCloser(strings.NewReader(payload)), info, nil

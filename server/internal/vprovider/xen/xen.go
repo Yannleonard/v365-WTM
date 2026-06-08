@@ -527,6 +527,13 @@ func (p *Provider) ExportVM(ctx context.Context, vmID string, format vp.DiskForm
 	if !ok {
 		return nil, nil, vp.ErrNotFound
 	}
+	// LIVE path: a real XAPI connection is attached but no real export (XVA / disk
+	// HTTP handler) is implemented yet. Fabricating a placeholder here would make
+	// backup / V2V record a worthless stub as SUCCESS, so we HARD-ERROR instead.
+	// Only the in-memory sim backend (tests) may return the placeholder below.
+	if _, live := p.backend.(*liveBackend); live {
+		return nil, nil, fmt.Errorf("%w: VM export not yet implemented for xen", vp.ErrUnsupported)
+	}
 	// Stand in for the XAPI export HTTP handler streaming the VM's xva / disk(s).
 	payload := fmt.Sprintf("XENEXPORT\x00provider=%s\x00vm=%s\x00format=%s\n", p.id, vmID, format)
 	info := &vp.ExportInfo{

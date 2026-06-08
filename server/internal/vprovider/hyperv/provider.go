@@ -46,6 +46,10 @@ type wmiBackend interface {
 	version() string
 	healthy() bool
 	close() error
+	// isLive reports whether this is the REAL WMI transport (true) or the in-memory
+	// sim/test fake (false). Used to gate operations — like ExportVM — that must
+	// HARD-ERROR on a live host rather than fabricate a placeholder artifact.
+	isLive() bool
 
 	// inventory (WMI-native)
 	listHosts() []*hypervHost
@@ -508,6 +512,13 @@ func (p *Provider) ExportVM(ctx context.Context, vmID string, format vp.DiskForm
 	vm, ok := p.backend.getVM(vmID)
 	if !ok {
 		return nil, nil, vp.ErrNotFound
+	}
+	// LIVE path: a real WMI/Hyper-V connection is attached but no real Export-VM
+	// (VHDX streaming) is implemented yet. Fabricating a placeholder here would make
+	// backup / V2V record a worthless stub as SUCCESS, so we HARD-ERROR instead.
+	// Only the in-memory sim backend (tests) may return the placeholder below.
+	if p.backend.isLive() {
+		return nil, nil, fmt.Errorf("%w: VM export not yet implemented for hyperv", vp.ErrUnsupported)
 	}
 	// Stand in for an Export-VM streaming the VM's VHDX disk(s) for V2V.
 	payload := fmt.Sprintf("HYPERVEXPORT\x00provider=%s\x00vm=%s\x00format=%s\n", p.id, vmID, format)
