@@ -1120,41 +1120,51 @@ export interface HvConnInput {
 // VM provider capability tokens. Open string union so an unknown token from a
 // newer backend still type-checks (we only branch on known ones).
 export type VMCapability =
+  | "list_hosts"
+  | "list_vms"
+  | "get_vm"
+  | "list_clusters"
+  | "list_storage"
+  | "list_networks"
+  | "create_vm"
   | "power_start"
   | "power_stop"
   | "power_reset"
-  | "power_suspend"
-  | "power_resume"
+  | "power_suspend" // resume shares this bit (no separate power_resume token)
+  | "delete_vm"
+  | "reconfigure_vm"
   | "snapshot"
-  | "snapshot_revert"
+  | "revert_snapshot"
   | "clone"
   | "migrate"
-  | "create_vm"
-  | "delete_vm"
-  | "reconfigure"
   | "export"
+  | "cluster_topology"
+  | "node_state"
   | "metrics"
+  | "events"
+  | "console"
+  | "network_write"
+  | "storage_write"
   | "readonly"
   | (string & {});
 
-// One virtual disk attached to a VM.
+// One virtual disk attached to a VM (matches vprovider.Disk).
 export interface VMDisk {
   id: string;
   label?: string;
-  sizeBytes: number;
+  format?: string;
+  capacityGb: number;
   storageId?: string;
   path?: string;
-  thin?: boolean;
 }
 
-// One virtual NIC attached to a VM.
+// One virtual NIC attached to a VM (matches vprovider.NIC).
 export interface VMNic {
   id: string;
-  label?: string;
-  network?: string;
-  macAddress?: string;
+  mac?: string;
+  networkId?: string;
+  model?: string;
   connected?: boolean;
-  ipAddresses?: string[];
 }
 
 // VM is the normalized guest summary (list rows + inventory.vms).
@@ -1192,80 +1202,86 @@ export interface VMProvider {
   capabilities: VMCapability[];
 }
 
-// One snapshot in a VM's snapshot tree (flattened list).
+// One snapshot in a VM's snapshot tree (matches vprovider.Snapshot).
 export interface VMSnapshot {
   id: string;
+  vmId?: string;
   name: string;
   description?: string;
   createdAt?: string; // RFC3339
-  state?: string;
-  current?: boolean;
   parentId?: string;
-  sizeBytes?: number;
+  hasMemory?: boolean;
+  isCurrent?: boolean;
 }
 
-// A hypervisor host (physical node running the hypervisor).
+// A hypervisor host (physical node running the hypervisor). Matches vprovider.Host:
+// memory is reported in MB (memoryMb), not bytes.
 export interface VMHost {
   id: string;
   name: string;
+  kind?: string;
   providerId: string;
   clusterId?: string;
   state?: string;
   cpuCores?: number;
   cpuMhz?: number;
-  memoryBytes?: number;
+  memoryMb?: number;
+  memUsedMb?: number;
   vmCount?: number;
   version?: string;
 }
 
-// A cluster of hypervisor hosts (DRS/HA domain).
+// A cluster of hypervisor hosts (matches vprovider.Cluster). The backend returns
+// the member host ids (hostIds), not pre-computed counts.
 export interface VMCluster {
   id: string;
   name: string;
+  kind?: string;
   providerId: string;
-  hostCount?: number;
-  vmCount?: number;
-  totalCpuCores?: number;
-  totalMemoryBytes?: number;
-  drsEnabled?: boolean;
+  hostIds?: string[];
   haEnabled?: boolean;
+  drsEnabled?: boolean;
 }
 
-// One node placement entry in a cluster topology (a host + the VMs on it).
+// One node in a cluster topology (matches vprovider.NodeState).
 export interface VMClusterNode {
-  hostId: string;
-  hostName: string;
+  nodeId: string;
   state?: string;
-  cpuCores?: number;
-  memoryBytes?: number;
-  vms: VM[];
+  message?: string;
+  vmCount?: number;
+  updatedAt?: string; // RFC3339
 }
 
-// Cluster topology: the cluster plus its hosts and their VM placement.
+// Cluster topology (matches vprovider.Topology): nodes[] + a vmId->nodeId
+// placement map.
 export interface VMClusterTopology {
   clusterId: string;
-  clusterName: string;
   nodes: VMClusterNode[];
+  placement?: Record<string, string>;
 }
 
-// A datastore / storage pool exposed by a VM provider.
+// A datastore / storage pool exposed by a VM provider (matches vprovider.StoragePool).
+// Capacity is reported in GB (capacityGb/freeGb), not bytes.
 export interface VMStorage {
   id: string;
   name: string;
+  kind?: string;
   providerId: string;
   type?: string;
-  capacityBytes?: number;
-  freeBytes?: number;
+  capacityGb?: number;
+  freeGb?: number;
+  hostIds?: string[];
   accessible?: boolean;
 }
 
-// A virtual network / port-group exposed by a VM provider.
+// A virtual network / port-group exposed by a VM provider (matches vprovider.Network).
 export interface VMNetwork {
   id: string;
   name: string;
+  kind?: string;
   providerId: string;
   type?: string;
-  vlanId?: number;
+  vlan?: number;
 }
 
 // VMNetworkType is the accepted set for a created virtual network.
@@ -1315,16 +1331,17 @@ export interface ConsoleEndpoint {
   path?: string;
 }
 
-// One metrics sample for a VM (timestamped CPU/memory/disk/net usage).
+// One metrics sample for a VM (matches vprovider.MetricSample). Memory is
+// reported as used/limit byte counts (not a precomputed percentage).
 export interface VMMetricSample {
   timestamp: string; // RFC3339
   cpuPercent?: number;
-  memoryPercent?: number;
-  memoryBytes?: number;
-  diskReadBytes?: number;
-  diskWriteBytes?: number;
+  memUsageBytes?: number;
+  memLimitBytes?: number;
   netRxBytes?: number;
   netTxBytes?: number;
+  diskReadBytes?: number;
+  diskWriteBytes?: number;
 }
 
 // Response of GET /vm/providers/{pid}/vms/{vmId}/metrics.
@@ -1454,7 +1471,8 @@ export interface V2VRequest {
   targetHostId?: string;
   targetStorageId?: string;
   targetName?: string;
-  powerOn?: boolean;
+  // Matches the backend migrateRequestBody.powerOnAfter json tag.
+  powerOnAfter?: boolean;
 }
 
 // Response of POST /v2v/preflight. ok=false with a populated issues[] means the

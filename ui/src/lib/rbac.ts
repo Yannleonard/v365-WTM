@@ -256,12 +256,13 @@ export const VM_ACTION: Record<
   stop: { cap: "power_stop", perm: "vm.power" },
   reset: { cap: "power_reset", perm: "vm.power" },
   suspend: { cap: "power_suspend", perm: "vm.power" },
-  resume: { cap: "power_resume", perm: "vm.power" },
+  // resume shares the suspend capability bit server-side (PowerOpCapability).
+  resume: { cap: "power_suspend", perm: "vm.power" },
   snapshot: { cap: "snapshot", perm: "vm.snapshot" },
-  snapshot_revert: { cap: "snapshot_revert", perm: "vm.snapshot" },
+  snapshot_revert: { cap: "revert_snapshot", perm: "vm.snapshot" },
   clone: { cap: "clone", perm: "vm.clone" },
   migrate: { cap: "migrate", perm: "vm.migrate" },
-  reconfigure: { cap: "reconfigure", perm: "vm.reconfigure" },
+  reconfigure: { cap: "reconfigure_vm", perm: "vm.reconfigure" },
   create_vm: { cap: "create_vm", perm: "vm.create" },
   delete_vm: { cap: "delete_vm", perm: "vm.delete" },
 };

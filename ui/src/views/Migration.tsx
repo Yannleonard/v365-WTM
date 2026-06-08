@@ -70,7 +70,7 @@ export function Migration() {
       sourceVmId,
       targetProviderId,
       targetName: targetName.trim() || undefined,
-      powerOn,
+      powerOnAfter: powerOn,
     }),
     [sourceProviderId, sourceVmId, targetProviderId, targetName, powerOn],
   );

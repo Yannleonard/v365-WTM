@@ -204,32 +204,17 @@ function VMOverview({ detail }: { detail: import("../lib/types").VMDetail }) {
 
   const diskColumns: Column<VMDisk>[] = [
     { key: "label", header: "Disk", cell: (d) => <span className="mono text-xs">{d.label || d.id}</span> },
-    { key: "size", header: "Size", align: "right", sortValue: (d) => d.sizeBytes, cell: (d) => <span className="mono text-xs">{formatBytes(d.sizeBytes)}</span> },
+    { key: "size", header: "Size", align: "right", sortValue: (d) => d.capacityGb, cell: (d) => <span className="mono text-xs">{formatBytes(d.capacityGb * 1024 ** 3, 0)}</span> },
+    { key: "format", header: "Format", cell: (d) => (d.format ? <span className="chip">{d.format}</span> : <span className="muted">—</span>) },
     { key: "storage", header: "Storage", cell: (d) => (d.storageId ? <span className="mono text-xs muted">{d.storageId}</span> : <span className="muted">—</span>) },
-    { key: "thin", header: "Provisioning", cell: (d) => <span className="text-xs">{d.thin ? "Thin" : "Thick"}</span> },
     { key: "path", header: "Path", cell: (d) => (d.path ? <span className="mono text-xs muted truncate" style={{ maxWidth: 280, display: "inline-block" }} title={d.path}>{d.path}</span> : <span className="muted">—</span>) },
   ];
 
   const nicColumns: Column<VMNic>[] = [
-    { key: "label", header: "NIC", cell: (n) => <span className="mono text-xs">{n.label || n.id}</span> },
-    { key: "network", header: "Network", cell: (n) => (n.network ? <span className="chip">{n.network}</span> : <span className="muted">—</span>) },
-    { key: "mac", header: "MAC", cell: (n) => (n.macAddress ? <span className="mono text-xs">{n.macAddress}</span> : <span className="muted">—</span>) },
-    {
-      key: "ips",
-      header: "IP addresses",
-      cell: (n) =>
-        n.ipAddresses && n.ipAddresses.length ? (
-          <span className="row-wrap" style={{ gap: 4 }}>
-            {n.ipAddresses.map((ip) => (
-              <span key={ip} className="chip chip-mono text-xs">
-                {ip}
-              </span>
-            ))}
-          </span>
-        ) : (
-          <span className="muted">—</span>
-        ),
-    },
+    { key: "id", header: "NIC", cell: (n) => <span className="mono text-xs">{n.id}</span> },
+    { key: "network", header: "Network", cell: (n) => (n.networkId ? <span className="chip">{n.networkId}</span> : <span className="muted">—</span>) },
+    { key: "model", header: "Model", cell: (n) => (n.model ? <span className="text-xs">{n.model}</span> : <span className="muted">—</span>) },
+    { key: "mac", header: "MAC", cell: (n) => (n.mac ? <span className="mono text-xs">{n.mac}</span> : <span className="muted">—</span>) },
     { key: "connected", header: "Connected", cell: (n) => <span className="text-xs">{n.connected ? "Yes" : "No"}</span> },
   ];
 
@@ -394,14 +379,14 @@ function SnapshotsPanel({
         <div className="col" style={{ gap: 2 }}>
           <div className="row" style={{ gap: "var(--sp-2)" }}>
             <span style={{ fontWeight: 600 }}>{s.name}</span>
-            {s.current ? <span className="chip">current</span> : null}
+            {s.isCurrent ? <span className="chip">current</span> : null}
           </div>
           {s.description ? <span className="text-xs muted truncate" style={{ maxWidth: 320 }}>{s.description}</span> : null}
         </div>
       ),
     },
     { key: "created", header: "Created", sortValue: (s) => s.createdAt ?? "", cell: (s) => <span className="text-xs muted nowrap">{s.createdAt ? timeAgo(s.createdAt) : "—"}</span> },
-    { key: "size", header: "Size", align: "right", sortValue: (s) => s.sizeBytes ?? 0, cell: (s) => <span className="mono text-xs">{s.sizeBytes ? formatBytes(s.sizeBytes) : "—"}</span> },
+    { key: "memory", header: "Memory", cell: (s) => <span className="text-xs">{s.hasMemory ? "Included" : "—"}</span> },
     {
       key: "actions",
       header: "",
@@ -467,7 +452,13 @@ function MetricsPanel({ pid, vmId }: { pid: string; vmId: string }) {
   const samples = metricsQ.data?.samples ?? [];
 
   const cpu = useMemo(() => samples.map((s) => s.cpuPercent ?? 0), [samples]);
-  const mem = useMemo(() => samples.map((s) => s.memoryPercent ?? 0), [samples]);
+  const mem = useMemo(
+    () =>
+      samples.map((s) =>
+        s.memLimitBytes && s.memLimitBytes > 0 ? ((s.memUsageBytes ?? 0) / s.memLimitBytes) * 100 : 0,
+      ),
+    [samples],
+  );
   const lastCpu = cpu.length ? cpu[cpu.length - 1]! : undefined;
   const lastMem = mem.length ? mem[mem.length - 1]! : undefined;
 

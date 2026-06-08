@@ -257,10 +257,10 @@ export function VMStorage() {
                     </td>
                     <td>{p.type ? <span className="chip">{p.type}</span> : <span className="muted">—</span>}</td>
                     <td className="mono text-xs nowrap" style={{ textAlign: "right" }}>
-                      {p.capacityBytes ? formatBytes(p.capacityBytes, 0) : "—"}
+                      {p.capacityGb ? formatBytes(p.capacityGb * 1024 ** 3, 0) : "—"}
                     </td>
                     <td className="mono text-xs nowrap" style={{ textAlign: "right" }}>
-                      {p.freeBytes !== undefined ? formatBytes(p.freeBytes, 0) : "—"}
+                      {p.freeGb !== undefined ? formatBytes(p.freeGb * 1024 ** 3, 0) : "—"}
                     </td>
                     <td>
                       <span className="text-xs">{p.accessible === false ? "No" : "Yes"}</span>

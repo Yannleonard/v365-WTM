@@ -351,7 +351,7 @@ export function VMCreateWizard() {
                 {pools.map((p) => (
                   <option key={p.id} value={p.id}>
                     {p.name}
-                    {p.freeBytes !== undefined ? ` — ${formatBytes(p.freeBytes, 0)} free` : ""}
+                    {p.freeGb !== undefined ? ` — ${formatBytes(p.freeGb * 1024 ** 3, 0)} free` : ""}
                   </option>
                 ))}
               </SelectField>

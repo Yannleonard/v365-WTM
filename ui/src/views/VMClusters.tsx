@@ -5,7 +5,7 @@
 // node (host) state + the VMs placed on it. Reuses DataTable for both the cluster
 // list and each node's VM placement table.
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useInventory, useVMClusterTopology } from "../lib/hooks";
 import { PageHeader } from "../components/PageHeader";
@@ -22,6 +22,7 @@ import type { VM, VMCluster } from "../lib/types";
 export function VMClusters() {
   const inventoryQ = useInventory();
   const clusters = inventoryQ.data?.clusters ?? [];
+  const allVms = inventoryQ.data?.vms ?? [];
 
   const [expanded, setExpanded] = useState<string | null>(null);
 
@@ -47,6 +48,7 @@ export function VMClusters() {
             <ClusterCard
               key={`${c.providerId}:${c.id}`}
               cluster={c}
+              vms={allVms}
               open={expanded === `${c.providerId}:${c.id}`}
               onToggle={() =>
                 setExpanded((cur) => (cur === `${c.providerId}:${c.id}` ? null : `${c.providerId}:${c.id}`))
@@ -59,7 +61,19 @@ export function VMClusters() {
   );
 }
 
-function ClusterCard({ cluster, open, onToggle }: { cluster: VMCluster; open: boolean; onToggle: () => void }) {
+function ClusterCard({
+  cluster,
+  vms,
+  open,
+  onToggle,
+}: {
+  cluster: VMCluster;
+  vms: VM[];
+  open: boolean;
+  onToggle: () => void;
+}) {
+  const hostCount = cluster.hostIds?.length ?? 0;
+  const vmCount = vms.filter((v) => v.providerId === cluster.providerId && v.clusterId === cluster.id).length;
   return (
     <div className="card">
       <div
@@ -81,23 +95,38 @@ function ClusterCard({ cluster, open, onToggle }: { cluster: VMCluster; open: bo
         <div className="row-wrap" style={{ gap: "var(--sp-2)" }}>
           {cluster.haEnabled ? <span className="chip">HA</span> : null}
           {cluster.drsEnabled ? <span className="chip">DRS</span> : null}
-          <span className="chip">{cluster.hostCount ?? 0} hosts</span>
-          <span className="chip">{cluster.vmCount ?? 0} VMs</span>
-          {cluster.totalCpuCores ? <span className="chip">{cluster.totalCpuCores} cores</span> : null}
-          {cluster.totalMemoryBytes ? <span className="chip">{formatBytes(cluster.totalMemoryBytes, 0)}</span> : null}
+          <span className="chip">{hostCount} hosts</span>
+          <span className="chip">{vmCount} VMs</span>
         </div>
       </div>
       {open ? (
         <div className="card-body" style={{ padding: 0 }}>
-          <ClusterTopology pid={cluster.providerId} cid={cluster.id} />
+          <ClusterTopology pid={cluster.providerId} cid={cluster.id} vms={vms} />
         </div>
       ) : null}
     </div>
   );
 }
 
-function ClusterTopology({ pid, cid }: { pid: string; cid: string }) {
+function ClusterTopology({ pid, cid, vms }: { pid: string; cid: string; vms: VM[] }) {
   const topoQ = useVMClusterTopology(pid, cid, true);
+
+  // The backend Topology carries node states + a vmId->nodeId placement map.
+  // Build per-node VM lists from the inventory VMs using that placement (falling
+  // back to the VM's hostId when a node has no explicit placement entry).
+  const vmsByNode = useMemo(() => {
+    const placement = topoQ.data?.placement ?? {};
+    const byNode = new Map<string, VM[]>();
+    for (const v of vms) {
+      if (v.providerId !== pid) continue;
+      const nodeId = placement[v.id] ?? v.hostId;
+      if (!nodeId) continue;
+      const list = byNode.get(nodeId) ?? [];
+      list.push(v);
+      byNode.set(nodeId, list);
+    }
+    return byNode;
+  }, [topoQ.data, vms, pid]);
 
   if (topoQ.isLoading) return <LoadingFill label="Loading topology…" />;
   if (topoQ.isError || !topoQ.data) {
@@ -120,13 +149,13 @@ function ClusterTopology({ pid, cid }: { pid: string; cid: string }) {
   return (
     <div className="col" style={{ gap: "var(--sp-4)", padding: "var(--sp-4)" }}>
       {nodes.map((node) => (
-        <NodePanel key={node.hostId} node={node} />
+        <NodePanel key={node.nodeId} node={node} vms={vmsByNode.get(node.nodeId) ?? []} />
       ))}
     </div>
   );
 }
 
-function NodePanel({ node }: { node: import("../lib/types").VMClusterNode }) {
+function NodePanel({ node, vms }: { node: import("../lib/types").VMClusterNode; vms: VM[] }) {
   const navigate = useNavigate();
   const vmColumns: Column<VM>[] = [
     { key: "name", header: "VM", sortValue: (v) => v.name, cell: (v) => <span style={{ fontWeight: 600 }} className="truncate">{v.name}</span> },
@@ -136,27 +165,27 @@ function NodePanel({ node }: { node: import("../lib/types").VMClusterNode }) {
     { key: "guestOs", header: "Guest OS", sortValue: (v) => v.guestOs ?? "", cell: (v) => <span className="text-xs muted">{v.guestOs || "—"}</span> },
   ];
 
+  const healthy = node.state === "up" || node.state === "running" || node.state === "connected";
+
   return (
     <div className="card" style={{ background: "var(--bg-elevated, var(--bg-surface))" }}>
       <div className="card-header">
         <div className="row" style={{ gap: "var(--sp-3)" }}>
-          <StatusDot color={node.state === "connected" || node.state === "running" ? "var(--success)" : "var(--state-pending)"} />
+          <StatusDot color={healthy ? "var(--success)" : "var(--state-pending)"} />
           <div className="col" style={{ gap: 0 }}>
-            <span className="card-title">{node.hostName || node.hostId}</span>
-            <span className="text-xs muted mono">{node.hostId}</span>
+            <span className="card-title">{node.nodeId}</span>
+            {node.message ? <span className="text-xs muted">{node.message}</span> : null}
           </div>
         </div>
         <div className="row-wrap" style={{ gap: "var(--sp-2)" }}>
           {node.state ? <span className="chip">{node.state}</span> : null}
-          {node.cpuCores ? <span className="chip">{node.cpuCores} cores</span> : null}
-          {node.memoryBytes ? <span className="chip">{formatBytes(node.memoryBytes, 0)}</span> : null}
-          <span className="chip">{node.vms.length} VMs</span>
+          <span className="chip">{node.vmCount ?? vms.length} VMs</span>
         </div>
       </div>
       <div className="card-body" style={{ padding: 0 }}>
         <DataTable
           columns={vmColumns}
-          rows={node.vms}
+          rows={vms}
           rowKey={(v) => `${v.providerId}:${v.id}`}
           defaultSortKey="name"
           onRowClick={(v) => navigate(`/vms/${encodeURIComponent(v.providerId)}/${encodeURIComponent(v.id)}`)}

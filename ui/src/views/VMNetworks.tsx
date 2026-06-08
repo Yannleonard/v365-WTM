@@ -87,10 +87,10 @@ export function VMNetworks() {
       key: "vlan",
       header: "VLAN",
       align: "right",
-      sortValue: (n) => n.vlanId ?? 0,
+      sortValue: (n) => n.vlan ?? 0,
       cell: (n) =>
-        n.vlanId !== undefined && n.vlanId !== null ? (
-          <span className="mono text-xs">{n.vlanId}</span>
+        n.vlan !== undefined && n.vlan !== null ? (
+          <span className="mono text-xs">{n.vlan}</span>
         ) : (
           <span className="muted">—</span>
         ),
