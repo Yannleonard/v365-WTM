@@ -387,6 +387,33 @@ export const IconMemory = (p: IconProps) => (
   </svg>
 );
 
+// Power symbol: a circle with a gap at the top crossed by a vertical bar — the
+// universal "Shut Down" glyph (distinct from IconPlay/IconStop).
+export const IconPower = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M12 3v9" />
+    <path d="M7.5 6.7a7 7 0 1 0 9 0" />
+  </svg>
+);
+
+// Graphical console: a monitor screen with a stand — distinct from IconTerminal
+// (serial/exec) and from IconVM (monitor + cursor mark).
+export const IconConsole = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="3" y="4" width="18" height="12" rx="2" />
+    <path d="M8 20h8M12 16v4" />
+  </svg>
+);
+
+// Eject: a triangle over a bar — the unambiguous "eject media" glyph (replaces
+// the previous IconClose ✕ which read as "cancel").
+export const IconEject = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M5 14h14L12 6z" fill="currentColor" stroke="none" />
+    <rect x="5" y="16" width="14" height="2" rx="1" fill="currentColor" stroke="none" />
+  </svg>
+);
+
 // Edit / pencil.
 export const IconEdit = (p: IconProps) => (
   <svg {...base(p)}>

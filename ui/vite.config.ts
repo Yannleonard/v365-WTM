@@ -30,6 +30,8 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    // Allow the Playwright-in-Docker host alias to reach `vite dev` for E2E shots.
+    allowedHosts: ["host.docker.internal", "localhost"],
     proxy: {
       "/api": {
         target: "http://localhost:8080",

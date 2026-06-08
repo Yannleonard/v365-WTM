@@ -919,6 +919,129 @@ li { list-style: none; }
   gap: var(--sp-4);
 }
 
+/* ===================================================================
+ * Lot 1 — UX clarity. Additive only: every rule reuses existing tokens
+ * (colors, spacing, radius, surfaces) and existing chrome (.menu-pop,
+ * .card, .dl). No new palette, no new visual language.
+ * =================================================================== */
+
+/* ---- Actions ▾ dropdown: submenu flyout + disabled item (reuses .menu-pop / .menu-item) ---- */
+.menu-item.has-sub { justify-content: space-between; }
+.menu-item.has-sub > .menu-sub-caret { margin-left: auto; color: var(--text-muted); }
+.menu-item.is-danger { color: var(--danger); }
+.menu-item.is-danger:hover { background: var(--danger-bg); color: var(--danger); }
+.menu-item.disabled,
+.menu-item:disabled { opacity: 0.45; cursor: not-allowed; }
+.menu-item.disabled:hover,
+.menu-item:disabled:hover { background: none; color: var(--text-secondary); }
+.menu-item-group { position: relative; }
+.menu-item-group > .submenu {
+  position: absolute;
+  top: -6px;
+  right: calc(100% + 4px);
+  min-width: 210px;
+  background: var(--bg-surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-pop);
+  padding: var(--sp-2);
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+/* When the menu would clip off the left edge, flip the submenu to the right side. */
+.menu-item-group.flip > .submenu { right: auto; left: calc(100% + 4px); }
+.menu-sublabel { padding: var(--sp-1) var(--sp-3) 2px; font-size: var(--fs-xs); color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+
+/* The split-button: a labeled primary action welded to a small caret toggle. */
+.split-btn { display: inline-flex; align-items: stretch; }
+.split-btn > .btn:first-child { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.split-btn > .split-caret { border-top-left-radius: 0; border-bottom-left-radius: 0; margin-left: -1px; width: 30px; padding: 0; }
+
+/* ---- Resource gauge (Summary tab) — labeled used/free/capacity bar ---- */
+.gauge { display: flex; flex-direction: column; gap: var(--sp-1); }
+.gauge-top { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-2); }
+.gauge-label { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); font-weight: var(--fw-medium); color: var(--text-secondary); }
+.gauge-pct { font-size: var(--fs-sm); font-weight: var(--fw-semibold); color: var(--text-primary); font-family: var(--font-mono); }
+.gauge-track { height: 8px; border-radius: var(--radius-pill); background: var(--bg-surface-3); overflow: hidden; }
+.gauge-fill { height: 100%; border-radius: var(--radius-pill); transition: width var(--dur-base) var(--ease); }
+.gauge-foot { display: flex; justify-content: space-between; gap: var(--sp-2); font-size: var(--fs-xs); color: var(--text-muted); font-family: var(--font-mono); }
+
+/* ---- Summary layout: 2-col grid of cards (reuses .card) ---- */
+.summary-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-5); align-items: start; }
+.summary-grid .span-2 { grid-column: 1 / -1; }
+.gauge-stack { display: flex; flex-direction: column; gap: var(--sp-4); }
+
+/* Console vignette: a clickable "Launch console" card built from surfaces/tokens. */
+.console-vignette {
+  display: flex; align-items: center; gap: var(--sp-4);
+  width: 100%; text-align: left;
+  padding: var(--sp-4) var(--sp-5);
+  background: var(--bg-inset);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  color: #DCE7F5;
+}
+.console-vignette:hover { border-color: var(--accent); }
+.console-vignette:disabled { opacity: 0.6; cursor: not-allowed; }
+.console-vignette .cv-screen {
+  flex: 0 0 auto; width: 64px; height: 44px; border-radius: var(--radius-sm);
+  background: linear-gradient(135deg, rgba(36,150,237,0.25), rgba(19,166,136,0.25));
+  display: flex; align-items: center; justify-content: center; color: #9FC4EA;
+}
+.console-vignette .cv-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.console-vignette .cv-title { font-size: var(--fs-sm); font-weight: var(--fw-semibold); color: #FFFFFF; }
+.console-vignette .cv-sub { font-size: var(--fs-xs); color: #9FB4CC; }
+
+/* ---- Recent Tasks / Alarms bottom bar (AppShell) ---- */
+.tasksbar {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--border-strong);
+  background: var(--bg-surface);
+  display: flex; flex-direction: column;
+}
+.tasksbar-head {
+  display: flex; align-items: stretch; height: 30px;
+  border-bottom: 1px solid var(--border);
+}
+.tasksbar.collapsed .tasksbar-head { border-bottom: none; }
+.tasksbar-tab {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: 0 var(--sp-4); background: none; border: none;
+  border-right: 1px solid var(--border);
+  color: var(--text-secondary); font-size: var(--fs-xs); font-weight: var(--fw-medium);
+}
+.tasksbar-tab:hover { color: var(--text-primary); }
+.tasksbar-tab.active { color: var(--text-primary); background: var(--bg-surface-2); box-shadow: inset 0 -2px 0 var(--accent); }
+.tasksbar-spacer { flex: 1 1 auto; }
+.tasksbar-toggle { padding: 0 var(--sp-3); background: none; border: none; border-left: 1px solid var(--border); color: var(--text-muted); display: flex; align-items: center; }
+.tasksbar-toggle:hover { color: var(--text-primary); }
+.tasksbar-body { height: 132px; overflow-y: auto; }
+.tasksbar-chips { display: flex; gap: var(--sp-1); padding: var(--sp-2) var(--sp-3) 0; }
+.tasksbar-chip {
+  padding: 2px var(--sp-2); border-radius: var(--radius-pill);
+  border: 1px solid var(--border); background: var(--bg-surface-2);
+  color: var(--text-secondary); font-size: var(--fs-xs);
+}
+.tasksbar-chip.active { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.task-row {
+  display: flex; align-items: center; gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-4);
+  border-bottom: 1px solid var(--border);
+  font-size: var(--fs-xs);
+  width: 100%; text-align: left; background: none; border-left: none; border-right: none; border-top: none;
+}
+.task-row:hover { background: var(--bg-surface-2); }
+.task-row .task-name { font-weight: var(--fw-medium); color: var(--text-primary); min-width: 130px; }
+.task-row .task-target { color: var(--text-secondary); flex: 1 1 auto; min-width: 0; }
+.task-row .task-actor { color: var(--text-muted); }
+.task-row .task-time { color: var(--text-muted); font-variant-numeric: tabular-nums; min-width: 64px; text-align: right; }
+.tasksbar-empty { padding: var(--sp-4); color: var(--text-muted); font-size: var(--fs-xs); }
+.tasksbar-count { display: inline-flex; align-items: center; justify-content: center; min-width: 16px; height: 16px; padding: 0 4px; border-radius: var(--radius-pill); background: var(--bg-surface-3); color: var(--text-secondary); font-size: 10px; font-weight: var(--fw-semibold); }
+.tasksbar-count.danger { background: var(--danger-bg); color: var(--danger); }
+.tasksbar-count.warn { background: var(--warning-bg); color: var(--warning); }
+
 /* ---- responsive ---- */
 @media (max-width: 880px) {
   .dl { grid-template-columns: 1fr; gap: var(--sp-1) 0; }
@@ -926,4 +1049,5 @@ li { list-style: none; }
   .mkt-row-port { grid-template-columns: 1fr auto 1fr; }
   .mkt-row-port .mkt-row-proto, .mkt-row-port .mkt-row-rm { grid-column: span 1; }
   .mkt-row-vol { grid-template-columns: 1fr auto 1fr; }
+  .summary-grid { grid-template-columns: 1fr; }
 }

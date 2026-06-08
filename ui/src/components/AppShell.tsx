@@ -9,6 +9,7 @@ import { Outlet } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
+import { RecentTasksBar } from "./RecentTasksBar";
 import { subscribeEvents } from "../lib/ws";
 import { useSelectedHost } from "../lib/hostStore";
 
@@ -20,6 +21,8 @@ export function AppShell() {
   useEffect(() => {
     const sub = subscribeEvents(hostId, {
       onData: (payload) => {
+        // Keep the Recent Tasks bar reactive to in-flight actions.
+        queryClient.invalidateQueries({ queryKey: ["audit", "recent"] });
         // Targeted invalidation by event kind keeps refetches cheap.
         switch (payload.kind) {
           case "container":
@@ -50,6 +53,7 @@ export function AppShell() {
             <Outlet />
           </div>
         </main>
+        <RecentTasksBar />
       </div>
     </div>
   );

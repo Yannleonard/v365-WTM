@@ -82,3 +82,42 @@ export function cleanName(name: string | undefined): string {
   if (!name) return "—";
   return name.startsWith("/") ? name.slice(1) : name;
 }
+
+// Humanize an audit/event `action` token (e.g. "vm.power.start" -> "Power On")
+// for the Recent Tasks bar. Exact mappings first, then a generic title-case
+// fallback so unknown actions still read cleanly.
+const ACTION_LABELS: Record<string, string> = {
+  "vm.power.start": "Power On",
+  "vm.power.stop": "Power Off",
+  "vm.power.reset": "Reset",
+  "vm.power.suspend": "Suspend",
+  "vm.power.resume": "Resume",
+  "vm.snapshot.create": "Take Snapshot",
+  "vm.snapshot.revert": "Revert Snapshot",
+  "vm.clone": "Clone",
+  "vm.migrate": "Migrate",
+  "vm.reconfigure": "Reconfigure",
+  "vm.delete": "Delete",
+  "vm.create": "Create VM",
+  "vm.disk.attach": "Add Disk",
+  "vm.disk.detach": "Detach Disk",
+  "vm.nic.attach": "Add Adapter",
+  "vm.nic.detach": "Detach Adapter",
+  "vm.iso.mount": "Mount ISO",
+  "vm.iso.unmount": "Eject ISO",
+  "vm.network.create": "Create Network",
+  "vm.network.delete": "Delete Network",
+  "vm.storage.create": "Create Volume",
+  "vm.storage.delete": "Delete Volume",
+};
+
+export function humanizeAction(action: string | undefined): string {
+  if (!action) return "—";
+  if (ACTION_LABELS[action]) return ACTION_LABELS[action]!;
+  // generic: "docker.container.restart" -> "Restart"; fall back to the last 1-2 segments.
+  const segs = action.split(".");
+  const tail = segs.slice(-1)[0] ?? action;
+  return tail
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}

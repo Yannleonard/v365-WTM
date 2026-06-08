@@ -14,7 +14,7 @@ import { useVMActions } from "./useVMActions";
 import { PageHeader } from "../components/PageHeader";
 import { DataTable, type Column } from "../components/DataTable";
 import { VMStateBadge } from "../components/VMStateBadge";
-import { VMActionButtons } from "../components/VMActionButtons";
+import { VMActions } from "../components/VMActions";
 import { ProtectedTag } from "../components/ProtectedTag";
 import { LoadingFill } from "../components/Spinner";
 import { ActionButton } from "../components/ActionButton";
@@ -160,9 +160,10 @@ export function VirtualMachines() {
       key: "actions",
       header: "",
       align: "right",
-      width: "200px",
+      width: "120px",
       cell: (v) => (
-        <VMActionButtons
+        <VMActions
+          layout="menu"
           vm={v}
           caps={capsForProvider(v.providerId)}
           permissions={permissions}
@@ -170,6 +171,12 @@ export function VirtualMachines() {
           onPower={actions.runPower}
           onSnapshot={actions.triggerSnapshot}
           onClone={actions.triggerClone}
+          onReconfigure={actions.triggerReconfigure}
+          onMigrate={actions.triggerMigrate}
+          onAddDisk={actions.triggerAddDisk}
+          onAddNic={actions.triggerAddNic}
+          onMountIso={actions.triggerMountIso}
+          onEjectIso={actions.ejectIso}
           onDelete={actions.triggerDelete}
         />
       ),

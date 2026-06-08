@@ -16,39 +16,41 @@ import { PageHeader } from "../components/PageHeader";
 import { LoadingFill } from "../components/Spinner";
 import { EmptyState } from "../components/EmptyState";
 import { VMStateBadge } from "../components/VMStateBadge";
-import { VMActionButtons } from "../components/VMActionButtons";
+import { VMActions } from "../components/VMActions";
 import { ProtectedTag } from "../components/ProtectedTag";
 import { ActionButton } from "../components/ActionButton";
 import { CapabilityGate } from "../components/CapabilityGate";
 import { DataTable, type Column } from "../components/DataTable";
 import { StatsChart } from "../components/StatsChart";
+import { ResourceGauge } from "../components/ResourceGauge";
 import { ConsolePanel } from "../components/ConsolePanel";
 import { InspectTab } from "./workload/InspectTab";
 import { gateVMAction, gateVMConsole, gateVMHotPlug } from "../lib/rbac";
 import { formatBytes, formatDateTime, shortId, timeAgo } from "../lib/format";
 import {
-  IconRefresh,
   IconVM,
   IconDashboard,
   IconSnapshot,
   IconStats,
   IconInspect,
-  IconEdit,
-  IconMigrate,
   IconRestart,
-  IconTerminal,
+  IconConsole,
+  IconCpu,
+  IconMemory,
   IconDisc,
   IconDisk,
   IconNic,
   IconTrash,
-  IconClose,
+  IconNetworks,
+  IconHosts,
+  IconShield,
 } from "../components/icons";
 import { toast, toastError } from "../lib/toast";
 import { api } from "../lib/api";
 import { useQueryClient } from "@tanstack/react-query";
 import type { VMDisk, VMNic, VMSnapshot } from "../lib/types";
 
-type TabKey = "overview" | "snapshots" | "metrics" | "console" | "inspect";
+type TabKey = "summary" | "monitor" | "snapshots" | "console" | "inspect";
 
 export function VirtualMachineDetail() {
   const params = useParams<{ pid: string; id: string }>();
@@ -64,7 +66,7 @@ export function VirtualMachineDetail() {
   const caps = capsForProvider(pid);
 
   const actions = useVMActions();
-  const [tab, setTab] = useState<TabKey>("overview");
+  const [tab, setTab] = useState<TabKey>("summary");
 
   if (query.isLoading) return <LoadingFill label="Loading virtual machine…" />;
 
@@ -91,11 +93,11 @@ export function VirtualMachineDetail() {
   const consoleGate = gateVMConsole(caps, permissions);
 
   const tabs: { key: TabKey; label: string; icon: JSX.Element }[] = [
-    { key: "overview", label: "Overview", icon: <IconDashboard size={15} /> },
+    { key: "summary", label: "Summary", icon: <IconDashboard size={15} /> },
+    { key: "monitor", label: "Monitor", icon: <IconStats size={15} /> },
     { key: "snapshots", label: "Snapshots", icon: <IconSnapshot size={15} /> },
-    { key: "metrics", label: "Metrics", icon: <IconStats size={15} /> },
     ...(consoleGate.allowed
-      ? [{ key: "console" as const, label: "Console", icon: <IconTerminal size={15} /> }]
+      ? [{ key: "console" as const, label: "Console", icon: <IconConsole size={15} /> }]
       : []),
     { key: "inspect", label: "Inspect", icon: <IconInspect size={15} /> },
   ];
@@ -120,97 +122,27 @@ export function VirtualMachineDetail() {
           </span>
         }
         actions={
-          <div className="row">
-            <VMActionButtons
-              vm={detail}
-              caps={caps}
-              permissions={permissions}
-              busy={actions.busyId === detail.id}
-              size="md"
-              onPower={actions.runPower}
-              onSnapshot={actions.triggerSnapshot}
-              onClone={actions.triggerClone}
-              onDelete={actions.triggerDelete}
-            />
-            <CapabilityGate gate={gateVMAction("reconfigure", caps, permissions)}>
-              {(allowed, reason) => (
-                <ActionButton
-                  variant="ghost"
-                  iconOnly
-                  disabled={!allowed}
-                  tooltip={allowed ? "Reconfigure" : reason}
-                  aria-label="Reconfigure"
-                  onClick={() => actions.triggerReconfigure(detail)}
-                >
-                  <IconEdit size={16} />
-                </ActionButton>
-              )}
-            </CapabilityGate>
-            <CapabilityGate gate={gateVMAction("migrate", caps, permissions)}>
-              {(allowed, reason) => (
-                <ActionButton
-                  variant="ghost"
-                  iconOnly
-                  disabled={!allowed}
-                  tooltip={allowed ? "Migrate (intra-hypervisor)" : reason}
-                  aria-label="Migrate"
-                  onClick={() => actions.triggerMigrate(detail)}
-                >
-                  <IconMigrate size={16} />
-                </ActionButton>
-              )}
-            </CapabilityGate>
-            <CapabilityGate gate={gateVMHotPlug(caps, permissions)}>
-              {(allowed, reason) => (
-                <>
-                  <ActionButton
-                    variant="ghost"
-                    iconOnly
-                    disabled={!allowed}
-                    tooltip={allowed ? "Add disk (live)" : reason}
-                    aria-label="Add disk"
-                    onClick={() => actions.triggerAddDisk(detail)}
-                  >
-                    <IconDisk size={16} />
-                  </ActionButton>
-                  <ActionButton
-                    variant="ghost"
-                    iconOnly
-                    disabled={!allowed}
-                    tooltip={allowed ? "Add network adapter (live)" : reason}
-                    aria-label="Add network adapter"
-                    onClick={() => actions.triggerAddNic(detail)}
-                  >
-                    <IconNic size={16} />
-                  </ActionButton>
-                  <ActionButton
-                    variant="ghost"
-                    iconOnly
-                    disabled={!allowed}
-                    tooltip={allowed ? "Mount ISO (live)" : reason}
-                    aria-label="Mount ISO"
-                    onClick={() => actions.triggerMountIso(detail)}
-                  >
-                    <IconDisc size={16} />
-                  </ActionButton>
-                  <ActionButton
-                    variant="ghost"
-                    iconOnly
-                    disabled={!allowed}
-                    tooltip={allowed ? "Eject ISO (live)" : reason}
-                    aria-label="Eject ISO"
-                    loading={actions.detachBusyId === detail.id + "-iso"}
-                    onClick={() => actions.ejectIso(detail)}
-                  >
-                    <IconClose size={16} />
-                  </ActionButton>
-                </>
-              )}
-            </CapabilityGate>
-            <ActionButton variant="ghost" iconOnly tooltip="Refresh" aria-label="Refresh" onClick={() => query.refetch()}>
-              <IconRefresh size={16} />
-            </ActionButton>
-          </div>
+          <VMActions
+            layout="bar"
+            vm={detail}
+            caps={caps}
+            permissions={permissions}
+            busy={actions.busyId === detail.id}
+            size="md"
+            onPower={actions.runPower}
+            onSnapshot={actions.triggerSnapshot}
+            onManageSnapshots={() => setTab("snapshots")}
+            onClone={actions.triggerClone}
+            onReconfigure={actions.triggerReconfigure}
+            onMigrate={actions.triggerMigrate}
+            onAddDisk={actions.triggerAddDisk}
+            onAddNic={actions.triggerAddNic}
+            onMountIso={actions.triggerMountIso}
+            onEjectIso={actions.ejectIso}
+            onDelete={actions.triggerDelete}
+            onConsole={consoleGate.allowed ? () => setTab("console") : undefined}
+            onRefresh={() => query.refetch()}
+          />
         }
       />
 
@@ -226,9 +158,13 @@ export function VirtualMachineDetail() {
       </div>
 
       <div>
-        {tab === "overview" && (
-          <VMOverview
+        {tab === "summary" && (
+          <VMSummary
+            pid={pid}
+            vmId={vmId}
             detail={detail}
+            consoleAllowed={consoleGate.allowed}
+            onLaunchConsole={() => setTab("console")}
             hotPlug={gateVMHotPlug(caps, permissions)}
             onDetachDisk={(id) => actions.detachDisk(detail, id)}
             onDetachNic={(id) => actions.detachNic(detail, id)}
@@ -244,7 +180,7 @@ export function VirtualMachineDetail() {
             onCreate={() => actions.triggerSnapshot(detail)}
           />
         )}
-        {tab === "metrics" && <MetricsPanel pid={pid} vmId={vmId} />}
+        {tab === "monitor" && <MetricsPanel pid={pid} vmId={vmId} />}
         {/* Mounted only when active so no console socket opens in the background. */}
         {tab === "console" && consoleGate.allowed && <ConsolePanel pid={pid} vmId={vmId} />}
         {tab === "inspect" && <InspectTab raw={detail.raw} />}
@@ -255,16 +191,29 @@ export function VirtualMachineDetail() {
   );
 }
 
-/* ============================ Overview ============================ */
+/* ============================ Summary ============================ */
+//
+// vSphere "Summary" rendered in Castor cards: a console vignette, three resource
+// gauges (CPU / Memory / Storage), a VM Hardware card, a General card and a
+// Related Objects card — restructured from the old Overview content. Gauges read
+// CPU/mem from the latest GetMetrics sample and storage from the disk capacities.
 
-function VMOverview({
+function VMSummary({
+  pid,
+  vmId,
   detail,
+  consoleAllowed,
+  onLaunchConsole,
   hotPlug,
   onDetachDisk,
   onDetachNic,
   detachBusyId,
 }: {
+  pid: string;
+  vmId: string;
   detail: import("../lib/types").VMDetail;
+  consoleAllowed: boolean;
+  onLaunchConsole: () => void;
   hotPlug: import("../lib/rbac").GateResult;
   onDetachDisk: (diskId: string) => void;
   onDetachNic: (nicId: string) => void;
@@ -273,6 +222,22 @@ function VMOverview({
   const disks = detail.disks ?? [];
   const nics = detail.nics ?? [];
   const labels = Object.entries(detail.labels ?? {});
+
+  // Latest metrics sample drives the CPU + memory gauges (best-effort: 0 if none).
+  const metricsQ = useVMMetrics(pid, vmId);
+  const samples = metricsQ.data?.samples ?? [];
+  const last = samples.length ? samples[samples.length - 1] : undefined;
+  const cpuPct = last?.cpuPercent ?? 0;
+  const memUsed = last?.memUsageBytes ?? 0;
+  const memCap = last?.memLimitBytes && last.memLimitBytes > 0 ? last.memLimitBytes : detail.memoryMb * 1024 * 1024;
+  const memPct = memCap > 0 ? (memUsed / memCap) * 100 : 0;
+
+  // Storage gauge from the sum of disk capacities (used/free are not reported per
+  // disk, so we show provisioned capacity as the gauge total — honest and useful).
+  const storageBytes = disks.reduce((s, d) => s + d.capacityGb * 1024 ** 3, 0);
+  // Best-effort "used": qcow2 thin disks rarely report usage here, so we present
+  // total provisioned capacity as the gauge value (100% provisioned) when unknown.
+  const storagePct = storageBytes > 0 ? 100 : 0;
 
   const diskColumns: Column<VMDisk>[] = [
     { key: "label", header: "Disk", cell: (d) => <span className="mono text-xs">{d.label || d.id}</span> },
@@ -334,69 +299,142 @@ function VMOverview({
       : []),
   ];
 
+  const networks = Array.from(new Set(nics.map((n) => n.networkId).filter(Boolean))) as string[];
+  const storageIds = Array.from(new Set(disks.map((d) => d.storageId).filter(Boolean))) as string[];
+
   return (
     <div className="col" style={{ gap: "var(--sp-5)" }}>
+      {/* Console vignette — a "Launch console" card linking to the Console tab. */}
+      <button
+        className="console-vignette"
+        disabled={!consoleAllowed}
+        onClick={onLaunchConsole}
+        title={consoleAllowed ? "Open the graphical console" : "Console not available for this VM"}
+      >
+        <span className="cv-screen"><IconConsole size={24} /></span>
+        <span className="cv-main">
+          <span className="cv-title">{consoleAllowed ? "Launch console" : "Console unavailable"}</span>
+          <span className="cv-sub">
+            {consoleAllowed
+              ? `Graphical console · ${detail.name}`
+              : "This hypervisor does not expose a console for this guest."}
+          </span>
+        </span>
+      </button>
+
+      {/* Top row: General + Resource gauges */}
+      <div className="summary-grid">
+        <div className="card">
+          <div className="card-header">
+            <span className="card-title">General</span>
+            <VMStateBadge state={detail.state} raw={detail.stateRaw} />
+          </div>
+          <div className="card-body">
+            <dl className="dl">
+              <dt>Name</dt>
+              <dd>{detail.name}</dd>
+              <dt>ID</dt>
+              <dd className="mono">{shortId(detail.id, 24)}</dd>
+              <dt>Guest OS</dt>
+              <dd>{detail.guestOs || "—"}</dd>
+              <dt>Host</dt>
+              <dd className="mono">{detail.hostId || "—"}</dd>
+              <dt>Cluster</dt>
+              <dd>{detail.clusterId ? <span className="chip">{detail.clusterId}</span> : "—"}</dd>
+              <dt>IP addresses</dt>
+              <dd>
+                {detail.ipAddresses && detail.ipAddresses.length ? (
+                  <span className="row-wrap" style={{ gap: 4 }}>
+                    {detail.ipAddresses.map((ip) => (
+                      <span key={ip} className="chip chip-mono text-xs">{ip}</span>
+                    ))}
+                  </span>
+                ) : (
+                  <span className="muted">—</span>
+                )}
+              </dd>
+              <dt>Created</dt>
+              <dd>
+                {detail.createdAt ? (
+                  <>
+                    {formatDateTime(detail.createdAt)} <span className="text-xs muted">({timeAgo(detail.createdAt)})</span>
+                  </>
+                ) : (
+                  "—"
+                )}
+              </dd>
+            </dl>
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="card-header">
+            <span className="card-title">Resources</span>
+            <span className="text-xs muted">latest</span>
+          </div>
+          <div className="card-body">
+            <div className="gauge-stack">
+              <ResourceGauge
+                label="CPU"
+                icon={<IconCpu size={15} />}
+                percent={cpuPct}
+                usedLabel={`${cpuPct.toFixed(0)}% used`}
+                capacityLabel={`${detail.vcpus} vCPU`}
+                baseColor="var(--accent)"
+              />
+              <ResourceGauge
+                label="Memory"
+                icon={<IconMemory size={15} />}
+                percent={memPct}
+                usedLabel={`${formatBytes(memUsed, 0)} used`}
+                capacityLabel={`${formatBytes(memCap, 0)} total`}
+                baseColor="var(--success)"
+              />
+              <ResourceGauge
+                label="Storage"
+                icon={<IconDisk size={15} />}
+                percent={storagePct}
+                usedLabel={`${disks.length} disk${disks.length === 1 ? "" : "s"}`}
+                capacityLabel={`${formatBytes(storageBytes, 0)} provisioned`}
+                baseColor="var(--accent)"
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* VM Hardware */}
       <div className="card">
         <div className="card-header">
-          <span className="card-title">Hardware</span>
+          <span className="card-title">VM Hardware</span>
           <span className="text-xs muted">{detail.kind}</span>
         </div>
         <div className="card-body">
           <dl className="dl">
-            <dt>State</dt>
-            <dd>
-              <VMStateBadge state={detail.state} raw={detail.stateRaw} />
-              {detail.stateRaw ? <span className="text-xs muted" style={{ marginLeft: 8 }}>{detail.stateRaw}</span> : null}
-            </dd>
-            <dt>ID</dt>
-            <dd className="mono">{detail.id}</dd>
-            <dt>vCPUs</dt>
-            <dd className="mono">{detail.vcpus}</dd>
-            <dt>Memory</dt>
+            <dt><span className="row" style={{ gap: 6 }}><IconCpu size={14} /> CPU</span></dt>
+            <dd className="mono">{detail.vcpus} vCPU</dd>
+            <dt><span className="row" style={{ gap: 6 }}><IconMemory size={14} /> Memory</span></dt>
             <dd className="mono">{formatBytes(detail.memoryMb * 1024 * 1024, 0)}</dd>
-            <dt>Guest OS</dt>
-            <dd>{detail.guestOs || "—"}</dd>
+            <dt><span className="row" style={{ gap: 6 }}><IconDisk size={14} /> Hard disks</span></dt>
+            <dd>{disks.length}{storageBytes > 0 ? <span className="text-xs muted"> · {formatBytes(storageBytes, 0)}</span> : null}</dd>
+            <dt><span className="row" style={{ gap: 6 }}><IconNic size={14} /> Network adapters</span></dt>
+            <dd>{nics.length}</dd>
+            <dt><span className="row" style={{ gap: 6 }}><IconDisc size={14} /> CD/DVD</span></dt>
+            <dd className="muted text-sm">Virtual drive (mount via Actions ▸ Storage)</dd>
             <dt>Firmware</dt>
             <dd>{detail.firmware || "—"}</dd>
-            <dt>Provider</dt>
-            <dd className="mono">{detail.providerId}</dd>
-            <dt>Host</dt>
-            <dd className="mono">{detail.hostId || "—"}</dd>
-            <dt>Cluster</dt>
-            <dd>{detail.clusterId ? <span className="chip">{detail.clusterId}</span> : "—"}</dd>
-            {detail.ipAddresses && detail.ipAddresses.length ? (
-              <>
-                <dt>IP addresses</dt>
-                <dd>
-                  <span className="row-wrap" style={{ gap: 4 }}>
-                    {detail.ipAddresses.map((ip) => (
-                      <span key={ip} className="chip chip-mono text-xs">
-                        {ip}
-                      </span>
-                    ))}
-                  </span>
-                </dd>
-              </>
-            ) : null}
+            <dt>Guest OS</dt>
+            <dd>{detail.guestOs || "—"}</dd>
             <dt>Snapshots</dt>
             <dd className="mono">{detail.snapshotCount}</dd>
-            <dt>Created</dt>
-            <dd>
-              {detail.createdAt ? (
-                <>
-                  {formatDateTime(detail.createdAt)} <span className="text-xs muted">({timeAgo(detail.createdAt)})</span>
-                </>
-              ) : (
-                "—"
-              )}
-            </dd>
           </dl>
         </div>
       </div>
 
+      {/* Hard disks table */}
       <div className="card">
         <div className="card-header">
-          <span className="card-title">Disks</span>
+          <span className="card-title">Hard disks</span>
           <span className="text-xs muted">{disks.length}</span>
         </div>
         <div className="card-body" style={{ padding: 0 }}>
@@ -404,15 +442,16 @@ function VMOverview({
             columns={diskColumns}
             rows={disks}
             rowKey={(d) => d.id}
-            emptyIcon={<IconVM size={32} />}
+            emptyIcon={<IconDisk size={32} />}
             emptyTitle="No disks reported"
           />
         </div>
       </div>
 
+      {/* Network adapters table */}
       <div className="card">
         <div className="card-header">
-          <span className="card-title">Network interfaces</span>
+          <span className="card-title">Network adapters</span>
           <span className="text-xs muted">{nics.length}</span>
         </div>
         <div className="card-body" style={{ padding: 0 }}>
@@ -420,12 +459,48 @@ function VMOverview({
             columns={nicColumns}
             rows={nics}
             rowKey={(n) => n.id}
-            emptyIcon={<IconVM size={32} />}
+            emptyIcon={<IconNic size={32} />}
             emptyTitle="No network interfaces reported"
           />
         </div>
       </div>
 
+      {/* Related Objects */}
+      <div className="card">
+        <div className="card-header">
+          <span className="card-title">Related Objects</span>
+        </div>
+        <div className="card-body">
+          <dl className="dl">
+            <dt><span className="row" style={{ gap: 6 }}><IconShield size={14} /> Provider</span></dt>
+            <dd className="mono">{detail.providerId}</dd>
+            <dt><span className="row" style={{ gap: 6 }}><IconHosts size={14} /> Host</span></dt>
+            <dd className="mono">{detail.hostId || "—"}</dd>
+            <dt><span className="row" style={{ gap: 6 }}><IconNetworks size={14} /> Networks</span></dt>
+            <dd>
+              {networks.length ? (
+                <span className="row-wrap" style={{ gap: 4 }}>
+                  {networks.map((nw) => <span key={nw} className="chip">{nw}</span>)}
+                </span>
+              ) : (
+                <span className="muted">—</span>
+              )}
+            </dd>
+            <dt><span className="row" style={{ gap: 6 }}><IconDisk size={14} /> Storage</span></dt>
+            <dd>
+              {storageIds.length ? (
+                <span className="row-wrap" style={{ gap: 4 }}>
+                  {storageIds.map((st) => <span key={st} className="chip chip-mono text-xs">{st}</span>)}
+                </span>
+              ) : (
+                <span className="muted">—</span>
+              )}
+            </dd>
+          </dl>
+        </div>
+      </div>
+
+      {/* Labels */}
       <div className="card">
         <div className="card-header">
           <span className="card-title">Labels</span>
@@ -438,9 +513,7 @@ function VMOverview({
             <div className="col" style={{ gap: "var(--sp-1)" }}>
               {labels.map(([k, v]) => (
                 <div key={k} className="row" style={{ gap: "var(--sp-2)", alignItems: "baseline" }}>
-                  <span className="mono text-xs" style={{ color: "var(--text-link)" }}>
-                    {k}
-                  </span>
+                  <span className="mono text-xs" style={{ color: "var(--text-link)" }}>{k}</span>
                   <span className="mono text-xs muted">=</span>
                   <span className="mono text-xs secondary truncate">{v}</span>
                 </div>
