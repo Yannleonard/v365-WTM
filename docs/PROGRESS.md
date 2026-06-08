@@ -29,6 +29,21 @@
 - ✅ Live verified: capabilities console/network_write/storage_write exposed; real storage
   pool listed; real network created via API (confirmed in libvirt).
 
+### Real browser validation (Playwright headless Chromium) — 100% green, effects verified in libvirt
+- NO MOCK in production: demo/sim registration deleted from main.go; sim only in CI tests.
+  /vm/providers empty until a real connection is added; VM list shows only real domains.
+- Integrated interactive console (guacd + guacamole-common-js): Console tab renders a live
+  VNC canvas ('Connected'). 12/12 view checks green.
+- Full action suite 10/10 via real browser clicks, 0 API errors, each confirmed in libvirt:
+  power stop/start; snapshot on diskless -> 422 surfaced (no fake success); reconfigure;
+  clone (e2e-clone); network create (e2e-fnet); volume create (e2e-fvol); Create VM wizard
+  (e2e-wizvm WITH a real disk).
+- Root-cause backend fixes: error-swallowing write seam -> errors now propagate; ReconfigureVM
+  was a no-op on live -> now real DomainSetVcpus/Memory; size-only disks were dropped ->
+  defineDomain auto-provisions a qcow2 volume; NAT-without-CIDR -> default subnet; dup -> 409.
+- Regression: 16 Go packages green, 26 UI vitest green, linux+windows build.
+- Runnable proof: test/e2e/*.spec.mjs.
+
 ### Phase 6 — DONE
 - ✅ deploy/docker-compose.unihv.yml: app + PostgreSQL 15 + Redis 7, one command, all healthy
 - ✅ Hardening fix (D-006): non-root user + group_add reconciles entrypoint with no-new-privileges + cap_drop ALL
