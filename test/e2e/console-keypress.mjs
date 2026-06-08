@@ -1,0 +1,24 @@
+import { chromium } from 'playwright';
+const BASE='http://host.docker.internal:8080';
+const VM=process.argv[2]||'Alpine';
+const b=await chromium.launch({args:['--no-sandbox']});
+const page=await (await b.newContext({viewport:{width:1400,height:900}})).newPage();
+const goto=async p=>{await page.goto(BASE+p,{waitUntil:'domcontentloaded',timeout:25000});await page.waitForTimeout(1800);};
+await goto('/login'); await page.waitForSelector('input#username');
+await page.fill('input#username','admin'); await page.fill('input#password','Admin1234567');
+await page.locator('button[type="submit"]').first().click(); await page.waitForTimeout(2000);
+await goto('/vms');
+await page.locator('text='+VM).first().click().catch(()=>{}); await page.waitForTimeout(1500);
+await page.locator('button:has-text("Console"),[role="tab"]:has-text("Console")').first().click().catch(()=>{});
+await page.waitForTimeout(6000);
+// click into the canvas + send Enter to force a screen refresh (login prompt redraw)
+const canvas = page.locator('canvas').last();
+await canvas.click().catch(()=>{});
+await page.waitForTimeout(500);
+await page.keyboard.press('Enter');
+await page.waitForTimeout(2000);
+await page.keyboard.press('Enter');
+await page.waitForTimeout(3000);
+await page.screenshot({path:`/work/test/e2e/shots/console-keypress-${VM}.png`, fullPage:false});
+console.log(VM, 'done; canvas count', await page.locator('canvas').count());
+await b.close(); process.exit(0);

@@ -616,27 +616,36 @@ func (p *Provider) StreamEvents(ctx context.Context) (<-chan vp.Event, error) {
 	if !p.caps.Has(vp.CapEvents) {
 		return nil, vp.ErrUnsupported
 	}
-	ch := make(chan vp.Event)
+	// REAL content only: emit one truthful vm.state event per VM reflecting its
+	// CURRENT state, then close. No fabricated heartbeat content. (xen is a
+	// non-live model provider; a snapshot of real inventory state is the honest
+	// event surface — when wired to live XAPI this becomes the real
+	// event.next/event.from subscription.)
+	ch := make(chan vp.Event, 8)
 	go func() {
 		defer close(ch)
-		// Stands in for a long-poll loop over XAPI event.next / event.from.
-		ticker := time.NewTicker(20 * time.Millisecond)
-		defer ticker.Stop()
-		for i := 0; ; i++ {
+		now := time.Now().UTC()
+		vms := p.backend.listVMs()
+		if len(vms) == 0 {
 			select {
+			case ch <- vp.Event{Kind: vp.EventAlert, ProviderID: p.id,
+				Message: "event stream established (no VMs)", Timestamp: now}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		for _, raw := range vms {
+			v := p.normalizeVM(raw)
+			select {
+			case ch <- vp.Event{
+				Kind:       vp.EventVMStateChanged,
+				ProviderID: p.id,
+				EntityID:   v.ID,
+				Message:    fmt.Sprintf("%s is %s", v.Name, v.State),
+				Timestamp:  now,
+			}:
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				select {
-				case ch <- vp.Event{
-					Kind:       vp.EventAlert,
-					ProviderID: p.id,
-					Message:    fmt.Sprintf("xapi event heartbeat %d", i),
-					Timestamp:  time.Now().UTC(),
-				}:
-				case <-ctx.Done():
-					return
-				}
 			}
 		}
 	}()

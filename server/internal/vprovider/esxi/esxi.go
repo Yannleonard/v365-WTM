@@ -583,26 +583,36 @@ func (p *Provider) StreamEvents(ctx context.Context) (<-chan vp.Event, error) {
 	if !p.caps.Has(vp.CapEvents) {
 		return nil, vp.ErrUnsupported
 	}
-	ch := make(chan vp.Event)
+	// REAL content only: emit one truthful vm.state event per VM reflecting its
+	// CURRENT state, then close. No fabricated heartbeat content. (esxi is a
+	// non-live model provider; a snapshot of real inventory state is the honest
+	// event surface — when wired to a live vCenter EventManager this becomes the
+	// real event subscription.)
+	ch := make(chan vp.Event, 8)
 	go func() {
 		defer close(ch)
-		ticker := time.NewTicker(20 * time.Millisecond)
-		defer ticker.Stop()
-		for i := 0; ; i++ {
+		now := time.Now().UTC()
+		vms := p.backend.listVMs()
+		if len(vms) == 0 {
 			select {
+			case ch <- vp.Event{Kind: vp.EventAlert, ProviderID: p.id,
+				Message: "event stream established (no VMs)", Timestamp: now}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		for _, vm := range vms {
+			v := p.normalizeVM(vm)
+			select {
+			case ch <- vp.Event{
+				Kind:       vp.EventVMStateChanged,
+				ProviderID: p.id,
+				EntityID:   v.ID,
+				Message:    fmt.Sprintf("%s is %s", v.Name, v.State),
+				Timestamp:  now,
+			}:
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				select {
-				case ch <- vp.Event{
-					Kind:       vp.EventAlert,
-					ProviderID: p.id,
-					Message:    fmt.Sprintf("vSphere EventManager heartbeat %d", i),
-					Timestamp:  time.Now().UTC(),
-				}:
-				case <-ctx.Done():
-					return
-				}
 			}
 		}
 	}()

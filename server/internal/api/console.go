@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"io"
+	"log"
 	"strconv"
 	"strings"
 
@@ -74,6 +75,7 @@ func (s *Server) VMConsoleWS(w http.ResponseWriter, r *http.Request) {
 	// Dial guacd + handshake BEFORE upgrading, so a failure is a clean HTTP error.
 	gconn, err := guac.Dial(s.cfg.GuacdAddr, params)
 	if err != nil {
+		log.Printf("console: guacd dial failed for vm=%s (%s %s:%d): %v", chi.URLParam(r, "vmID"), params.Protocol, params.Hostname, params.Port, err)
 		authz.WriteError(w, r, authz.Errorf(authz.ErrInternal, "console backend unavailable: "+err.Error()))
 		return
 	}

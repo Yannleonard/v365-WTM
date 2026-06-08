@@ -36,12 +36,21 @@ type Phase = "connecting" | "connected" | "disconnected" | "error";
 
 // Build the same-origin websocket URL (mirrors Terminal.tsx's ws:// vs wss://
 // selection from location). The session cookie is sent automatically.
-function buildWsUrl(pid: string, vmId: string, w: number, h: number): string {
+// buildWsUrl returns the tunnel base URL WITHOUT a query string. guacamole-common-js
+// appends "?<connectString>" itself, so the w/h/dpi params are passed via
+// client.connect(buildConnectString(...)) — putting them here too would produce a
+// double "?" and a broken socket.
+function buildWsUrl(pid: string, vmId: string): string {
   const proto = window.location.protocol === "https:" ? "wss" : "ws";
   return (
     `${proto}://${window.location.host}/api/v1/vm/providers/${encodeURIComponent(pid)}` +
-    `/vms/${encodeURIComponent(vmId)}/console/ws?w=${w}&h=${h}&dpi=96`
+    `/vms/${encodeURIComponent(vmId)}/console/ws`
   );
+}
+
+// buildConnectString is the query guacamole appends after "?": "w=..&h=..&dpi=96".
+function buildConnectString(w: number, h: number): string {
+  return `w=${w}&h=${h}&dpi=96`;
 }
 
 export function ConsolePanel({ pid, vmId }: Props) {
@@ -74,7 +83,7 @@ export function ConsolePanel({ pid, vmId }: Props) {
     const w = Math.max(640, Math.round(rect.width) || 1024);
     const h = Math.max(480, Math.round(rect.height) || 768);
 
-    const tunnel = new Guacamole.WebSocketTunnel(buildWsUrl(pid, vmId, w, h));
+    const tunnel = new Guacamole.WebSocketTunnel(buildWsUrl(pid, vmId));
     const client = new Guacamole.Client(tunnel);
     clientRef.current = client;
 
@@ -155,7 +164,12 @@ export function ConsolePanel({ pid, vmId }: Props) {
     window.addEventListener("resize", onWindowResize);
 
     try {
-      client.connect();
+      // guacamole-common-js builds the tunnel URL as `<tunnelURL>?<connectString>`.
+      // Calling connect() with no arg appended the literal "?undefined" to the URL,
+      // producing ".../console/ws?w=..&dpi=96?undefined" — the socket closed at once
+      // and the UI hung on "Opening interactive console". We now pass the params via
+      // the connect string so the URL is exactly ".../console/ws?w=..&h=..&dpi=96".
+      client.connect(buildConnectString(w, h));
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed to open console socket");
       setPhase("error");

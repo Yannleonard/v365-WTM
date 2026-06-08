@@ -792,14 +792,46 @@ func (p *Provider) NodeState(ctx context.Context, nodeID string) (*vp.NodeState,
 
 // --- observability ---
 
+// metricsBackend is the OPTIONAL seam a libvirtBackend may satisfy to serve REAL
+// per-domain / per-host metrics. The live libvirt backend implements it (real
+// DomainGetInfo CPU-time sampling, DomainMemoryStats, DomainInterfaceStats,
+// DomainBlockStats — see live_libvirt.go). The in-memory simBackend does NOT
+// implement it; GetMetrics then uses the deterministic test fixture below, which
+// honours power state (a shut-off domain yields ZERO samples). No fabricated
+// numbers ever reach a LIVE provider's metrics.
+type metricsBackend interface {
+	// metrics returns the real metric series for entityID (a domain UUID or a
+	// host/node id). A NOT-running domain MUST return a series with no samples (or
+	// all-zero samples) — never fabricated values. ok=false means the entity is not
+	// known to this backend (-> ErrNotFound at the Provider boundary).
+	metrics(entityID string, window vp.MetricWindow) (series *vp.MetricSeries, ok bool)
+}
+
 func (p *Provider) GetMetrics(ctx context.Context, entityID string, window vp.MetricWindow) (*vp.MetricSeries, error) {
 	if !p.caps.Has(vp.CapMetrics) {
 		return nil, vp.ErrUnsupported
 	}
-	_, domOK := p.backend.getDomain(entityID)
+	// LIVE path: the real libvirt backend serves REAL libvirt-sourced metrics and,
+	// crucially, ZERO for a powered-off domain. This is the production path.
+	if mb, ok := p.backend.(metricsBackend); ok {
+		series, found := mb.metrics(entityID, window)
+		if !found {
+			return nil, vp.ErrNotFound
+		}
+		return series, nil
+	}
+	// SIM/TEST path: deterministic fixture (NOT production). Still honours power
+	// state — a shut-off domain returns an EMPTY series so tests exercise the same
+	// "stopped == zero" contract the live backend enforces.
+	dom, domOK := p.backend.getDomain(entityID)
 	_, nodeOK := p.backend.getNode(entityID)
 	if !domOK && !nodeOK {
 		return nil, vp.ErrNotFound
+	}
+	series := &vp.MetricSeries{EntityID: entityID}
+	if domOK && normalizeState(dom.State) != vp.StateRunning {
+		// Stopped/paused/etc: no fabricated load. Empty series (zero samples).
+		return series, nil
 	}
 	base := window.Since
 	if base.IsZero() {
@@ -809,13 +841,21 @@ func (p *Provider) GetMetrics(ctx context.Context, entityID string, window vp.Me
 	if step <= 0 {
 		step = 30
 	}
-	series := &vp.MetricSeries{EntityID: entityID}
+	// Deterministic TEST FIXTURE values (sim backend only). These are intentionally
+	// fixed so the conformance suite is reproducible; they NEVER run for a live
+	// provider (which takes the metricsBackend path above). For a domain, reflect
+	// the domain's REAL configured memory limit so even the fixture is internally
+	// consistent with the modeled VM.
+	memLimit := uint64(4) << 30
+	if domOK {
+		memLimit = uint64(dom.MemoryKB) * 1024
+	}
 	for i := 0; i < 5; i++ {
 		series.Samples = append(series.Samples, vp.MetricSample{
 			Timestamp:      base.Add(time.Duration(i*step) * time.Second),
 			CPUPercent:     float64(8 + i*7),
 			MemUsageBytes:  uint64(1<<30) + uint64(i)<<20,
-			MemLimitBytes:  4 << 30,
+			MemLimitBytes:  memLimit,
 			NetRxBytes:     uint64(i) * 1500,
 			NetTxBytes:     uint64(i) * 1100,
 			DiskReadBytes:  uint64(i) * 4096,
@@ -829,30 +869,59 @@ func (p *Provider) StreamEvents(ctx context.Context) (<-chan vp.Event, error) {
 	if !p.caps.Has(vp.CapEvents) {
 		return nil, vp.ErrUnsupported
 	}
-	ch := make(chan vp.Event)
-	go func() {
-		defer close(ch)
-		ticker := time.NewTicker(20 * time.Millisecond)
-		defer ticker.Stop()
-		for i := 0; ; i++ {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				select {
-				case ch <- vp.Event{
-					Kind:       vp.EventAlert,
-					ProviderID: p.id,
-					Message:    fmt.Sprintf("libvirt lifecycle heartbeat %d", i),
-					Timestamp:  time.Now().UTC(),
-				}:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}
-	}()
+	// REAL events only. The live backend (eventBackend) emits libvirt-sourced
+	// lifecycle events (real domain state, observed via polling DomainGetState);
+	// the sim backend emits a single truthful snapshot of current domain states.
+	// NO fabricated heartbeat content is ever produced.
+	ch := make(chan vp.Event, 8)
+	if eb, ok := p.backend.(eventBackend); ok {
+		go eb.streamEvents(ctx, p.id, ch)
+		return ch, nil
+	}
+	go p.streamSnapshotEvents(ctx, ch)
 	return ch, nil
+}
+
+// streamSnapshotEvents emits ONE truthful event per known domain describing its
+// CURRENT real state (vm.state), then closes. This is a real fact about the
+// modeled inventory — not a fabricated heartbeat. Used by the sim/non-live
+// backend so StreamEvents still surfaces genuine inventory state.
+func (p *Provider) streamSnapshotEvents(ctx context.Context, ch chan<- vp.Event) {
+	defer close(ch)
+	now := time.Now().UTC()
+	doms := p.backend.listDomains()
+	if len(doms) == 0 {
+		// Nothing to report: emit a single truthful connection event so consumers
+		// know the stream is live (no synthetic load/metric content).
+		select {
+		case ch <- vp.Event{Kind: vp.EventAlert, ProviderID: p.id,
+			Message: "event stream established (no domains)", Timestamp: now}:
+		case <-ctx.Done():
+		}
+		return
+	}
+	for _, d := range doms {
+		v := p.normalizeDomain(d)
+		select {
+		case ch <- vp.Event{
+			Kind:       vp.EventVMStateChanged,
+			ProviderID: p.id,
+			EntityID:   v.ID,
+			Message:    fmt.Sprintf("%s is %s", v.Name, v.State),
+			Timestamp:  now,
+		}:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// eventBackend is the OPTIONAL seam a libvirtBackend may satisfy to stream REAL
+// libvirt lifecycle events. The live backend implements it (polling real
+// DomainGetState transitions); the sim backend does not (it uses the snapshot
+// emitter above).
+type eventBackend interface {
+	streamEvents(ctx context.Context, providerID string, out chan<- vp.Event)
 }
 
 // --- helpers ---

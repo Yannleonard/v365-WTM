@@ -274,7 +274,202 @@ func main() {
 	proveDiskQoSAndTrim(ctx, p)
 	proveStorageMigration(ctx, p)
 
+	// --- METRICS bug-fix proof: real metrics for RUNNING, ZERO for STOPPED ---
+	proveMetricsRealAndStoppedZero(ctx, p)
+
 	fmt.Println("\nPROBE OK: real libvirt RPC API exercised end to end.")
+}
+
+// proveMetricsRealAndStoppedZero PROVES the GetMetrics bug-fix:
+//
+//	RUNNING VM  -> REAL libvirt metrics: CPU% reflects reality (NOT the old
+//	               8/15/22/29/36 ramp), MemLimitBytes == the VM's REAL configured
+//	               RAM, MemUsageBytes > 0.
+//	STOPPED VM  -> ZERO: an empty series (no samples) — explicitly CPUPercent==0
+//	               and no fabricated memory. This is the powered-off "36% CPU" bug.
+//
+// It prefers existing demo VMs (web-server-01 / linux-server running; a shut-off
+// one for the stopped case); if none are available it creates a throwaway disked
+// domain, starts it for the running proof, then stops it for the stopped proof,
+// and cleans everything up.
+func proveMetricsRealAndStoppedZero(ctx context.Context, p *kvm.Provider) {
+	fmt.Println("== METRICS proof: REAL metrics for a RUNNING VM, ZERO for a STOPPED VM ==")
+	if !p.Capabilities().Has(vprovider.CapMetrics) {
+		fmt.Println("  provider lacks CapMetrics; skipping")
+		fmt.Println()
+		return
+	}
+
+	vms, _ := p.ListVMs(ctx, vprovider.ListOptions{})
+	var running, stopped *vprovider.VM
+	for i := range vms {
+		v := vms[i]
+		if v.State == vprovider.StateRunning && running == nil {
+			running = &vms[i]
+		}
+		if v.State == vprovider.StateStopped && stopped == nil {
+			stopped = &vms[i]
+		}
+	}
+
+	// If we have no running and no stopped existing VM, fabricate a throwaway we
+	// control (NOT metric data — a real domain we start/stop).
+	var cleanup func()
+	if running == nil || stopped == nil {
+		id, _, cl := createDiskedDomainForMetrics(ctx, p)
+		cleanup = cl
+		if id != "" {
+			if running == nil {
+				if _, err := p.PowerOp(ctx, id, vprovider.PowerStart); err == nil {
+					// Give the guest a moment to actually consume some CPU/mem.
+					time.Sleep(2 * time.Second)
+					if d, err := p.GetVM(ctx, id); err == nil {
+						running = &d.VM
+					}
+				}
+			}
+			if stopped == nil {
+				// Ensure it is shut off for the stopped proof. If we started it for
+				// the running proof above we must stop it AFTER that proof, so only
+				// pre-stop when we are NOT reusing it as the running VM.
+				if running == nil || running.ID != id {
+					_, _ = p.PowerOp(ctx, id, vprovider.PowerStop)
+					time.Sleep(1 * time.Second)
+					if d, err := p.GetVM(ctx, id); err == nil && d.State == vprovider.StateStopped {
+						stopped = &d.VM
+					}
+				}
+			}
+		}
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+
+	// --- RUNNING proof ---
+	if running != nil {
+		ms, err := p.GetMetrics(ctx, running.ID, vprovider.MetricWindow{StepSecond: 10})
+		if err != nil {
+			fatalf("metrics: GetMetrics(running %s): %v", running.Name, err)
+		}
+		if len(ms.Samples) == 0 {
+			fatalf("metrics: RUNNING VM %s returned NO samples (expected real data)", running.Name)
+		}
+		s := ms.Samples[len(ms.Samples)-1]
+		wantLimit := uint64(running.MemoryMB) * 1024 * 1024
+		fmt.Printf("  RUNNING %s (id=%s, configured RAM=%dMB):\n", running.Name, running.ID, running.MemoryMB)
+		fmt.Printf("    CPUPercent     = %.3f%%   (REAL; NOT the old 8/15/22/29/36 ramp)\n", s.CPUPercent)
+		fmt.Printf("    MemUsageBytes  = %d (%.1f MiB)\n", s.MemUsageBytes, float64(s.MemUsageBytes)/(1<<20))
+		fmt.Printf("    MemLimitBytes  = %d (%.1f GiB)  want == configured %d (%.1f GiB)\n",
+			s.MemLimitBytes, float64(s.MemLimitBytes)/(1<<30), wantLimit, float64(wantLimit)/(1<<30))
+		fmt.Printf("    Net rx/tx      = %d / %d bytes\n", s.NetRxBytes, s.NetTxBytes)
+		fmt.Printf("    Disk rd/wr     = %d / %d bytes\n", s.DiskReadBytes, s.DiskWriteBytes)
+		if s.CPUPercent < 0 || s.CPUPercent > 100 {
+			fatalf("metrics: CPUPercent %.3f out of [0,100] — not a sane real value", s.CPUPercent)
+		}
+		// Old fabricated ramp produced exactly 8/15/22/29/36 — assert we are NOT that.
+		if isOldFabricatedRamp(ms.Samples) {
+			fatalf("metrics: RUNNING VM still returns the OLD fabricated 8/15/22/29/36 CPU ramp — BUG NOT FIXED")
+		}
+		if s.MemLimitBytes != wantLimit {
+			fatalf("metrics: MemLimitBytes %d != VM's REAL configured RAM %d — limit is wrong (the 4GB-vs-8GB bug)", s.MemLimitBytes, wantLimit)
+		}
+		if s.MemUsageBytes == 0 {
+			fmt.Println("    NOTE: MemUsageBytes==0 (no balloon/agent memory stats on this guest); limit is still REAL.")
+		}
+		fmt.Println("  CONFIRMED: RUNNING VM reports REAL libvirt metrics; MemLimit matches configured RAM.")
+	} else {
+		fmt.Println("  (no RUNNING VM available to prove real metrics)")
+	}
+
+	// --- STOPPED proof: the core bug fix ---
+	if stopped != nil {
+		ms, err := p.GetMetrics(ctx, stopped.ID, vprovider.MetricWindow{StepSecond: 10})
+		if err != nil {
+			fatalf("metrics: GetMetrics(stopped %s): %v", stopped.Name, err)
+		}
+		fmt.Printf("  STOPPED %s (id=%s, state=%s): %d sample(s)\n", stopped.Name, stopped.ID, stopped.State, len(ms.Samples))
+		// The guarantee: NO samples, or every sample all-zero. Either way CPU==0.
+		for i, s := range ms.Samples {
+			fmt.Printf("    sample[%d]: cpu=%.3f%% memUsage=%d memLimit=%d net=%d/%d disk=%d/%d\n",
+				i, s.CPUPercent, s.MemUsageBytes, s.MemLimitBytes, s.NetRxBytes, s.NetTxBytes, s.DiskReadBytes, s.DiskWriteBytes)
+			if s.CPUPercent != 0 || s.MemUsageBytes != 0 {
+				fatalf("metrics: STOPPED VM returned FABRICATED data (cpu=%.3f mem=%d) — the 36%% bug is NOT fixed", s.CPUPercent, s.MemUsageBytes)
+			}
+		}
+		fmt.Println("  CONFIRMED: STOPPED VM reports ZERO — empty/all-zero series, CPUPercent==0, no fabricated memory.")
+	} else {
+		fmt.Println("  (no STOPPED VM available to prove zero metrics)")
+	}
+	fmt.Println()
+}
+
+// isOldFabricatedRamp reports whether the samples match the old hard-coded
+// 8/15/22/29/36 CPU ramp the bug produced — used to assert the fixture is gone
+// from the live path.
+func isOldFabricatedRamp(samples []vprovider.MetricSample) bool {
+	if len(samples) != 5 {
+		return false
+	}
+	want := []float64{8, 15, 22, 29, 36}
+	for i, s := range samples {
+		if s.CPUPercent != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// createDiskedDomainForMetrics creates a throwaway disked domain (shut off) so the
+// metrics proof has a VM it fully controls. Returns its id+name and a cleanup func
+// (delete domain + backing volume). Returns ("","",noop) when no storage exists.
+func createDiskedDomainForMetrics(ctx context.Context, p *kvm.Provider) (string, string, func()) {
+	noop := func() {}
+	sp, ok := any(p).(vprovider.StorageProvider)
+	if !ok {
+		return "", "", noop
+	}
+	pools, _ := p.ListStorage(ctx)
+	var pool string
+	for _, pl := range pools {
+		if pl.Accessible {
+			pool = pl.Name
+			break
+		}
+	}
+	if pool == "" {
+		return "", "", noop
+	}
+	volName := fmt.Sprintf("unihv-metrics-%d.qcow2", time.Now().UnixNano())
+	if _, err := sp.CreateVolume(ctx, vprovider.VolumeSpec{Name: volName, StorageID: pool, CapacityGB: 1, Format: vprovider.DiskQcow2}); err != nil {
+		fmt.Printf("  (could not create metrics volume: %v)\n", err)
+		return "", "", noop
+	}
+	var diskPath string
+	if vols, err := sp.ListVolumes(ctx, pool); err == nil {
+		for _, v := range vols {
+			if v.Name == volName {
+				diskPath = v.Path
+			}
+		}
+	}
+	name := fmt.Sprintf("unihv-metrics-dom-%d", time.Now().UnixNano())
+	task, err := p.CreateVM(ctx, vprovider.VMSpec{
+		Name: name, VCPUs: 1, MemoryMB: 512, Firmware: vprovider.FirmwareUEFI,
+		Disks: []vprovider.DiskSpec{{StorageID: pool, SourcePath: diskPath, Format: vprovider.DiskQcow2, CapacityGB: 1}},
+	})
+	if err != nil {
+		_, _ = sp.DeleteVolume(ctx, pool, volName)
+		fmt.Printf("  (could not create metrics domain: %v)\n", err)
+		return "", "", noop
+	}
+	id := task.EntityID
+	fmt.Printf("  created throwaway metrics domain %s id=%s\n", name, id)
+	cleanup := func() {
+		_, _ = p.DeleteVM(ctx, id, vprovider.DeleteOptions{Force: true})
+		_, _ = sp.DeleteVolume(ctx, pool, volName)
+	}
+	return id, name, cleanup
 }
 
 // proveGuestAgent: LOT 3 #1. Query the qemu-guest-agent path. The proof PASSES

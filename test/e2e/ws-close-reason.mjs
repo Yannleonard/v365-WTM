@@ -1,0 +1,22 @@
+import { chromium } from 'playwright';
+const BASE='http://host.docker.internal:8080';
+const b=await chromium.launch({args:['--no-sandbox']});
+const ctx=await b.newContext({viewport:{width:1400,height:900}});
+const page=await ctx.newPage();
+// Use CDP to get WS close code
+const cdp=await ctx.newCDPSession(page);
+await cdp.send('Network.enable');
+cdp.on('Network.webSocketClosed', e=>console.log('WS CLOSED reqId', e.requestId));
+cdp.on('Network.webSocketFrameError', e=>console.log('WS FRAME ERROR', JSON.stringify(e)));
+cdp.on('Network.webSocketHandshakeResponseReceived', e=>{ if(/console/.test(JSON.stringify(e.response.url||''))) console.log('WS HANDSHAKE status', e.response.status, e.response.statusText); });
+cdp.on('Network.webSocketCreated', e=>{ if(/console/.test(e.url)) console.log('WS CREATED', e.url); });
+page.on('response', r=>{ if(/console\/ws/.test(r.url())) console.log('HTTP RESP', r.status(), r.statusText(), r.url().slice(-60)); });
+const goto=async p=>{await page.goto(BASE+p,{waitUntil:'domcontentloaded',timeout:25000});await page.waitForTimeout(1600);};
+await goto('/login'); await page.waitForSelector('input#username');
+await page.fill('input#username','admin'); await page.fill('input#password','Admin1234567');
+await page.locator('button[type="submit"]').first().click(); await page.waitForTimeout(2000);
+await goto('/vms');
+await page.locator('text=Alpine').first().click().catch(()=>{}); await page.waitForTimeout(1500);
+await page.locator('button:has-text("Console"),[role="tab"]:has-text("Console")').first().click().catch(()=>{});
+await page.waitForTimeout(8000);
+await b.close(); process.exit(0);
