@@ -21,7 +21,7 @@ const failedReqs = [];
 page.on('response', r => { if (r.status() >= 400) failedReqs.push(`${r.status()} ${r.request().method()} ${r.url().replace(BASE, '')}`); });
 
 const shot = n => page.screenshot({ path: `${SHOTS}/${n}.png`, fullPage: true }).catch(() => {});
-const goto = p => page.goto(BASE + p, { waitUntil: 'networkidle', timeout: 20000 });
+const goto = p => page.goto(BASE + p, { waitUntil: 'domcontentloaded', timeout: 20000 });
 
 try {
   await goto('/login');

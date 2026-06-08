@@ -1,0 +1,12 @@
+import { chromium } from 'playwright';
+const b = await chromium.launch({args:['--no-sandbox']});
+const p = await (await b.newContext()).newPage();
+await p.goto('http://host.docker.internal:8080/login',{waitUntil: 'domcontentloaded',timeout:25000});
+await p.waitForTimeout(1500);
+const inputs = await p.$$eval('input', els=>els.map(e=>({type:e.type,name:e.name,ph:e.placeholder,id:e.id})));
+console.log('LOGIN INPUTS:', JSON.stringify(inputs));
+console.log('URL:', p.url());
+console.log('TITLE:', await p.title());
+const bodyLen = (await p.locator('body').innerText()).length;
+console.log('body text length:', bodyLen);
+await b.close(); process.exit(0);

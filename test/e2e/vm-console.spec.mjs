@@ -27,7 +27,7 @@ page.on('console', m => { if (m.type() === 'error') consoleErrors.push(m.text())
 page.on('pageerror', e => consoleErrors.push('pageerror: ' + e.message));
 
 async function shot(name) { try { await page.screenshot({ path: `${SHOTS}/${name}.png`, fullPage: true }); } catch {} }
-async function goto(path) { await page.goto(BASE + path, { waitUntil: 'networkidle', timeout: 20000 }); }
+async function goto(path) { await page.goto(BASE + path, { waitUntil: 'domcontentloaded', timeout: 20000 }); }
 
 try {
   // --- login ---

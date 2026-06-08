@@ -160,16 +160,17 @@ func (b *simBackend) listNets() []*libvirtNet {
 	return append([]*libvirtNet(nil), b.nets...)
 }
 
-func (b *simBackend) defineDomain(d *libvirtDomain) {
+func (b *simBackend) defineDomain(d *libvirtDomain) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if _, exists := b.domains[d.UUID]; !exists {
 		b.order = append(b.order, d.UUID)
 	}
 	b.domains[d.UUID] = d
+	return nil
 }
 
-func (b *simBackend) undefineDomain(uuid string) {
+func (b *simBackend) undefineDomain(uuid string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	delete(b.domains, uuid)
@@ -180,14 +181,35 @@ func (b *simBackend) undefineDomain(uuid string) {
 			break
 		}
 	}
+	return nil
 }
 
-func (b *simBackend) setDomainState(uuid string, s libvirtState) {
+func (b *simBackend) setDomainState(uuid string, s libvirtState) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if d, ok := b.domains[uuid]; ok {
 		d.State = s
 	}
+	return nil
+}
+
+// reconfigureDomain mutates the in-memory model's vCPU / memory (the sim has no
+// max-vcpu limit, so any positive value is accepted — the conformance suite only
+// exercises valid specs).
+func (b *simBackend) reconfigureDomain(uuid string, vcpus *int, memMB *int64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	d, ok := b.domains[uuid]
+	if !ok {
+		return vp.ErrNotFound
+	}
+	if vcpus != nil {
+		d.VCPUs = *vcpus
+	}
+	if memMB != nil {
+		d.MemoryKB = *memMB * 1024
+	}
+	return nil
 }
 
 func (b *simBackend) domainsOnHost(hostID string) int {
@@ -211,16 +233,17 @@ func (b *simBackend) listSnapshots(uuid string) []vp.Snapshot {
 	return out
 }
 
-func (b *simBackend) createSnapshot(uuid string, snap vp.Snapshot) {
+func (b *simBackend) createSnapshot(uuid string, snap vp.Snapshot) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for i := range b.snapshots[uuid] {
 		b.snapshots[uuid][i].IsCurrent = false
 	}
 	b.snapshots[uuid] = append(b.snapshots[uuid], snap)
+	return nil
 }
 
-func (b *simBackend) setCurrentSnapshot(uuid, snapID string) bool {
+func (b *simBackend) setCurrentSnapshot(uuid, snapID string) (bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	found := false
@@ -231,7 +254,7 @@ func (b *simBackend) setCurrentSnapshot(uuid, snapID string) bool {
 			found = true
 		}
 	}
-	return found
+	return found, nil
 }
 
 func (b *simBackend) hostIDs() []string {

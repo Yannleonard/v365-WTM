@@ -413,18 +413,44 @@ func (b *liveBackend) listNets() []*libvirtNet {
 // defineDomain defines (and optionally starts) a domain from a libvirtDomain. The
 // core builds the struct from a VMSpec; here we render it to libvirt domain XML and
 // call DomainDefineXML (persistent define) then DomainCreate (start) if requested.
-func (b *liveBackend) defineDomain(d *libvirtDomain) {
+func (b *liveBackend) defineDomain(d *libvirtDomain) error {
 	b.mu.RLock()
 	l := b.l
 	b.mu.RUnlock()
 	if l == nil {
-		return
+		return errNoConn
+	}
+	// Provision a backing volume for each disk that was requested by SIZE only (no
+	// explicit Source path). Without this, renderDomainXML drops the disk (it needs
+	// a source file) and the VM boots diskless — which then can't be snapshotted or
+	// booted. We create a qcow2 volume in the disk's pool (default "default") and
+	// point the disk at the real file path libvirt returns.
+	for i := range d.Disks {
+		dk := &d.Disks[i]
+		if dk.Source != "" || dk.CapBytes <= 0 {
+			continue
+		}
+		poolName := dk.Pool
+		if poolName == "" {
+			poolName = "default"
+		}
+		format := dk.Driver
+		if format == "" {
+			format = "qcow2"
+		}
+		volName := fmt.Sprintf("%s-%s.%s", sanitizeBridge(d.Name), dk.Target, format)
+		path, err := b.provisionVolume(poolName, volName, dk.CapBytes, format)
+		if err != nil {
+			return err
+		}
+		dk.Source = path
+		dk.Driver = format
 	}
 	xmlDesc := renderDomainXML(d)
 	dom, err := l.DomainDefineXML(xmlDesc)
 	if err != nil {
 		b.fail(err)
-		return
+		return mapLibvirtErr(err)
 	}
 	// Reflect the real libvirt-assigned UUID back into the model.
 	d.UUID = uuidString(dom.UUID)
@@ -434,14 +460,24 @@ func (b *liveBackend) defineDomain(d *libvirtDomain) {
 	if d.State == domRunning {
 		if err := l.DomainCreate(dom); err != nil {
 			b.fail(err)
+			// Roll back the persistent definition so a failed start leaves no orphan.
+			_ = l.DomainUndefineFlags(dom, libvirt.DomainUndefineNvram)
+			b.mu.Lock()
+			delete(b.domHandles, d.UUID)
+			b.mu.Unlock()
+			return mapLibvirtErr(err)
 		}
 	}
+	return nil
 }
 
-func (b *liveBackend) undefineDomain(uuid string) {
+func (b *liveBackend) undefineDomain(uuid string) error {
 	l, dom, ok := b.domainHandle(uuid)
 	if !ok {
-		return
+		if l == nil {
+			return errNoConn
+		}
+		return vp.ErrNotFound
 	}
 	// Best-effort destroy if running, then undefine (also drop NVRAM/snapshots).
 	_ = l.DomainDestroy(dom)
@@ -450,16 +486,21 @@ func (b *liveBackend) undefineDomain(uuid string) {
 		libvirt.DomainUndefineNvram
 	if err := l.DomainUndefineFlags(dom, flags); err != nil {
 		b.fail(err)
+		return mapLibvirtErr(err)
 	}
 	b.mu.Lock()
 	delete(b.domHandles, uuid)
 	b.mu.Unlock()
+	return nil
 }
 
-func (b *liveBackend) setDomainState(uuid string, s libvirtState) {
+func (b *liveBackend) setDomainState(uuid string, s libvirtState) error {
 	l, dom, ok := b.domainHandle(uuid)
 	if !ok {
-		return
+		if l == nil {
+			return errNoConn
+		}
+		return vp.ErrNotFound
 	}
 	var err error
 	switch s {
@@ -486,7 +527,92 @@ func (b *liveBackend) setDomainState(uuid string, s libvirtState) {
 	}
 	if err != nil {
 		b.fail(err)
+		return mapLibvirtErr(err)
 	}
+	return nil
+}
+
+// reconfigureDomain applies a vCPU and/or memory change to the REAL domain.
+//
+//   - vCPUs: DomainSetVcpusFlags with VCPU_CONFIG (persistent). When the new count
+//     exceeds the domain's persisted MAXIMUM, libvirt rejects it ("requested vcpus
+//     is greater than max allowable"); we raise the CONFIG MAXIMUM first, then set
+//     the live count. When the domain is running we also apply VCPU_LIVE so the
+//     change takes effect without a reboot (best-effort; running guests cannot
+//     always hot-add, in which case the CONFIG change still persists).
+//   - memory: DomainSetMemoryFlags with MEM_CONFIG. Raising current memory above
+//     the persisted maximum requires bumping MEM_MAXIMUM first.
+//
+// Any hard libvirt rejection is returned (mapped to a contract sentinel) so the
+// API surfaces a 409/422 instead of a false success.
+func (b *liveBackend) reconfigureDomain(uuid string, vcpus *int, memMB *int64) error {
+	l, dom, ok := b.domainHandle(uuid)
+	if !ok {
+		if l == nil {
+			return errNoConn
+		}
+		return vp.ErrNotFound
+	}
+	running := false
+	if st, _, err := l.DomainGetState(dom, 0); err == nil {
+		s := libvirtState(st)
+		running = s == domRunning || s == domBlocked
+	}
+
+	if vcpus != nil {
+		n := uint32(*vcpus)
+		// Persisted maximum vCPUs (CONFIG|MAXIMUM); if we're asking for more, raise
+		// the max in the persistent config first (only valid while shut off).
+		maxCfg, err := l.DomainGetVcpusFlags(dom, uint32(libvirt.DomainVCPUConfig|libvirt.DomainVCPUMaximum))
+		if err == nil && int32(n) > maxCfg {
+			if running {
+				// Cannot grow the maximum of a live domain; libvirt requires it be
+				// shut off. Surface a clear conflict.
+				return fmt.Errorf("%w: cannot raise maximum vCPUs above %d while the domain is running (stop it first)", vp.ErrConflict, maxCfg)
+			}
+			if err := l.DomainSetVcpusFlags(dom, n, uint32(libvirt.DomainVCPUConfig|libvirt.DomainVCPUMaximum)); err != nil {
+				b.fail(err)
+				return mapLibvirtErr(err)
+			}
+		}
+		// Set the persistent (CONFIG) vCPU count.
+		if err := l.DomainSetVcpusFlags(dom, n, uint32(libvirt.DomainVCPUConfig)); err != nil {
+			b.fail(err)
+			return mapLibvirtErr(err)
+		}
+		// Apply to the running instance too (best-effort: a guest may refuse a
+		// hot (un)plug, but the persisted config is already correct).
+		if running {
+			if err := l.DomainSetVcpusFlags(dom, n, uint32(libvirt.DomainVCPULive)); err != nil {
+				b.fail(err)
+			}
+		}
+	}
+
+	if memMB != nil {
+		memKiB := uint64(*memMB) * 1024 //nolint:gosec // memMB validated > 0 by caller
+		// Raise the persisted MAXIMUM memory if needed (shut off only).
+		maxMem, err := l.DomainGetMaxMemory(dom)
+		if err == nil && memKiB > maxMem {
+			if running {
+				return fmt.Errorf("%w: cannot raise memory above the maximum %d KiB while the domain is running (stop it first)", vp.ErrConflict, maxMem)
+			}
+			if err := l.DomainSetMemoryFlags(dom, memKiB, uint32(libvirt.DomainMemConfig|libvirt.DomainMemMaximum)); err != nil {
+				b.fail(err)
+				return mapLibvirtErr(err)
+			}
+		}
+		if err := l.DomainSetMemoryFlags(dom, memKiB, uint32(libvirt.DomainMemConfig)); err != nil {
+			b.fail(err)
+			return mapLibvirtErr(err)
+		}
+		if running {
+			if err := l.DomainSetMemoryFlags(dom, memKiB, uint32(libvirt.DomainMemLive)); err != nil {
+				b.fail(err)
+			}
+		}
+	}
+	return nil
 }
 
 func (b *liveBackend) domainsOnHost(hostID string) int {
@@ -522,28 +648,40 @@ func (b *liveBackend) listSnapshots(uuid string) []vp.Snapshot {
 	return out
 }
 
-func (b *liveBackend) createSnapshot(uuid string, snap vp.Snapshot) {
+func (b *liveBackend) createSnapshot(uuid string, snap vp.Snapshot) error {
 	l, dom, ok := b.domainHandle(uuid)
 	if !ok {
-		return
+		if l == nil {
+			return errNoConn
+		}
+		return vp.ErrNotFound
 	}
 	xmlDesc := renderSnapshotXML(snap)
+	// DomainSnapshotCreateXML fails (and MUST surface) for e.g. a diskless domain:
+	// "internal and full system snapshots require all disks to be selected".
 	if _, err := l.DomainSnapshotCreateXML(dom, xmlDesc, 0); err != nil {
 		b.fail(err)
+		return mapLibvirtErr(err)
 	}
+	return nil
 }
 
-func (b *liveBackend) setCurrentSnapshot(uuid, snapID string) bool {
+func (b *liveBackend) setCurrentSnapshot(uuid, snapID string) (bool, error) {
 	l, dom, ok := b.domainHandle(uuid)
 	if !ok {
-		return false
+		if l == nil {
+			return false, errNoConn
+		}
+		return false, vp.ErrNotFound
 	}
 	snap := libvirt.DomainSnapshot{Name: snapID, Dom: dom}
 	if err := l.DomainRevertToSnapshot(snap, 0); err != nil {
 		b.fail(err)
-		return false
+		// A missing snapshot maps to ErrNotFound (-> provider returns it); other
+		// libvirt failures (e.g. revert-while-running constraints) propagate too.
+		return false, mapLibvirtErr(err)
 	}
-	return true
+	return true, nil
 }
 
 // --- host/cluster identity ---
@@ -629,13 +767,36 @@ func mapLibvirtErr(err error) error {
 	case libvirt.ErrNoDomain, libvirt.ErrNoNetwork, libvirt.ErrNoStoragePool,
 		libvirt.ErrNoStorageVol, libvirt.ErrNoDomainSnapshot:
 		return vp.ErrNotFound
-	case libvirt.ErrOperationInvalid:
+	case libvirt.ErrNetworkExist, libvirt.ErrDomExist, libvirt.ErrStorageVolExist,
+		libvirt.ErrOperationInvalid:
+		// Duplicate-name / already-exists and "operation invalid in this state"
+		// are conflicts (HTTP 409). libvirt returns ErrNetworkExist (37) for a
+		// duplicate network name on NetworkDefineXML/NetworkCreate.
 		return vp.ErrConflict
-	case libvirt.ErrInvalidArg, libvirt.ErrXMLError, libvirt.ErrXMLDetail:
+	case libvirt.ErrInvalidArg, libvirt.ErrXMLError, libvirt.ErrXMLDetail,
+		libvirt.ErrConfigUnsupported:
+		// Bad spec / unacceptable config (e.g. "requested vcpus is greater than
+		// max allowable", or a diskless internal-snapshot request) -> 422.
 		return vp.ErrInvalidSpec
+	case libvirt.ErrOperationFailed:
+		// ErrOperationFailed (9) is generic. libvirt reports a duplicate-name
+		// collision on NetworkDefineXML this way (message: "network '...' already
+		// exists with uuid ..."), so disambiguate on the message and surface a
+		// conflict (HTTP 409). Anything else stays a generic error (500).
+		if isAlreadyExistsMsg(le.Message) {
+			return vp.ErrConflict
+		}
+		return err
 	default:
 		return err
 	}
+}
+
+// isAlreadyExistsMsg reports whether a libvirt error message describes a
+// duplicate-name / already-exists collision (which libvirt sometimes reports
+// under the generic ErrOperationFailed code rather than a dedicated *Exist code).
+func isAlreadyExistsMsg(msg string) bool {
+	return strings.Contains(strings.ToLower(msg), "already exists")
 }
 
 // errorAs is errors.As specialized to avoid importing errors twice across files.
@@ -933,6 +1094,44 @@ func (b *liveBackend) createVolume(spec vp.VolumeSpec) error {
 	return nil
 }
 
+// provisionVolume creates a backing volume in poolName and returns its on-disk
+// path (for use as a domain disk <source file>). Used by defineDomain to back
+// size-only disks. If a volume of that name already exists, its existing path is
+// returned (idempotent).
+func (b *liveBackend) provisionVolume(poolName, volName string, capBytes int64, format string) (string, error) {
+	pool, err := b.poolHandle(poolName)
+	if err != nil {
+		return "", err
+	}
+	b.mu.RLock()
+	l := b.l
+	b.mu.RUnlock()
+	if l == nil {
+		return "", errNoConn
+	}
+	if format != "raw" {
+		format = "qcow2"
+	}
+	// Reuse an existing volume of the same name if present.
+	if vol, err := l.StorageVolLookupByName(pool, volName); err == nil {
+		if p, perr := l.StorageVolGetPath(vol); perr == nil {
+			return p, nil
+		}
+	}
+	xmlDesc := renderVolumeXML(volName, format, uint64(capBytes))
+	vol, err := l.StorageVolCreateXML(pool, xmlDesc, 0)
+	if err != nil {
+		b.fail(err)
+		return "", mapLibvirtErr(err)
+	}
+	path, err := l.StorageVolGetPath(vol)
+	if err != nil {
+		b.fail(err)
+		return "", mapLibvirtErr(err)
+	}
+	return path, nil
+}
+
 func (b *liveBackend) deleteVolume(storageID, volumeID string) error {
 	vol, err := b.volHandle(storageID, volumeID)
 	if err != nil {
@@ -1060,10 +1259,31 @@ func renderNetworkXML(spec vp.NetworkSpec) string {
 			bridge = "virbr-" + sanitizeBridge(spec.Name)
 		}
 		fmt.Fprintf(&sb, "  <bridge name='%s' stp='on' delay='0'/>\n", xmlEscape(bridge))
-		appendNetworkIP(&sb, spec.CIDR)
+		// libvirt REQUIRES an IP for nat/route forwarding ("nat forwarding requested,
+		// but no IP address provided"). When the caller did not supply a CIDR, default
+		// to a deterministic per-name managed subnet so the common "create a NAT
+		// network" path just works (192.168.<h>.0/24, h derived from the name).
+		cidr := spec.CIDR
+		if cidr == "" {
+			cidr = defaultNATCIDR(spec.Name)
+		}
+		appendNetworkIP(&sb, cidr)
 	}
 	fmt.Fprintf(&sb, "</network>\n")
 	return sb.String()
+}
+
+// defaultNATCIDR returns a deterministic private /24 for a managed NAT/route network
+// when the caller gives no CIDR. The third octet is derived from the name hash to
+// reduce collisions across multiple auto-created networks (range 100..199).
+func defaultNATCIDR(name string) string {
+	var h uint32 = 2166136261
+	for i := 0; i < len(name); i++ {
+		h ^= uint32(name[i])
+		h *= 16777619
+	}
+	octet := 100 + int(h%100) // 100..199
+	return fmt.Sprintf("192.168.%d.0/24", octet)
 }
 
 // appendNetworkIP renders an <ip>/<dhcp> block for a managed network if a CIDR is
@@ -1225,8 +1445,13 @@ type domainXML struct {
 	XMLName xml.Name `xml:"domain"`
 	Name    string   `xml:"name"`
 	UUID    string   `xml:"uuid"`
-	VCPU    int      `xml:"vcpu"`
-	Memory  struct {
+	VCPU    struct {
+		// chardata is the MAXIMUM vCPUs; current attr (when present) is the active
+		// count after a DomainSetVcpusFlags(...CONFIG) without raising the maximum.
+		Current string `xml:"current,attr"`
+		Max     int    `xml:",chardata"`
+	} `xml:"vcpu"`
+	Memory struct {
 		Unit  string `xml:"unit,attr"`
 		Value int64  `xml:",chardata"`
 	} `xml:"memory"`
@@ -1283,8 +1508,13 @@ func applyDomainXML(d *libvirtDomain, raw string) {
 	if err := xml.Unmarshal([]byte(raw), &dx); err != nil {
 		return
 	}
-	if dx.VCPU > 0 {
-		d.VCPUs = dx.VCPU
+	// Prefer the current (active) vCPU count when libvirt records one (e.g. after a
+	// CONFIG vcpu change that did not raise the maximum: <vcpu current='2'>4</vcpu>),
+	// else fall back to the maximum chardata.
+	if cur := atoiSafe(dx.VCPU.Current); cur > 0 {
+		d.VCPUs = cur
+	} else if dx.VCPU.Max > 0 {
+		d.VCPUs = dx.VCPU.Max
 	}
 	if dx.Memory.Value > 0 {
 		d.MemoryKB = toKiB(dx.Memory.Value, dx.Memory.Unit)

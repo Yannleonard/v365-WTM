@@ -50,16 +50,23 @@ type libvirtBackend interface {
 	listPools() []*libvirtPool
 	listNets() []*libvirtNet
 
-	// lifecycle
-	defineDomain(d *libvirtDomain) // create/define a new domain
-	undefineDomain(uuid string)    // delete a domain
-	setDomainState(uuid string, s libvirtState)
+	// lifecycle. These WRITE methods return an error so a live libvirt RPC
+	// failure propagates to the Provider (and on to the API as 409/422) instead
+	// of becoming a false success. The in-memory sim mutates a struct and always
+	// returns nil.
+	defineDomain(d *libvirtDomain) error // create/define a new domain
+	undefineDomain(uuid string) error    // delete a domain
+	setDomainState(uuid string, s libvirtState) error
+	// reconfigureDomain applies a vCPU and/or memory change to the persistent
+	// (CONFIG) definition and, when the domain is live, to the running instance.
+	// vcpus / memMB are nil when that field is unchanged.
+	reconfigureDomain(uuid string, vcpus *int, memMB *int64) error
 	domainsOnHost(hostID string) int
 
 	// snapshots
 	listSnapshots(uuid string) []vp.Snapshot
-	createSnapshot(uuid string, snap vp.Snapshot)
-	setCurrentSnapshot(uuid, snapID string) bool
+	createSnapshot(uuid string, snap vp.Snapshot) error
+	setCurrentSnapshot(uuid, snapID string) (bool, error)
 
 	// host/cluster
 	hostIDs() []string
@@ -317,8 +324,11 @@ func (p *Provider) CreateVM(ctx context.Context, spec vp.VMSpec) (*vp.Task, erro
 			Link:    true,
 		})
 	}
-	p.backend.defineDomain(d)
-	return p.finishTask("createVM", uuid), nil
+	if err := p.backend.defineDomain(d); err != nil {
+		return nil, err
+	}
+	// d.UUID is reflected back to the real libvirt-assigned UUID by the live backend.
+	return p.finishTask("createVM", d.UUID), nil
 }
 
 func (p *Provider) PowerOp(ctx context.Context, vmID string, op vp.PowerOp) (*vp.Task, error) {
@@ -331,15 +341,19 @@ func (p *Provider) PowerOp(ctx context.Context, vmID string, op vp.PowerOp) (*vp
 	if _, ok := p.backend.getDomain(vmID); !ok {
 		return nil, vp.ErrNotFound
 	}
+	var err error
 	switch op {
 	case vp.PowerStart, vp.PowerResume, vp.PowerReset:
 		// start: shutoff->running; resume: paused->running; reset: hard reboot.
-		p.backend.setDomainState(vmID, domRunning)
+		err = p.backend.setDomainState(vmID, domRunning)
 	case vp.PowerStop:
-		p.backend.setDomainState(vmID, domShutoff)
+		err = p.backend.setDomainState(vmID, domShutoff)
 	case vp.PowerSuspend:
 		// suspend == save state / guest-PM suspend -> pmsuspended.
-		p.backend.setDomainState(vmID, domPMSuspended)
+		err = p.backend.setDomainState(vmID, domPMSuspended)
+	}
+	if err != nil {
+		return nil, err
 	}
 	return p.finishTask("powerOp", vmID), nil
 }
@@ -357,9 +371,13 @@ func (p *Provider) DeleteVM(ctx context.Context, vmID string, opts vp.DeleteOpti
 	}
 	// Force on a running domain destroys it first (virDomainDestroy).
 	if normalizeState(d.State) == vp.StateRunning && opts.Force {
-		p.backend.setDomainState(vmID, domShutoff)
+		if err := p.backend.setDomainState(vmID, domShutoff); err != nil {
+			return nil, err
+		}
 	}
-	p.backend.undefineDomain(vmID)
+	if err := p.backend.undefineDomain(vmID); err != nil {
+		return nil, err
+	}
 	return p.finishTask("deleteVM", vmID), nil
 }
 
@@ -371,17 +389,28 @@ func (p *Provider) ReconfigureVM(ctx context.Context, vmID string, spec vp.VMRec
 	if !ok {
 		return nil, vp.ErrNotFound
 	}
-	if spec.VCPUs != nil {
-		if *spec.VCPUs <= 0 {
-			return nil, vp.ErrInvalidSpec
-		}
-		d.VCPUs = *spec.VCPUs
+	if spec.VCPUs != nil && *spec.VCPUs <= 0 {
+		return nil, vp.ErrInvalidSpec
 	}
-	if spec.MemoryMB != nil {
-		if *spec.MemoryMB <= 0 {
-			return nil, vp.ErrInvalidSpec
+	if spec.MemoryMB != nil && *spec.MemoryMB <= 0 {
+		return nil, vp.ErrInvalidSpec
+	}
+	// vCPU / memory changes are REAL libvirt writes (DomainSetVcpusFlags /
+	// DomainSetMemoryFlags with the CONFIG flag, plus the live value when the
+	// domain is running). The live backend surfaces libvirt rejections (e.g.
+	// "requested vcpus is greater than max allowable") as errors -> 409/422.
+	if spec.VCPUs != nil || spec.MemoryMB != nil {
+		if err := p.backend.reconfigureDomain(vmID, spec.VCPUs, spec.MemoryMB); err != nil {
+			return nil, err
 		}
-		d.MemoryKB = *spec.MemoryMB * 1024
+		// Keep the in-memory model consistent (no-op for the live backend, which
+		// re-reads from libvirt, but correct for the sim).
+		if spec.VCPUs != nil {
+			d.VCPUs = *spec.VCPUs
+		}
+		if spec.MemoryMB != nil {
+			d.MemoryKB = *spec.MemoryMB * 1024
+		}
 	}
 	for i, dk := range spec.AddDisks {
 		d.Disks = append(d.Disks, libvirtDisk{
@@ -424,7 +453,9 @@ func (p *Provider) Snapshot(ctx context.Context, vmID string, opts vp.SnapshotOp
 		IsCurrent:   true,
 		CreatedAt:   time.Now().UTC(),
 	}
-	p.backend.createSnapshot(vmID, snap)
+	if err := p.backend.createSnapshot(vmID, snap); err != nil {
+		return nil, err
+	}
 	return p.finishTask("snapshot", vmID), nil
 }
 
@@ -435,7 +466,11 @@ func (p *Provider) RevertSnapshot(ctx context.Context, vmID, snapID string) (*vp
 	if _, ok := p.backend.getDomain(vmID); !ok {
 		return nil, vp.ErrNotFound
 	}
-	if !p.backend.setCurrentSnapshot(vmID, snapID) {
+	ok, err := p.backend.setCurrentSnapshot(vmID, snapID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
 		return nil, vp.ErrNotFound
 	}
 	return p.finishTask("revertSnapshot", vmID), nil
@@ -477,8 +512,10 @@ func (p *Provider) Clone(ctx context.Context, vmID string, spec vp.CloneSpec) (*
 	// deep-copy disks/NICs so the clone is independent
 	clone.Disks = append([]libvirtDisk(nil), src.Disks...)
 	clone.NICs = append([]libvirtNIC(nil), src.NICs...)
-	p.backend.defineDomain(&clone)
-	return p.finishTask("clone", uuid), nil
+	if err := p.backend.defineDomain(&clone); err != nil {
+		return nil, err
+	}
+	return p.finishTask("clone", clone.UUID), nil
 }
 
 // --- migration ---

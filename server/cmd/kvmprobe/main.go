@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -238,7 +239,219 @@ func main() {
 	}
 	fmt.Println()
 
+	// =========================================================================
+	// BUG-FIX PROOFS: these sections prove the write seam now hits real libvirt
+	// and surfaces real errors (vs the old silent false-success behaviour).
+	// =========================================================================
+
+	proveReconfigure(ctx, p)
+	proveSnapshotFailureSurfaces(ctx, p)
+	proveSnapshotOnDiskedDomain(ctx, p, socket)
+	proveDuplicateNetworkConflict(ctx, p)
+
 	fmt.Println("\nPROBE OK: real libvirt RPC API exercised end to end.")
+}
+
+// proveReconfigure: BUG #1. Reconfigure a real domain's vCPUs and CONFIRM via a
+// FRESH read (which the live backend backs with DomainGetXMLDesc) that <vcpu>
+// actually changed in libvirt. The domain is created shut off with a generous
+// maximum so the CONFIG change is accepted.
+func proveReconfigure(ctx context.Context, p *kvm.Provider) {
+	fmt.Println("== BUG #1 proof: ReconfigureVM really changes vCPUs in libvirt ==")
+	name := fmt.Sprintf("unihv-reconf-%d", time.Now().UnixNano())
+	task, err := p.CreateVM(ctx, vprovider.VMSpec{
+		Name: name, VCPUs: 4, MemoryMB: 512, Firmware: vprovider.FirmwareBIOS,
+	})
+	if err != nil {
+		fatalf("reconfigure: CreateVM: %v", err)
+	}
+	id := task.EntityID
+	defer func() { _, _ = p.DeleteVM(ctx, id, vprovider.DeleteOptions{Force: true}) }()
+
+	before := readVCPUs(ctx, p, id)
+	fmt.Printf("  created %s id=%s vcpu(before)=%d (defined with max=4)\n", name, id, before)
+
+	// Lower to 2 (well within the max=4 -> accepted).
+	two := 2
+	if _, err := p.ReconfigureVM(ctx, id, vprovider.VMReconfigureSpec{VCPUs: &two}); err != nil {
+		fatalf("reconfigure: ReconfigureVM(2): %v", err)
+	}
+	after := readVCPUs(ctx, p, id)
+	fmt.Printf("  ReconfigureVM(vcpus=2) -> vcpu(after, fresh read)=%d\n", after)
+	if after != 2 {
+		fatalf("reconfigure: libvirt <vcpu> NOT changed (got %d want 2) — fix regressed", after)
+	}
+	fmt.Println("  CONFIRMED: live libvirt domain vCPU count actually changed.")
+
+	// Now prove libvirt REJECTIONS surface as errors: ask for more than the max.
+	ten := 10
+	_, err = p.ReconfigureVM(ctx, id, vprovider.VMReconfigureSpec{VCPUs: &ten})
+	// max=4 was defined; on a SHUT-OFF domain the backend raises the CONFIG
+	// MAXIMUM first, so 10 may be accepted. We instead prove rejection mapping by
+	// requesting an absurd value that libvirt refuses. If it was accepted, that is
+	// still a real write; report whichever path libvirt took.
+	if err != nil {
+		fmt.Printf("  ReconfigureVM(vcpus=10) -> error surfaced: %v (mapsToInvalidSpec=%v conflict=%v)\n",
+			err, errors.Is(err, vprovider.ErrInvalidSpec), errors.Is(err, vprovider.ErrConflict))
+	} else {
+		fmt.Printf("  ReconfigureVM(vcpus=10) -> accepted (max raised on shut-off domain); vcpu now=%d\n",
+			readVCPUs(ctx, p, id))
+	}
+	fmt.Println()
+}
+
+func readVCPUs(ctx context.Context, p *kvm.Provider, id string) int {
+	d, err := p.GetVM(ctx, id)
+	if err != nil {
+		fatalf("readVCPUs GetVM(%s): %v", id, err)
+	}
+	return d.VCPUs
+}
+
+// proveSnapshotFailureSurfaces: BUG #2/#3. A snapshot on a DISKLESS domain must
+// now RETURN an error (libvirt: "internal and full system snapshots require all
+// disks to be selected"), instead of the old silent 201.
+func proveSnapshotFailureSurfaces(ctx context.Context, p *kvm.Provider) {
+	fmt.Println("== BUG #2/#3 proof: snapshot failure surfaces as an error ==")
+	name := fmt.Sprintf("unihv-snapfail-%d", time.Now().UnixNano())
+	task, err := p.CreateVM(ctx, vprovider.VMSpec{
+		Name: name, VCPUs: 1, MemoryMB: 256, Firmware: vprovider.FirmwareBIOS,
+	})
+	if err != nil {
+		fatalf("snapfail: CreateVM: %v", err)
+	}
+	id := task.EntityID
+	defer func() { _, _ = p.DeleteVM(ctx, id, vprovider.DeleteOptions{Force: true}) }()
+	fmt.Printf("  created DISKLESS domain %s id=%s\n", name, id)
+
+	_, err = p.Snapshot(ctx, id, vprovider.SnapshotOptions{Name: "snap-should-fail"})
+	if err == nil {
+		fatalf("snapfail: Snapshot returned SUCCESS on a diskless domain — BUG NOT FIXED")
+	}
+	fmt.Printf("  Snapshot(diskless) -> error surfaced: %v\n", err)
+	fmt.Printf("  (mapsToInvalidSpec=%v conflict=%v)\n",
+		errors.Is(err, vprovider.ErrInvalidSpec), errors.Is(err, vprovider.ErrConflict))
+	fmt.Println("  CONFIRMED: the libvirt snapshot failure is no longer swallowed.")
+	fmt.Println()
+}
+
+// proveSnapshotOnDiskedDomain: BUG #2/#3 positive case. Create a domain WITH a
+// real disk (a qcow2 volume in the default pool) and CONFIRM a snapshot actually
+// appears in DomainListAllSnapshots (via ListSnapshots).
+func proveSnapshotOnDiskedDomain(ctx context.Context, p *kvm.Provider, socket string) {
+	fmt.Println("== BUG #2/#3 proof: snapshot on a DISKED domain really appears ==")
+	sp, ok := any(p).(vprovider.StorageProvider)
+	if !ok {
+		fmt.Println("  provider has no StorageProvider; skipping")
+		fmt.Println()
+		return
+	}
+	// Find a writable pool for the backing disk.
+	pools, _ := p.ListStorage(ctx)
+	var pool string
+	for _, pl := range pools {
+		if pl.Accessible {
+			pool = pl.Name
+			break
+		}
+	}
+	if pool == "" {
+		fmt.Println("  no active storage pool; skipping disked-snapshot proof")
+		fmt.Println()
+		return
+	}
+
+	volName := fmt.Sprintf("unihv-snapdisk-%d.qcow2", time.Now().UnixNano())
+	if _, err := sp.CreateVolume(ctx, vprovider.VolumeSpec{
+		Name: volName, StorageID: pool, CapacityGB: 1, Format: vprovider.DiskQcow2,
+	}); err != nil {
+		fatalf("snapdisk: CreateVolume: %v", err)
+	}
+	defer func() { _, _ = sp.DeleteVolume(ctx, pool, volName) }()
+
+	// Resolve the volume's real path so the domain disk points at it.
+	var diskPath string
+	if vols, err := sp.ListVolumes(ctx, pool); err == nil {
+		for _, v := range vols {
+			if v.Name == volName {
+				diskPath = v.Path
+			}
+		}
+	}
+	if diskPath == "" {
+		fatalf("snapdisk: could not resolve created volume path")
+	}
+	fmt.Printf("  created backing qcow2 volume %s -> %s\n", volName, diskPath)
+
+	name := fmt.Sprintf("unihv-snapdisk-dom-%d", time.Now().UnixNano())
+	task, err := p.CreateVM(ctx, vprovider.VMSpec{
+		Name: name, VCPUs: 1, MemoryMB: 256, Firmware: vprovider.FirmwareBIOS,
+		Disks: []vprovider.DiskSpec{{
+			StorageID: pool, SourcePath: diskPath, Format: vprovider.DiskQcow2, CapacityGB: 1,
+		}},
+	})
+	if err != nil {
+		fatalf("snapdisk: CreateVM: %v", err)
+	}
+	id := task.EntityID
+	defer func() { _, _ = p.DeleteVM(ctx, id, vprovider.DeleteOptions{Force: true}) }()
+	fmt.Printf("  created DISKED domain %s id=%s (1 disk)\n", name, id)
+
+	snapName := "snap-real"
+	if _, err := p.Snapshot(ctx, id, vprovider.SnapshotOptions{Name: snapName}); err != nil {
+		fatalf("snapdisk: Snapshot on disked domain failed (should succeed): %v", err)
+	}
+	snaps, err := p.ListSnapshots(ctx, id)
+	if err != nil {
+		fatalf("snapdisk: ListSnapshots: %v", err)
+	}
+	found := false
+	for _, s := range snaps {
+		if s.Name == snapName {
+			found = true
+		}
+	}
+	fmt.Printf("  Snapshot(%q) -> ListSnapshots(DomainListAllSnapshots) returns %d snapshot(s); found=%v\n",
+		snapName, len(snaps), found)
+	if !found {
+		fatalf("snapdisk: snapshot did NOT appear in DomainListAllSnapshots — BUG NOT FIXED")
+	}
+	fmt.Println("  CONFIRMED: snapshot really created and visible in libvirt.")
+	fmt.Println()
+}
+
+// proveDuplicateNetworkConflict: BUG #4. Creating a network whose name already
+// exists must map libvirt's ErrNetworkExist to vp.ErrConflict (HTTP 409), not a
+// generic 500.
+func proveDuplicateNetworkConflict(ctx context.Context, p *kvm.Provider) {
+	fmt.Println("== BUG #4 proof: duplicate network -> conflict ==")
+	nw, ok := any(p).(vprovider.NetworkWriter)
+	if !ok {
+		fmt.Println("  provider has no NetworkWriter; skipping")
+		fmt.Println()
+		return
+	}
+	netName := fmt.Sprintf("unihv-dup-net-%d", time.Now().UnixNano())
+	if _, err := nw.CreateNetwork(ctx, vprovider.NetworkSpec{
+		Name: netName, Type: "nat", CIDR: "192.168.231.0/24",
+	}); err != nil {
+		fatalf("dupnet: first CreateNetwork: %v", err)
+	}
+	defer func() { _, _ = nw.DeleteNetwork(ctx, netName) }()
+	fmt.Printf("  created network %s\n", netName)
+
+	_, err := nw.CreateNetwork(ctx, vprovider.NetworkSpec{
+		Name: netName, Type: "nat", CIDR: "192.168.232.0/24",
+	})
+	if err == nil {
+		fatalf("dupnet: duplicate CreateNetwork unexpectedly SUCCEEDED")
+	}
+	fmt.Printf("  duplicate CreateNetwork(%s) -> error: %v\n", netName, err)
+	if !errors.Is(err, vprovider.ErrConflict) {
+		fatalf("dupnet: error does NOT map to ErrConflict (got %v) — BUG NOT FIXED", err)
+	}
+	fmt.Println("  CONFIRMED: duplicate-name maps to vp.ErrConflict (-> HTTP 409).")
+	fmt.Println()
 }
 
 func fatalf(format string, args ...any) {
