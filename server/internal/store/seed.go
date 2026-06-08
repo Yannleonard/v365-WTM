@@ -46,6 +46,7 @@ var AllReadPermissions = []string{
 	"vm.cluster.read",
 	"vm.storage.read",
 	"vm.network.read",
+	"vm.storage.read",
 	"inventory.read",
 	"v2v.read",
 	"audit.read",
@@ -120,6 +121,9 @@ var operatorExtraPermissions = []string{
 	"vm.clone",        // clone an existing VM
 	"vm.migrate",      // intra-hypervisor live/cold migrate
 	"vm.export",       // export disks (for V2V); non-destructive read of disk
+	"vm.console",      // open graphical console (VNC/SPICE/RDP)
+	"vm.network.write",// create/delete virtual networks/switches
+	"vm.storage.write",// create/delete volumes, upload ISOs
 	"v2v.migrate",     // run a cross-hypervisor V2V migration
 }
 

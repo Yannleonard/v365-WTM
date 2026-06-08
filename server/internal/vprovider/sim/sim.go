@@ -26,7 +26,8 @@ const FullCaps = vp.CapListHosts | vp.CapListVMs | vp.CapGetVM | vp.CapListClust
 	vp.CapPowerStop | vp.CapPowerReset | vp.CapPowerSuspend | vp.CapDeleteVM |
 	vp.CapReconfigureVM | vp.CapSnapshot | vp.CapRevertSnapshot | vp.CapClone |
 	vp.CapMigrate | vp.CapExport | vp.CapClusterTopology | vp.CapNodeState |
-	vp.CapMetrics | vp.CapEvents
+	vp.CapMetrics | vp.CapEvents |
+	vp.CapConsole | vp.CapNetworkWrite | vp.CapStorageWrite
 
 // Provider is an in-memory HypervisorProvider.
 type Provider struct {
@@ -41,6 +42,7 @@ type Provider struct {
 	storage   map[string]vp.StoragePool
 	networks  map[string]vp.Network
 	snapshots map[string][]vp.Snapshot // vmID -> snapshots
+	volumes   map[string][]vp.Volume   // storageID -> volumes (disks + ISOs)
 	tracker   *vp.TaskTracker
 	seq       int64
 	closed    bool
@@ -69,6 +71,7 @@ func New(id string, opts ...Option) *Provider {
 		storage:   map[string]vp.StoragePool{},
 		networks:  map[string]vp.Network{},
 		snapshots: map[string][]vp.Snapshot{},
+		volumes:   map[string][]vp.Volume{},
 		tracker:   vp.NewTaskTracker(),
 	}
 	for _, o := range opts {
@@ -95,6 +98,10 @@ func (p *Provider) seed() {
 		HostIDs: []string{"host-1", "host-2"}}
 	p.networks["net-1"] = vp.Network{ID: "net-1", Name: "sim-vmnet", Kind: p.kind,
 		ProviderID: p.id, Type: "bridge", VLAN: 0}
+	p.volumes["ds-1"] = []vp.Volume{
+		{ID: "vol-1", Name: "vm-1-disk0.qcow2", StorageID: "ds-1", Format: vp.DiskQcow2, CapacityGB: 40, AllocGB: 8},
+		{ID: "iso-1", Name: "ubuntu-24.04.iso", StorageID: "ds-1", Format: vp.DiskRaw, CapacityGB: 2, AllocGB: 2, IsISO: true},
+	}
 	for i, st := range []vp.VMState{vp.StateRunning, vp.StateRunning, vp.StateStopped} {
 		id := fmt.Sprintf("vm-%d", i+1)
 		host := "host-1"
@@ -565,5 +572,150 @@ func (p *Provider) StreamEvents(ctx context.Context) (<-chan vp.Event, error) {
 	return ch, nil
 }
 
-// compile-time assertion: *Provider satisfies the contract.
-var _ vp.HypervisorProvider = (*Provider)(nil)
+// --- extension interfaces (console / network write / storage write) ---
+
+// Console returns a fake VNC endpoint for a known VM.
+func (p *Provider) Console(ctx context.Context, vmID string) (*vp.ConsoleEndpoint, error) {
+	if !p.caps.Has(vp.CapConsole) {
+		return nil, vp.ErrUnsupported
+	}
+	p.mu.RLock()
+	_, ok := p.vms[vmID]
+	p.mu.RUnlock()
+	if !ok {
+		return nil, vp.ErrNotFound
+	}
+	return &vp.ConsoleEndpoint{Kind: vp.ConsoleVNC, Host: "127.0.0.1", Port: 5901, Password: "sim-ticket"}, nil
+}
+
+// CreateNetwork adds a network.
+func (p *Provider) CreateNetwork(ctx context.Context, spec vp.NetworkSpec) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapNetworkWrite) {
+		return nil, vp.ErrUnsupported
+	}
+	if strings.TrimSpace(spec.Name) == "" {
+		return nil, vp.ErrInvalidSpec
+	}
+	now := time.Now().UTC()
+	id := p.nextID("net")
+	p.mu.Lock()
+	p.networks[id] = vp.Network{ID: id, Name: spec.Name, Kind: p.kind, ProviderID: p.id, Type: spec.Type, VLAN: spec.VLAN}
+	p.mu.Unlock()
+	t := p.tracker.Start(p.nextID("task"), "createNetwork", p.id, id, now)
+	return p.tracker.Finish(t.ID, vp.TaskSucceeded, "", now), nil
+}
+
+// DeleteNetwork removes a network.
+func (p *Provider) DeleteNetwork(ctx context.Context, networkID string) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapNetworkWrite) {
+		return nil, vp.ErrUnsupported
+	}
+	p.mu.Lock()
+	_, ok := p.networks[networkID]
+	if ok {
+		delete(p.networks, networkID)
+	}
+	p.mu.Unlock()
+	if !ok {
+		return nil, vp.ErrNotFound
+	}
+	now := time.Now().UTC()
+	t := p.tracker.Start(p.nextID("task"), "deleteNetwork", p.id, networkID, now)
+	return p.tracker.Finish(t.ID, vp.TaskSucceeded, "", now), nil
+}
+
+// ListVolumes lists volumes in a pool.
+func (p *Provider) ListVolumes(ctx context.Context, storageID string) ([]vp.Volume, error) {
+	if !p.caps.Has(vp.CapListStorage) {
+		return nil, vp.ErrUnsupported
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if _, ok := p.storage[storageID]; !ok {
+		return nil, vp.ErrNotFound
+	}
+	out := make([]vp.Volume, len(p.volumes[storageID]))
+	copy(out, p.volumes[storageID])
+	return out, nil
+}
+
+// CreateVolume provisions a disk volume.
+func (p *Provider) CreateVolume(ctx context.Context, spec vp.VolumeSpec) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapStorageWrite) {
+		return nil, vp.ErrUnsupported
+	}
+	if spec.Name == "" || spec.CapacityGB <= 0 {
+		return nil, vp.ErrInvalidSpec
+	}
+	p.mu.Lock()
+	if _, ok := p.storage[spec.StorageID]; !ok {
+		p.mu.Unlock()
+		return nil, vp.ErrNotFound
+	}
+	id := p.nextID("vol")
+	p.volumes[spec.StorageID] = append(p.volumes[spec.StorageID], vp.Volume{
+		ID: id, Name: spec.Name, StorageID: spec.StorageID, Format: spec.Format, CapacityGB: spec.CapacityGB})
+	p.mu.Unlock()
+	now := time.Now().UTC()
+	t := p.tracker.Start(p.nextID("task"), "createVolume", p.id, id, now)
+	return p.tracker.Finish(t.ID, vp.TaskSucceeded, "", now), nil
+}
+
+// DeleteVolume removes a volume.
+func (p *Provider) DeleteVolume(ctx context.Context, storageID, volumeID string) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapStorageWrite) {
+		return nil, vp.ErrUnsupported
+	}
+	p.mu.Lock()
+	vols := p.volumes[storageID]
+	found := -1
+	for i := range vols {
+		if vols[i].ID == volumeID {
+			found = i
+			break
+		}
+	}
+	if found >= 0 {
+		p.volumes[storageID] = append(vols[:found], vols[found+1:]...)
+	}
+	p.mu.Unlock()
+	if found < 0 {
+		return nil, vp.ErrNotFound
+	}
+	now := time.Now().UTC()
+	t := p.tracker.Start(p.nextID("task"), "deleteVolume", p.id, volumeID, now)
+	return p.tracker.Finish(t.ID, vp.TaskSucceeded, "", now), nil
+}
+
+// UploadISO registers an ISO from a stream.
+func (p *Provider) UploadISO(ctx context.Context, storageID, name string, size int64, r io.Reader) (*vp.Volume, error) {
+	if !p.caps.Has(vp.CapStorageWrite) {
+		return nil, vp.ErrUnsupported
+	}
+	if name == "" {
+		return nil, vp.ErrInvalidSpec
+	}
+	// Drain the stream (sim discards bytes but validates the pipe works).
+	n, _ := io.Copy(io.Discard, r)
+	gb := float64(n) / (1 << 30)
+	if gb <= 0 {
+		gb = float64(size) / (1 << 30)
+	}
+	p.mu.Lock()
+	if _, ok := p.storage[storageID]; !ok {
+		p.mu.Unlock()
+		return nil, vp.ErrNotFound
+	}
+	vol := vp.Volume{ID: p.nextID("iso"), Name: name, StorageID: storageID, Format: vp.DiskRaw, CapacityGB: gb, AllocGB: gb, IsISO: true}
+	p.volumes[storageID] = append(p.volumes[storageID], vol)
+	p.mu.Unlock()
+	return &vol, nil
+}
+
+// compile-time assertions: *Provider satisfies the core + extension contracts.
+var (
+	_ vp.HypervisorProvider = (*Provider)(nil)
+	_ vp.ConsoleProvider    = (*Provider)(nil)
+	_ vp.NetworkWriter      = (*Provider)(nil)
+	_ vp.StorageProvider    = (*Provider)(nil)
+)

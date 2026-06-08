@@ -77,14 +77,16 @@ var capTokens = []struct {
 }
 
 // Strings returns the active capabilities as stable lowercase tokens for the
-// API/UI. Order is deterministic.
+// API/UI (core bits + the optional extension bits console/network_write/
+// storage_write). Order is deterministic.
 func (c CapabilityMatrix) Strings() []string {
-	out := make([]string, 0, len(capTokens))
+	out := make([]string, 0, len(capTokens)+len(extTokens))
 	for _, ct := range capTokens {
 		if c.Has(ct.bit) {
 			out = append(out, ct.token)
 		}
 	}
+	out = append(out, c.ExtStrings()...)
 	return out
 }
 

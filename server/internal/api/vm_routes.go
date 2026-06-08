@@ -59,4 +59,26 @@ func (s *Server) mountVMRoutes(pr chi.Router) {
 	// Migration (intra-hypervisor; cross-hypervisor V2V is the migrate engine, Phase 4).
 	pr.With(az.AuditWrap("vm.migrate"), az.RequireAAL, az.RequirePermission("vm.migrate", scopeFromProvider)).
 		Post("/vm/providers/{providerID}/vms/{vmID}/migrate", s.VMMigrate)
+
+	// --- extension features (console / network write / storage+ISO) ---
+
+	// Graphical console (VNC/SPICE/RDP). Read-grade ticket, gated by vm.console.
+	pr.With(az.AuditWrap("vm.console"), az.RequirePermission("vm.console", scopeFromProvider)).
+		Get("/vm/providers/{providerID}/vms/{vmID}/console", s.VMConsole)
+
+	// Virtual network create/delete.
+	pr.With(az.AuditWrap("vm.network.create"), az.RequireAAL, az.RequirePermission("vm.network.write", scopeFromProvider)).
+		Post("/vm/providers/{providerID}/networks", s.VMNetworkCreate)
+	pr.With(az.AuditWrap("vm.network.delete"), az.RequireAAL, az.RequirePermission("vm.network.write", scopeFromProvider)).
+		Delete("/vm/providers/{providerID}/networks/{networkID}", s.VMNetworkDelete)
+
+	// Storage volumes + ISO library.
+	pr.With(az.RequirePermission("vm.storage.read", scopeFromProvider)).
+		Get("/vm/providers/{providerID}/storage/{storageID}/volumes", s.VMVolumes)
+	pr.With(az.AuditWrap("vm.volume.create"), az.RequireAAL, az.RequirePermission("vm.storage.write", scopeFromProvider)).
+		Post("/vm/providers/{providerID}/storage/{storageID}/volumes", s.VMVolumeCreate)
+	pr.With(az.AuditWrap("vm.volume.delete"), az.RequireAAL, az.RequirePermission("vm.storage.write", scopeFromProvider)).
+		Delete("/vm/providers/{providerID}/storage/{storageID}/volumes/{volumeID}", s.VMVolumeDelete)
+	pr.With(az.AuditWrap("vm.iso.upload"), az.RequireAAL, az.RequirePermission("vm.storage.write", scopeFromProvider)).
+		Post("/vm/providers/{providerID}/storage/{storageID}/iso", s.VMISOUpload)
 }

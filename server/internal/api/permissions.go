@@ -109,6 +109,12 @@ var permissionCatalog = []string{
 	"vm.export",
 	"vm.create",
 	"vm.delete",
+	// UniHV VM extension features: graphical console, virtual-network write,
+	// storage volume/ISO read+write.
+	"vm.console",
+	"vm.network.write",
+	"vm.storage.read",
+	"vm.storage.write",
 	// UniHV V2V cross-hypervisor migration: read job status / run a migration.
 	"v2v.read",
 	"v2v.migrate",
