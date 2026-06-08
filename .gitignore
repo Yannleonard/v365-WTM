@@ -45,6 +45,9 @@ profile.cov
 
 # --- Generic build dir -------------------------------------------------------
 dist/
+# …but keep the committed UI embed placeholder (go:embed needs it before a build).
+!/server/web/dist/
+!/server/web/dist/index.html
 
 # --- Env & secrets -----------------------------------------------------------
 .env
