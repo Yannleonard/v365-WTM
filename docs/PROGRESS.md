@@ -16,6 +16,19 @@
 | 5 | Frontend: VM/cluster/migration views + unified VM+container dashboard | ✅ | npm build green, 23 vitest pass, full image builds |
 | 6 | Hardening, docs, security audit, live validation | ✅ | compose up all-healthy; live E2E green; security scan clean |
 
+### Operational features (post-DoD, user-requested) — DONE
+- ✅ Real official-API clients for ALL 4 hypervisors (no mock): KVM=libvirt RPC,
+  Hyper-V=WMI Msvm_* via go-ole, ESXi=govmomi, Xen=XAPI. Proven on real libvirt + real Hyper-V.
+- ✅ Connection management: register/connect real hypervisors (local AND remote) via UI/API,
+  credentials AES-256-GCM sealed. Hyper-V remote via WMI ConnectServer over DCOM.
+- ✅ Extension contract (non-breaking optional interfaces): Console (VNC/SPICE/RDP),
+  Network write (create/delete switches), Storage write (volumes + ISO upload).
+  Implemented on KVM live (proven: real net/vol create-delete in WSL) + Hyper-V live
+  (proven: real switch/VHD on host) + sim (CI).
+- ✅ Frontend: VM creation wizard, VM Networks view, VM Storage/ISO library, Console viewer.
+- ✅ Live verified: capabilities console/network_write/storage_write exposed; real storage
+  pool listed; real network created via API (confirmed in libvirt).
+
 ### Phase 6 — DONE
 - ✅ deploy/docker-compose.unihv.yml: app + PostgreSQL 15 + Redis 7, one command, all healthy
 - ✅ Hardening fix (D-006): non-root user + group_add reconciles entrypoint with no-new-privileges + cap_drop ALL
