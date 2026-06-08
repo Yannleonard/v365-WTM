@@ -14,6 +14,10 @@ import { Dashboard } from "./views/Dashboard";
 import { Hosts } from "./views/Hosts";
 import { Workloads } from "./views/Workloads";
 import { WorkloadDetail } from "./views/WorkloadDetail";
+import { VirtualMachines } from "./views/VirtualMachines";
+import { VirtualMachineDetail } from "./views/VirtualMachineDetail";
+import { VMClusters } from "./views/VMClusters";
+import { Migration } from "./views/Migration";
 import { Stacks } from "./views/Stacks";
 import { StackEditor } from "./views/StackEditor";
 import { Marketplace } from "./views/Marketplace";
@@ -52,6 +56,38 @@ export const router = createBrowserRouter([
       { path: "hosts", element: <Hosts /> },
       { path: "workloads", element: <Workloads /> },
       { path: "workloads/:hostId/:id", element: <WorkloadDetail /> },
+      {
+        path: "vms",
+        element: (
+          <RequirePerm anyOf={["vm.read", "*"]}>
+            <VirtualMachines />
+          </RequirePerm>
+        ),
+      },
+      {
+        path: "vms/:pid/:id",
+        element: (
+          <RequirePerm anyOf={["vm.read", "*"]}>
+            <VirtualMachineDetail />
+          </RequirePerm>
+        ),
+      },
+      {
+        path: "vm-clusters",
+        element: (
+          <RequirePerm anyOf={["vm.cluster.read", "vm.read", "*"]}>
+            <VMClusters />
+          </RequirePerm>
+        ),
+      },
+      {
+        path: "migration",
+        element: (
+          <RequirePerm anyOf={["v2v.read", "*"]}>
+            <Migration />
+          </RequirePerm>
+        ),
+      },
       {
         path: "stacks",
         element: (

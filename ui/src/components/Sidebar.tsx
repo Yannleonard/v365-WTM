@@ -13,6 +13,8 @@ import {
   IconDashboard,
   IconHosts,
   IconWorkloads,
+  IconVM,
+  IconMigrate,
   IconMarketplace,
   IconStacks,
   IconImages,
@@ -59,6 +61,14 @@ const GROUPS: NavGroup[] = [
       { to: "/images", label: "Images", icon: <IconImages size={18} />, perms: ["docker.image.read"] },
       { to: "/networks", label: "Networks", icon: <IconNetworks size={18} />, perms: ["docker.network.read"] },
       { to: "/volumes", label: "Volumes", icon: <IconVolumes size={18} />, perms: ["docker.volume.read"] },
+    ],
+  },
+  {
+    label: "Virtual Machines",
+    items: [
+      { to: "/vms", label: "Virtual Machines", icon: <IconVM size={18} />, perms: ["vm.read"] },
+      { to: "/vm-clusters", label: "Clusters", icon: <IconNetworks size={18} />, perms: ["vm.cluster.read", "vm.read"] },
+      { to: "/migration", label: "Migration (V2V)", icon: <IconMigrate size={18} />, perms: ["v2v.read"] },
     ],
   },
   {

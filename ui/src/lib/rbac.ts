@@ -6,7 +6,7 @@
 // IMPORTANT: this is a UX affordance only (grey-out-before-click). The backend
 // re-checks every permission; the UI never relies on this for security.
 
-import type { Capability, OrchestratorKind } from "./types";
+import type { Capability, OrchestratorKind, VMCapability } from "./types";
 
 /** Returns true if the permission set grants `perm`. */
 export function can(permissions: string[] | undefined, perm: string): boolean {
@@ -232,6 +232,62 @@ export function gateK8sCluster(
   if (isReadOnly(caps)) return { allowed: false, reason: "Kubernetes is read-only on this host" };
   const perm = K8S_CLUSTER_WRITE_PERM[domain];
   if (!can(permissions, perm)) return { allowed: false, reason: `You lack the ${perm} permission` };
+  return { allowed: true, reason: "" };
+}
+
+/* ===================== Virtual machine (hypervisor) write gates ===================== */
+//
+// VM write affordances follow the same grey-out-before-click rule as containers:
+// a button is enabled only when BOTH the owning hypervisor provider advertises
+// the required VM capability AND the user holds the matching permission. The
+// backend re-checks. A provider that advertises "readonly" disables every write.
+
+/** VM capability membership check. */
+export function hasVMCap(caps: VMCapability[] | undefined, want: VMCapability): boolean {
+  return !!caps && caps.includes(want);
+}
+
+/** VM write actions -> (capability token, permission) pairs. */
+export const VM_ACTION: Record<
+  string,
+  { cap: VMCapability; perm: string }
+> = {
+  start: { cap: "power_start", perm: "vm.power" },
+  stop: { cap: "power_stop", perm: "vm.power" },
+  reset: { cap: "power_reset", perm: "vm.power" },
+  suspend: { cap: "power_suspend", perm: "vm.power" },
+  resume: { cap: "power_resume", perm: "vm.power" },
+  snapshot: { cap: "snapshot", perm: "vm.snapshot" },
+  snapshot_revert: { cap: "snapshot_revert", perm: "vm.snapshot" },
+  clone: { cap: "clone", perm: "vm.clone" },
+  migrate: { cap: "migrate", perm: "vm.migrate" },
+  reconfigure: { cap: "reconfigure", perm: "vm.reconfigure" },
+  create_vm: { cap: "create_vm", perm: "vm.create" },
+  delete_vm: { cap: "delete_vm", perm: "vm.delete" },
+};
+
+export type VMActionKey = keyof typeof VM_ACTION;
+
+/**
+ * Gate a VM write action. Combines the provider's advertised capability with the
+ * user's permission; a read-only provider disables everything.
+ */
+export function gateVMAction(
+  action: VMActionKey,
+  caps: VMCapability[] | undefined,
+  permissions: string[] | undefined,
+): GateResult {
+  const spec = VM_ACTION[action];
+  if (!spec) return { allowed: false, reason: "Unknown action" };
+  if (hasVMCap(caps, "readonly")) {
+    return { allowed: false, reason: "This hypervisor is read-only" };
+  }
+  if (!hasVMCap(caps, spec.cap)) {
+    return { allowed: false, reason: `Provider does not support ${action.replace(/_/g, " ")}` };
+  }
+  if (!can(permissions, spec.perm)) {
+    return { allowed: false, reason: `You lack the ${spec.perm} permission` };
+  }
   return { allowed: true, reason: "" };
 }
 

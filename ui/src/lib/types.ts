@@ -1060,6 +1060,344 @@ export interface BuilderResponse {
   yaml: string;
 }
 
+/* ===================== Virtual machines / hypervisors ===================== */
+//
+// The VM/hypervisor domain mirrors the backend vm provider contract. A VM is a
+// normalized guest across hypervisor kinds (vSphere/ESXi, Proxmox, libvirt/KVM,
+// Hyper-V, …); the `kind` is the provider kind token. Capability tokens
+// (vmCapability) gate write affordances the same way ADR-002 caps gate
+// container actions — power_start / snapshot / clone / migrate / create_vm /
+// delete_vm / export / metrics …
+
+// Normalized VM lifecycle state. stateRaw carries the hypervisor-native string.
+export type VMState =
+  | "running"
+  | "stopped"
+  | "suspended"
+  | "paused"
+  | "unknown";
+
+// VM provider capability tokens. Open string union so an unknown token from a
+// newer backend still type-checks (we only branch on known ones).
+export type VMCapability =
+  | "power_start"
+  | "power_stop"
+  | "power_reset"
+  | "power_suspend"
+  | "power_resume"
+  | "snapshot"
+  | "snapshot_revert"
+  | "clone"
+  | "migrate"
+  | "create_vm"
+  | "delete_vm"
+  | "reconfigure"
+  | "export"
+  | "metrics"
+  | "readonly"
+  | (string & {});
+
+// One virtual disk attached to a VM.
+export interface VMDisk {
+  id: string;
+  label?: string;
+  sizeBytes: number;
+  storageId?: string;
+  path?: string;
+  thin?: boolean;
+}
+
+// One virtual NIC attached to a VM.
+export interface VMNic {
+  id: string;
+  label?: string;
+  network?: string;
+  macAddress?: string;
+  connected?: boolean;
+  ipAddresses?: string[];
+}
+
+// VM is the normalized guest summary (list rows + inventory.vms).
+export interface VM {
+  id: string;
+  name: string;
+  kind: string; // provider kind token (e.g. "vsphere", "proxmox", "libvirt")
+  providerId: string;
+  hostId?: string;
+  clusterId?: string;
+  state: VMState;
+  stateRaw?: string;
+  vcpus: number;
+  memoryMb: number;
+  guestOs?: string;
+  firmware?: string;
+  disks?: VMDisk[];
+  nics?: VMNic[];
+  ipAddresses?: string[];
+  labels?: Record<string, string>;
+  snapshotCount: number;
+  createdAt?: string; // RFC3339
+  protected: boolean;
+}
+
+// VMDetail adds the hypervisor-native inspect document (opaque JSON).
+export interface VMDetail extends VM {
+  raw: unknown;
+}
+
+// One VM provider (hypervisor connection) + its capability list.
+export interface VMProvider {
+  id: string;
+  kind: string;
+  capabilities: VMCapability[];
+}
+
+// One snapshot in a VM's snapshot tree (flattened list).
+export interface VMSnapshot {
+  id: string;
+  name: string;
+  description?: string;
+  createdAt?: string; // RFC3339
+  state?: string;
+  current?: boolean;
+  parentId?: string;
+  sizeBytes?: number;
+}
+
+// A hypervisor host (physical node running the hypervisor).
+export interface VMHost {
+  id: string;
+  name: string;
+  providerId: string;
+  clusterId?: string;
+  state?: string;
+  cpuCores?: number;
+  cpuMhz?: number;
+  memoryBytes?: number;
+  vmCount?: number;
+  version?: string;
+}
+
+// A cluster of hypervisor hosts (DRS/HA domain).
+export interface VMCluster {
+  id: string;
+  name: string;
+  providerId: string;
+  hostCount?: number;
+  vmCount?: number;
+  totalCpuCores?: number;
+  totalMemoryBytes?: number;
+  drsEnabled?: boolean;
+  haEnabled?: boolean;
+}
+
+// One node placement entry in a cluster topology (a host + the VMs on it).
+export interface VMClusterNode {
+  hostId: string;
+  hostName: string;
+  state?: string;
+  cpuCores?: number;
+  memoryBytes?: number;
+  vms: VM[];
+}
+
+// Cluster topology: the cluster plus its hosts and their VM placement.
+export interface VMClusterTopology {
+  clusterId: string;
+  clusterName: string;
+  nodes: VMClusterNode[];
+}
+
+// A datastore / storage pool exposed by a VM provider.
+export interface VMStorage {
+  id: string;
+  name: string;
+  providerId: string;
+  type?: string;
+  capacityBytes?: number;
+  freeBytes?: number;
+  accessible?: boolean;
+}
+
+// A virtual network / port-group exposed by a VM provider.
+export interface VMNetwork {
+  id: string;
+  name: string;
+  providerId: string;
+  type?: string;
+  vlanId?: number;
+}
+
+// One metrics sample for a VM (timestamped CPU/memory/disk/net usage).
+export interface VMMetricSample {
+  timestamp: string; // RFC3339
+  cpuPercent?: number;
+  memoryPercent?: number;
+  memoryBytes?: number;
+  diskReadBytes?: number;
+  diskWriteBytes?: number;
+  netRxBytes?: number;
+  netTxBytes?: number;
+}
+
+// Response of GET /vm/providers/{pid}/vms/{vmId}/metrics.
+export interface VMMetricsResponse {
+  entityId: string;
+  samples: VMMetricSample[];
+}
+
+// A long-running hypervisor task returned by power/lifecycle mutations.
+export interface VMTask {
+  id: string;
+  state?: string;
+  progress?: number;
+  message?: string;
+  error?: string;
+}
+
+// Body for POST /vm/providers/{pid}/vms/{vmId}/snapshots.
+export interface VMSnapshotCreateRequest {
+  name: string;
+  description?: string;
+  memory?: boolean;
+  quiesce?: boolean;
+}
+
+// Body for POST /vm/providers/{pid}/vms/{vmId}/clone.
+export interface VMCloneRequest {
+  name: string;
+  hostId?: string;
+  storageId?: string;
+  linked?: boolean;
+  powerOn?: boolean;
+}
+
+// Body for POST /vm/providers/{pid}/vms/{vmId}/migrate (intra-hypervisor).
+export interface VMMigrateRequest {
+  targetHost: string;
+  live?: boolean;
+  targetStorage?: string;
+}
+
+// Body for POST /vm/providers/{pid}/vms/{vmId}/reconfigure.
+export interface VMReconfigureRequest {
+  vcpus?: number;
+  memoryMb?: number;
+}
+
+// Body for POST /vm/providers/{pid}/vms (create a VM; admin).
+export interface VMSpec {
+  name: string;
+  vcpus: number;
+  memoryMb: number;
+  guestOs?: string;
+  firmware?: string;
+  hostId?: string;
+  clusterId?: string;
+  storageId?: string;
+  diskGb?: number;
+  network?: string;
+  powerOn?: boolean;
+}
+
+// VM power operation tokens (path segment for the power endpoint).
+export type VMPowerOp = "start" | "stop" | "reset" | "suspend" | "resume";
+
+/* ===================== Unified inventory (single pane of glass) ===================== */
+
+// Aggregated counts across the VM + container worlds. Field names match the
+// backend Unified.counts struct verbatim.
+export interface InventoryCounts {
+  vms: number;
+  vmsRunning: number;
+  hosts: number;
+  clusters: number;
+  containers: number;
+  containersUp: number;
+  hypervisorProviders: number;
+  containerHosts: number;
+}
+
+// One degraded provider/host entry on the unified inventory (best-effort
+// surfaced; fields are advisory).
+export interface InventoryDegraded {
+  id: string;
+  kind?: string;
+  message?: string;
+}
+
+// Response of GET /inventory — the unified single-pane snapshot.
+export interface Inventory {
+  vms: VM[];
+  hosts: VMHost[];
+  clusters: VMCluster[];
+  storage: VMStorage[];
+  networks: VMNetwork[];
+  workloads: Workload[];
+  counts: InventoryCounts;
+  degraded: InventoryDegraded[];
+  generatedAt: string; // RFC3339
+}
+
+/* ===================== V2V migration (cross-hypervisor) ===================== */
+
+// Body for POST /v2v/preflight and POST /v2v/migrate. The same shape drives
+// both: preflight validates it, migrate enqueues the job.
+export interface V2VRequest {
+  sourceProviderId: string;
+  sourceVmId: string;
+  targetProviderId: string;
+  targetHostId?: string;
+  targetStorageId?: string;
+  targetName?: string;
+  powerOn?: boolean;
+}
+
+// Response of POST /v2v/preflight. ok=false with a populated issues[] means the
+// migration is blocked (not an HTTP error). source/target Format and Kind
+// describe the disk-format conversion that will happen.
+export interface V2VPreflightResult {
+  ok: boolean;
+  issues: string[];
+  sourceFormat: string;
+  targetFormat: string;
+  sourceKind: string;
+  targetKind: string;
+}
+
+// Response of POST /v2v/migrate (the enqueued job id).
+export interface V2VMigrateResponse {
+  id: string;
+}
+
+// V2V job phases (lower-case, as the backend reports them). Open union for
+// forward-compat.
+export type V2VPhase =
+  | "queued"
+  | "export"
+  | "convert"
+  | "transfer"
+  | "import"
+  | "finalize"
+  | "done"
+  | "failed"
+  | (string & {});
+
+// Progress of a V2V job (GET /v2v/jobs and /v2v/jobs/{id}).
+export interface V2VProgress {
+  id: string;
+  phase: V2VPhase;
+  percent: number;
+  message?: string;
+  sourceProviderId?: string;
+  sourceVmId?: string;
+  targetProviderId?: string;
+  targetVmId?: string;
+  error?: string;
+  startedAt?: string; // RFC3339
+  updatedAt?: string; // RFC3339
+}
+
 /* ===================== Error envelope ===================== */
 
 export type ApiErrorCode =

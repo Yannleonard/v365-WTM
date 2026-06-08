@@ -43,6 +43,16 @@ import type {
   UserRecord,
   Workload,
   WorkloadDetail,
+  Inventory,
+  VM,
+  VMDetail,
+  VMProvider,
+  VMCapability,
+  VMSnapshot,
+  VMCluster,
+  VMClusterTopology,
+  VMMetricsResponse,
+  V2VProgress,
 } from "./types";
 
 export const DEFAULT_HOST = "local";
@@ -97,6 +107,16 @@ export const qk = {
   catalogs: ["catalogs"] as const,
   authProviders: ["authProviders"] as const,
   authProviderMappings: (id: string) => ["authProviderMappings", id] as const,
+  inventory: ["inventory"] as const,
+  vmProviders: ["vmProviders"] as const,
+  vms: (pid: string) => ["vms", pid] as const,
+  vm: (pid: string, id: string) => ["vm", pid, id] as const,
+  vmSnapshots: (pid: string, id: string) => ["vm", "snapshots", pid, id] as const,
+  vmMetrics: (pid: string, id: string) => ["vm", "metrics", pid, id] as const,
+  vmClusters: (pid: string) => ["vm", "clusters", pid] as const,
+  vmClusterTopology: (pid: string, cid: string) => ["vm", "topology", pid, cid] as const,
+  v2vJobs: ["v2v", "jobs"] as const,
+  v2vJob: (id: string) => ["v2v", "job", id] as const,
 };
 
 const POLL = 8000; // background refresh cadence for live-ish lists
@@ -475,6 +495,104 @@ export function useProviderMappings(providerId: string, opts?: Partial<UseQueryO
   return useQuery<GroupRoleMapping[]>({
     queryKey: qk.authProviderMappings(providerId),
     queryFn: () => api.authProviderMappings(providerId),
+    ...opts,
+  });
+}
+
+/* ===================== Virtual machines / hypervisors ===================== */
+
+/** Unified single-pane inventory (VMs + containers aggregate). Live-ish. */
+export function useInventory(opts?: Partial<UseQueryOptions<Inventory>>) {
+  return useQuery<Inventory>({
+    queryKey: qk.inventory,
+    queryFn: () => api.listInventory(),
+    refetchInterval: POLL,
+    ...opts,
+  });
+}
+
+/** Hypervisor providers + their capability lists. */
+export function useVMProviders(opts?: Partial<UseQueryOptions<VMProvider[]>>) {
+  return useQuery<VMProvider[]>({
+    queryKey: qk.vmProviders,
+    queryFn: () => api.vmProviders(),
+    staleTime: 60_000,
+    ...opts,
+  });
+}
+
+/** Build providerId -> capabilities for the VM domain (grey-out-before-click). */
+export function useVMCapabilityLookup() {
+  const { data } = useVMProviders();
+  const byProvider = new Map<string, VMCapability[]>();
+  for (const p of data ?? []) byProvider.set(p.id, p.capabilities);
+  return {
+    providers: data ?? [],
+    capsForProvider: (id: string | undefined): VMCapability[] | undefined =>
+      id ? byProvider.get(id) : undefined,
+  };
+}
+
+export function useVMs(pid: string, enabled = true, opts?: Partial<UseQueryOptions<VM[]>>) {
+  return useQuery<VM[]>({
+    queryKey: qk.vms(pid),
+    queryFn: () => api.vms(pid),
+    enabled: enabled && !!pid,
+    refetchInterval: POLL,
+    ...opts,
+  });
+}
+
+export function useVM(pid: string, id: string, opts?: Partial<UseQueryOptions<VMDetail>>) {
+  return useQuery<VMDetail>({
+    queryKey: qk.vm(pid, id),
+    queryFn: () => api.vm(pid, id),
+    enabled: !!pid && !!id,
+    ...opts,
+  });
+}
+
+export function useVMSnapshots(pid: string, id: string, enabled = true) {
+  return useQuery<VMSnapshot[]>({
+    queryKey: qk.vmSnapshots(pid, id),
+    queryFn: () => api.vmSnapshots(pid, id),
+    enabled: enabled && !!pid && !!id,
+  });
+}
+
+export function useVMMetrics(pid: string, id: string, enabled = true) {
+  return useQuery<VMMetricsResponse>({
+    queryKey: qk.vmMetrics(pid, id),
+    queryFn: () => api.vmMetrics(pid, id),
+    enabled: enabled && !!pid && !!id,
+    refetchInterval: 10_000,
+  });
+}
+
+export function useVMClusters(pid: string, enabled = true) {
+  return useQuery<VMCluster[]>({
+    queryKey: qk.vmClusters(pid),
+    queryFn: () => api.vmClusters(pid),
+    enabled: enabled && !!pid,
+    refetchInterval: POLL,
+  });
+}
+
+export function useVMClusterTopology(pid: string, cid: string, enabled = true) {
+  return useQuery<VMClusterTopology>({
+    queryKey: qk.vmClusterTopology(pid, cid),
+    queryFn: () => api.vmClusterTopology(pid, cid),
+    enabled: enabled && !!pid && !!cid,
+  });
+}
+
+/** Recent V2V migration jobs (polled while the migration view is open). */
+export function useV2VJobs(enabled = true, opts?: Partial<UseQueryOptions<V2VProgress[]>>) {
+  return useQuery<V2VProgress[]>({
+    queryKey: qk.v2vJobs,
+    queryFn: () => api.v2vJobs(),
+    enabled,
+    refetchInterval: 4000,
     ...opts,
   });
 }

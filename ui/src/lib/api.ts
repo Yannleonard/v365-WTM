@@ -95,6 +95,28 @@ import type {
   ValidateStackRequest,
   Workload,
   WorkloadDetail,
+  Inventory,
+  VM,
+  VMDetail,
+  VMProvider,
+  VMSnapshot,
+  VMHost,
+  VMCluster,
+  VMClusterTopology,
+  VMStorage,
+  VMNetwork,
+  VMMetricsResponse,
+  VMTask,
+  VMSnapshotCreateRequest,
+  VMCloneRequest,
+  VMMigrateRequest,
+  VMReconfigureRequest,
+  VMSpec,
+  VMPowerOp,
+  V2VRequest,
+  V2VPreflightResult,
+  V2VMigrateResponse,
+  V2VProgress,
 } from "./types";
 
 export const API_BASE = "/api/v1";
@@ -633,6 +655,60 @@ export const api = {
     del<void>(`/hosts/${encId(hostId)}/stacks/${encId(id)}`),
   stackBuilderGenerate: (body: BuilderRequest) =>
     post<BuilderResponse>("/stacks/builder/generate", body),
+  /* ---- unified inventory (single pane of glass) ---- */
+  // Aggregated VM + container snapshot: vms/hosts/clusters/storage/networks/
+  // workloads + counts + degraded[]. Drives the unified dashboard + VM lists.
+  listInventory: () => get<Inventory>("/inventory"),
+
+  /* ---- virtual machines / hypervisors ---- */
+  // Hypervisor providers + their capability lists (mirrors /providers for VMs).
+  vmProviders: () => get<VMProvider[]>("/vm/providers"),
+  // All VMs for one provider.
+  vms: (pid: string) => get<VM[]>(`/vm/providers/${encId(pid)}/vms`),
+  // One VM (normalized + hypervisor-native raw).
+  vm: (pid: string, vmId: string) =>
+    get<VMDetail>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}`),
+  vmSnapshots: (pid: string, vmId: string) =>
+    get<VMSnapshot[]>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/snapshots`),
+  vmMetrics: (pid: string, vmId: string) =>
+    get<VMMetricsResponse>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/metrics`),
+  // Hypervisor infrastructure (per provider).
+  vmHosts: (pid: string) => get<VMHost[]>(`/vm/providers/${encId(pid)}/hosts`),
+  vmClusters: (pid: string) => get<VMCluster[]>(`/vm/providers/${encId(pid)}/clusters`),
+  vmClusterTopology: (pid: string, cid: string) =>
+    get<VMClusterTopology>(`/vm/providers/${encId(pid)}/clusters/${encId(cid)}/topology`),
+  vmStorage: (pid: string) => get<VMStorage[]>(`/vm/providers/${encId(pid)}/storage`),
+  vmNetworks: (pid: string) => get<VMNetwork[]>(`/vm/providers/${encId(pid)}/networks`),
+  // Power lifecycle (op: start|stop|reset|suspend|resume). Returns a Task.
+  vmPower: (pid: string, vmId: string, op: VMPowerOp) =>
+    post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/power/${encId(op)}`),
+  // Snapshot create / revert.
+  vmSnapshotCreate: (pid: string, vmId: string, body: VMSnapshotCreateRequest) =>
+    post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/snapshots`, body),
+  vmSnapshotRevert: (pid: string, vmId: string, snapId: string) =>
+    post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/snapshots/${encId(snapId)}/revert`),
+  // Clone / intra-hypervisor migrate / reconfigure.
+  vmClone: (pid: string, vmId: string, body: VMCloneRequest) =>
+    post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/clone`, body),
+  vmMigrate: (pid: string, vmId: string, body: VMMigrateRequest) =>
+    post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/migrate`, body),
+  vmReconfigure: (pid: string, vmId: string, body: VMReconfigureRequest) =>
+    post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/reconfigure`, body),
+  // Create (admin) / delete.
+  vmCreate: (pid: string, body: VMSpec) => post<VMTask>(`/vm/providers/${encId(pid)}/vms`, body),
+  vmDelete: (pid: string, vmId: string, opts: { force?: boolean; deleteDisks?: boolean } = {}) => {
+    const { force, deleteDisks } = opts;
+    return del<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}${qs({ force, deleteDisks })}`);
+  },
+
+  /* ---- V2V cross-hypervisor migration ---- */
+  // Preflight validates a migration (ok:false + issues[] is a normal result,
+  // not an HTTP error); migrate enqueues the job and returns its id.
+  v2vPreflight: (body: V2VRequest) => post<V2VPreflightResult>("/v2v/preflight", body),
+  v2vMigrate: (body: V2VRequest) => post<V2VMigrateResponse>("/v2v/migrate", body),
+  v2vJobs: () => get<V2VProgress[]>("/v2v/jobs"),
+  v2vJob: (id: string) => get<V2VProgress>(`/v2v/jobs/${encId(id)}`),
+
   /* ---- settings ---- */
   settings: () => get<SettingsResponse>("/settings"),
   settingsUpdate: (body: SettingsPatch) => put<SettingsResponse>("/settings", body),

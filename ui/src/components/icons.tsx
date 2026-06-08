@@ -296,6 +296,49 @@ export const IconScale = (p: IconProps) => (
   </svg>
 );
 
+// Virtual machine: a monitor/screen with a small "VM" cursor mark — distinct
+// from IconWorkloads (container cube) and IconHosts (server racks).
+export const IconVM = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="3" y="4" width="18" height="12" rx="2" />
+    <path d="M8 20h8M12 16v4" />
+    <path d="m9 8 3 2-3 2M13 12h2" />
+  </svg>
+);
+
+// Pause: two vertical bars (VM suspend action).
+export const IconPause = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="6" y="5" width="4" height="14" rx="1" fill="currentColor" stroke="none" />
+    <rect x="14" y="5" width="4" height="14" rx="1" fill="currentColor" stroke="none" />
+  </svg>
+);
+
+// Camera/snapshot mark (VM snapshot action).
+export const IconSnapshot = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M4 7h3l2-2h6l2 2h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1z" />
+    <circle cx="12" cy="13" r="3.2" />
+  </svg>
+);
+
+// Clone: two overlapping squares (VM clone action).
+export const IconClone = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="9" y="9" width="11" height="11" rx="2" />
+    <path d="M5 15V5a2 2 0 0 1 2-2h8" />
+  </svg>
+);
+
+// Migration: an arrow crossing between two stacked planes (V2V move).
+export const IconMigrate = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="3" y="4" width="7" height="7" rx="1.5" />
+    <rect x="14" y="13" width="7" height="7" rx="1.5" />
+    <path d="M10 7h6a2 2 0 0 1 2 2v3M18 12l-2.5-2.5M18 12l2.5-2.5" />
+  </svg>
+);
+
 // Edit / pencil.
 export const IconEdit = (p: IconProps) => (
   <svg {...base(p)}>

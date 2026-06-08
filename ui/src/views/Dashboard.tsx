@@ -24,12 +24,13 @@ import {
   type TooltipProps,
 } from "recharts";
 import { useAuth } from "../lib/auth";
-import { useDashboardMetrics, useHosts, useProviders } from "../lib/hooks";
+import { useDashboardMetrics, useHosts, useProviders, useInventory } from "../lib/hooks";
 import { useSelectedHost } from "../lib/hostStore";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { PageHeader } from "../components/PageHeader";
 import { OrchestratorBadge } from "../components/OrchestratorBadge";
+import { StatCard } from "../components/StatCard";
 import { StatusDot } from "../components/StatusDot";
 import { LoadingFill } from "../components/Spinner";
 import { EmptyState } from "../components/EmptyState";
@@ -41,6 +42,7 @@ import {
   IconVolumes,
   IconStats,
   IconAudit,
+  IconVM,
 } from "../components/icons";
 import { formatBytes, formatPct, timeAgo } from "../lib/format";
 import type { AuditResult, DashboardTopContainer } from "../lib/types";
@@ -85,6 +87,8 @@ export function Dashboard() {
   const hostsQ = useHosts();
   const metricsQ = useDashboardMetrics(hostId);
   const providersQ = useProviders();
+  // Unified single-pane snapshot (VMs + containers across every provider).
+  const inventoryQ = useInventory();
 
   const canAudit = can("audit.read");
   const auditQ = useQuery({
@@ -146,6 +150,68 @@ export function Dashboard() {
               Review hosts
             </a>
             .
+          </span>
+        </div>
+      ) : null}
+
+      {/* ---- unified single-pane headline (VMs + containers side by side) ---- */}
+      {(() => {
+        const inv = inventoryQ.data;
+        const counts = inv?.counts;
+        return (
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+              gap: "var(--sp-4)",
+            }}
+          >
+            <StatCard
+              label="Virtual machines"
+              icon={<IconVM size={18} />}
+              accent="var(--accent)"
+              value={counts ? counts.vms : "—"}
+              sub={counts ? `${counts.vmsRunning} running` : "across hypervisors"}
+              onClick={() => navigate("/vms")}
+            />
+            <StatCard
+              label="Containers"
+              icon={<IconWorkloads size={18} />}
+              accent="var(--success)"
+              value={counts ? counts.containers : "—"}
+              sub={counts ? `${counts.containersUp} up` : "across orchestrators"}
+              onClick={() => navigate("/workloads")}
+            />
+            <StatCard
+              label="Hypervisor hosts"
+              icon={<IconHosts size={18} />}
+              value={counts ? counts.hosts : "—"}
+              sub={counts ? `${counts.hypervisorProviders} hypervisors` : "physical nodes"}
+            />
+            <StatCard
+              label="Clusters"
+              icon={<IconNetworks size={18} />}
+              value={counts ? counts.clusters : "—"}
+              sub="HA / DRS domains"
+              onClick={() => navigate("/vm-clusters")}
+            />
+            <StatCard
+              label="Container hosts"
+              icon={<IconHosts size={18} />}
+              value={counts ? counts.containerHosts : "—"}
+              sub="engine endpoints"
+              onClick={() => navigate("/hosts")}
+            />
+          </div>
+        );
+      })()}
+
+      {(inventoryQ.data?.degraded ?? []).length > 0 ? (
+        <div className="banner warning">
+          <IconHosts size={16} />
+          <span>
+            {inventoryQ.data!.degraded.length} provider(s) degraded in the unified inventory — some VM or
+            container data may be incomplete.
           </span>
         </div>
       ) : null}
