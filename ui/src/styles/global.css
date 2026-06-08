@@ -1051,3 +1051,158 @@ li { list-style: none; }
   .mkt-row-vol { grid-template-columns: 1fr auto 1fr; }
   .summary-grid { grid-template-columns: 1fr; }
 }
+
+/* ============================================================================
+   Lot 2A — Inventory Tree (left object inventory for the VM/Compute domain).
+   Layout: the existing .app-main is a vertical stack (TopBar / workspace /
+   tasksbar). .app-workspace is the middle row; in the VM domain it splits into
+   [tree | content]. Everything reuses Sidebar nav tokens so the tree reads as
+   native Castor chrome.
+   ============================================================================ */
+
+.app-workspace {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+}
+.app-workspace > .app-content { flex: 1 1 auto; min-width: 0; }
+
+.app-tree {
+  flex: 0 0 var(--invtree-w, 280px);
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  background: var(--bg-surface);
+  overflow: hidden;
+}
+
+.invtree {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+.invtree-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4) var(--sp-2);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.invtree-title {
+  font-size: 10px;
+  font-weight: var(--fw-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+}
+.invtree-search {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  flex: 0 0 auto;
+}
+.invtree-search .input { height: 30px; font-size: var(--fs-xs); }
+.invtree-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: var(--sp-2) var(--sp-2) var(--sp-3);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.invtree-empty {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-4) var(--sp-3);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+/* A tree row IS a .nav-item (hover / active / left-rail inherited) but clickable
+   even when it only toggles, so render it as a button-like div. */
+.invtree-item {
+  cursor: pointer;
+  padding-top: 5px;
+  padding-bottom: 5px;
+  font-size: var(--fs-sm);
+  user-select: none;
+}
+.invtree-item .nav-icon svg { display: block; }
+.invtree-item .nav-label { flex: 1 1 auto; min-width: 0; }
+
+/* Chevron column: fixed width so labels align across depths; ghost = leaf spacer. */
+.invtree-chev {
+  flex: 0 0 14px;
+  width: 14px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  transition: transform var(--dur-fast) var(--ease);
+}
+.invtree-chev svg { transition: transform var(--dur-fast) var(--ease); }
+.invtree-chev.ghost { visibility: hidden; }
+.invtree-item:hover .invtree-chev { color: var(--text-secondary); }
+
+/* Badges (protected lock, alarm count) — same vocabulary as .pill / .nav-badge. */
+.invtree-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: var(--fw-semibold);
+  line-height: 1;
+}
+.invtree-badge.protected { color: var(--state-protected); }
+.invtree-badge.alarm {
+  color: var(--danger);
+  background: var(--danger-bg);
+  border-radius: var(--radius-pill);
+  padding: 1px 6px;
+}
+
+/* Collapse / reopen affordances for the whole pane. */
+.invtree-collapse {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2);
+  border: none;
+  border-top: 1px solid var(--border);
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.invtree-collapse:hover { background: var(--bg-surface-2); color: var(--text-secondary); }
+.invtree-reopen {
+  flex: 0 0 28px;
+  width: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-right: 1px solid var(--border);
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.invtree-reopen:hover { background: var(--bg-surface-2); color: var(--accent); }
+
+/* Responsive: on narrow screens the tree narrows; the rest of the app already
+   collapses its module sidebar at 920px (shell.css), so this complements it. */
+@media (max-width: 1100px) {
+  .app-tree { flex-basis: 240px; }
+}
+@media (max-width: 820px) {
+  .app-workspace.with-tree .app-tree { flex-basis: 200px; }
+}
