@@ -109,6 +109,9 @@ var permissionCatalog = []string{
 	"vm.export",
 	"vm.create",
 	"vm.delete",
+	// UniHV V2V cross-hypervisor migration: read job status / run a migration.
+	"v2v.read",
+	"v2v.migrate",
 	// audit & settings
 	"audit.read",
 	"settings.read",

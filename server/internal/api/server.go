@@ -15,6 +15,7 @@ import (
 	"github.com/gtek-it/castor/server/internal/cache"
 	"github.com/gtek-it/castor/server/internal/config"
 	"github.com/gtek-it/castor/server/internal/inventory"
+	"github.com/gtek-it/castor/server/internal/migrate"
 	"github.com/gtek-it/castor/server/internal/provider"
 	"github.com/gtek-it/castor/server/internal/store"
 	"github.com/gtek-it/castor/server/internal/vprovider"
@@ -32,8 +33,9 @@ type Server struct {
 	// UniHV VM domain: the hypervisor provider registry and the unified
 	// (VM + container) inventory aggregator. vreg may be empty (no hypervisors
 	// configured); agg is always set (it tolerates nil domains).
-	vreg *vprovider.Registry
-	agg  *inventory.Aggregator
+	vreg   *vprovider.Registry
+	agg    *inventory.Aggregator
+	migEng *migrate.Engine
 }
 
 // NewServer constructs the API server. vreg is the hypervisor registry (may be an
@@ -53,6 +55,7 @@ func NewServer(cfg *config.Config, st *store.Store, az *authz.Deps, guard *authz
 		vreg:    vreg,
 	}
 	s.agg = inventory.New(vreg, containerSnapshotAdapter{mgr: mgr})
+	s.migEng = migrate.New(vreg, nil) // nil -> qemu-img converter (passthrough fallback)
 	return s
 }
 

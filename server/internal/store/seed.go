@@ -47,6 +47,7 @@ var AllReadPermissions = []string{
 	"vm.storage.read",
 	"vm.network.read",
 	"inventory.read",
+	"v2v.read",
 	"audit.read",
 	"settings.read",
 }
@@ -119,6 +120,7 @@ var operatorExtraPermissions = []string{
 	"vm.clone",        // clone an existing VM
 	"vm.migrate",      // intra-hypervisor live/cold migrate
 	"vm.export",       // export disks (for V2V); non-destructive read of disk
+	"v2v.migrate",     // run a cross-hypervisor V2V migration
 }
 
 // Seed inserts the built-in roles, the local host row, and default settings.
