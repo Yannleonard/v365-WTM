@@ -506,6 +506,20 @@ func (b *liveBackend) defineDomain(d *libvirtDomain) error {
 		}
 		d.SeedISO = seed
 	}
+	// Windows sysprep (Lot 4A): build the autounattend.xml seed ISO (volid 'sysprep')
+	// and attach it as an extra cdrom (renderDomainXML reads d.SysprepISO). Mirrors the
+	// cloud-init seed path. Live-only (the sim backend ignores Sysprep).
+	if d.Sysprep != nil {
+		poolName := "default"
+		if len(d.Disks) > 0 && d.Disks[0].Pool != "" {
+			poolName = d.Disks[0].Pool
+		}
+		seed, err := b.buildSysprepISO(d.Name, poolName, d.Sysprep)
+		if err != nil {
+			return err
+		}
+		d.SysprepISO = seed
+	}
 	xmlDesc := renderDomainXML(d)
 	dom, err := l.DomainDefineXML(xmlDesc)
 	if err != nil {
@@ -683,6 +697,39 @@ func (b *liveBackend) domainsOnHost(hostID string) int {
 		}
 	}
 	return n
+}
+
+// markTemplate sets/clears the UniHV template marker on a domain via the official
+// libvirt DomainSetMetadata RPC (Lot 4A). It writes a custom <unihv:template>true</>
+// element under the domain's <metadata> (DomainMetadataElement, namespace
+// unihvMetadataNS, prefix "unihv") with DomainAffectConfig so it persists. Passing
+// an empty metadata removes the element (unmark). This is the libvirt-recommended
+// way to attach app metadata WITHOUT re-rendering (and risking dropping devices on)
+// the full domain XML.
+func (b *liveBackend) markTemplate(uuid string, isTemplate bool) error {
+	l, dom, ok := b.domainHandle(uuid)
+	if !ok {
+		if l == nil {
+			return errNoConn
+		}
+		return vp.ErrNotFound
+	}
+	meta := libvirt.OptString{} // empty -> remove the element (unmark)
+	if isTemplate {
+		meta = libvirt.OptString{"<template>true</template>"}
+	}
+	if err := l.DomainSetMetadata(
+		dom,
+		int32(libvirt.DomainMetadataElement),
+		meta,
+		libvirt.OptString{"unihv"},
+		libvirt.OptString{unihvMetadataNS},
+		libvirt.DomainAffectConfig,
+	); err != nil {
+		b.fail(err)
+		return mapLibvirtErr(err)
+	}
+	return nil
 }
 
 // --- snapshots ---
@@ -2235,6 +2282,22 @@ type domainXML struct {
 		} `xml:"loader"`
 		Firmware string `xml:"firmware,attr"`
 	} `xml:"os"`
+	// CPU topology + model (Lot 4A). Mode is host-passthrough/host-model/custom; the
+	// <topology> gives sockets/cores/threads; <model> the named CPU model (custom).
+	CPU struct {
+		Mode     string `xml:"mode,attr"`
+		Model    string `xml:"model"`
+		Topology struct {
+			Sockets int `xml:"sockets,attr"`
+			Cores   int `xml:"cores,attr"`
+			Threads int `xml:"threads,attr"`
+		} `xml:"topology"`
+	} `xml:"cpu"`
+	// Metadata carries UniHV's custom <unihv:template> element. The local-name match
+	// (any-namespace 'template') reads the template marker set via DomainSetMetadata.
+	Metadata struct {
+		Template string `xml:"template"`
+	} `xml:"metadata"`
 	Devices struct {
 		Disks []struct {
 			Device string `xml:"device,attr"`
@@ -2296,6 +2359,25 @@ func applyDomainXML(d *libvirtDomain, raw string) {
 		d.Firmware = vp.FirmwareUEFI
 	} else {
 		d.Firmware = vp.FirmwareBIOS
+	}
+	// CPU topology + model (Lot 4A): surface an explicit <cpu><topology> back into the
+	// model so GetVM/ListVMs reflect sockets/cores/threads + the CPU model (via Labels).
+	if t := dx.CPU.Topology; t.Sockets > 0 || t.Cores > 0 || t.Threads > 0 || dx.CPU.Mode != "" || dx.CPU.Model != "" {
+		model := strings.TrimSpace(dx.CPU.Model)
+		if model == "" {
+			model = strings.TrimSpace(dx.CPU.Mode) // host-passthrough/host-model
+		}
+		d.CPU = &vp.CPUSpec{
+			Sockets:        t.Sockets,
+			CoresPerSocket: t.Cores,
+			ThreadsPerCore: t.Threads,
+			Model:          model,
+		}
+	}
+	// Template marker (Lot 4A): the <unihv:template>true</> metadata element set via
+	// DomainSetMetadata.
+	if strings.EqualFold(strings.TrimSpace(dx.Metadata.Template), "true") {
+		d.IsTemplate = true
 	}
 	for _, dk := range dx.Devices.Disks {
 		if dk.Device == "cdrom" {
@@ -2421,12 +2503,58 @@ func renderDomainXML(d *libvirtDomain) string {
 	if vcpu <= 0 {
 		vcpu = 1
 	}
+	// CPU topology (Lot 4A): when an explicit topology is set, <vcpu> MUST equal
+	// sockets*cores*threads or libvirt rejects the domain. Override the flat count.
+	if n := cpuTopologyVCPUs(d.CPU); n > 0 {
+		vcpu = n
+	}
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "<domain type='kvm'>\n")
 	fmt.Fprintf(&sb, "  <name>%s</name>\n", xmlEscape(d.Name))
+	// Template metadata (Lot 4A): UniHV marks golden-image domains with a custom
+	// <unihv:template> element. Emitted at create time when IsTemplate is set; the
+	// MarkTemplate path uses DomainSetMetadata to toggle it later.
+	if d.IsTemplate {
+		fmt.Fprintf(&sb, "  <metadata>\n")
+		fmt.Fprintf(&sb, "    <unihv:template xmlns:unihv='%s'>true</unihv:template>\n", xmlEscape(unihvMetadataNS))
+		fmt.Fprintf(&sb, "  </metadata>\n")
+	}
 	fmt.Fprintf(&sb, "  <memory unit='KiB'>%d</memory>\n", memKiB)
 	fmt.Fprintf(&sb, "  <currentMemory unit='KiB'>%d</currentMemory>\n", memKiB)
 	fmt.Fprintf(&sb, "  <vcpu placement='static'>%d</vcpu>\n", vcpu)
+	// CPU topology + model (Lot 4A): emit a <cpu> element when a topology/model is
+	// requested. Mode 'host-passthrough' (the default / empty model) exposes the host
+	// CPU verbatim; a named model uses mode 'custom'. A <topology> pins sockets/cores/
+	// threads so the guest sees the intended core layout (licensing/NUMA/perf).
+	if c := d.CPU; c != nil {
+		model := strings.TrimSpace(c.Model)
+		mode := "host-passthrough"
+		switch strings.ToLower(model) {
+		case "", "host-passthrough":
+			mode = "host-passthrough"
+			model = ""
+		case "host-model":
+			mode = "host-model"
+			model = ""
+		default:
+			mode = "custom"
+		}
+		hasTopo := c.Sockets > 0 && c.CoresPerSocket > 0 && c.ThreadsPerCore > 0
+		if mode == "custom" {
+			fmt.Fprintf(&sb, "  <cpu mode='custom' match='exact' check='partial'>\n")
+			fmt.Fprintf(&sb, "    <model fallback='allow'>%s</model>\n", xmlEscape(model))
+			if hasTopo {
+				fmt.Fprintf(&sb, "    <topology sockets='%d' cores='%d' threads='%d'/>\n", c.Sockets, c.CoresPerSocket, c.ThreadsPerCore)
+			}
+			fmt.Fprintf(&sb, "  </cpu>\n")
+		} else if hasTopo {
+			fmt.Fprintf(&sb, "  <cpu mode='%s'>\n", mode)
+			fmt.Fprintf(&sb, "    <topology sockets='%d' cores='%d' threads='%d'/>\n", c.Sockets, c.CoresPerSocket, c.ThreadsPerCore)
+			fmt.Fprintf(&sb, "  </cpu>\n")
+		} else {
+			fmt.Fprintf(&sb, "  <cpu mode='%s'/>\n", mode)
+		}
+	}
 	// Always use the modern q35 machine type so EVERY UniHV-created VM supports PCIe
 	// hot-plug (live add/remove of disks & NICs). i440fx's pci.0 bus cannot hotplug,
 	// so we no longer emit it. UEFI adds the efi firmware loader.
@@ -2518,6 +2646,18 @@ func renderDomainXML(d *libvirtDomain) string {
 		fmt.Fprintf(&sb, "      <driver name='qemu' type='raw'/>\n")
 		fmt.Fprintf(&sb, "      <source file='%s'/>\n", xmlEscape(d.SeedISO))
 		fmt.Fprintf(&sb, "      <target dev='sdb' bus='sata'/>\n")
+		fmt.Fprintf(&sb, "      <readonly/>\n")
+		fmt.Fprintf(&sb, "    </disk>\n")
+	}
+	// Windows sysprep seed (Lot 4A): a read-only cdrom carrying the autounattend.xml
+	// ISO (volid 'sysprep'). Windows Setup auto-discovers an autounattend.xml on any
+	// attached removable media, so this drives an unattended specialize/OOBE pass —
+	// the Windows analogue of the cloud-init NoCloud seed. Distinct sata target (sdc).
+	if d.SysprepISO != "" {
+		fmt.Fprintf(&sb, "    <disk type='file' device='cdrom'>\n")
+		fmt.Fprintf(&sb, "      <driver name='qemu' type='raw'/>\n")
+		fmt.Fprintf(&sb, "      <source file='%s'/>\n", xmlEscape(d.SysprepISO))
+		fmt.Fprintf(&sb, "      <target dev='sdc' bus='sata'/>\n")
 		fmt.Fprintf(&sb, "      <readonly/>\n")
 		fmt.Fprintf(&sb, "    </disk>\n")
 	}

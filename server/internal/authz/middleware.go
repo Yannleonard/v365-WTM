@@ -244,6 +244,13 @@ func (d *Deps) CSRF(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		// Bearer-authenticated requests are exempt from CSRF: an API token is sent
+		// in the Authorization header, never as a cookie, so it cannot be driven by
+		// a cross-site request the way an ambient session cookie can.
+		if IsBearerAuth(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if !d.originAllowed(r) {
 			WriteError(w, r, Errorf(ErrCSRFFailed, "Origin not allowed."))
 			return

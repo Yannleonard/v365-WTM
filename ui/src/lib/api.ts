@@ -137,6 +137,11 @@ import type {
   RightsizingResponse,
   RateCard,
   InsightsFeed,
+  VMBulkRequest,
+  VMBulkResponse,
+  ApiTokenRecord,
+  ApiTokenCreateRequest,
+  ApiTokenCreateResponse,
 } from "./types";
 
 export const API_BASE = "/api/v1";
@@ -791,6 +796,30 @@ export const api = {
     post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/migrate`, body),
   vmReconfigure: (pid: string, vmId: string, body: VMReconfigureRequest) =>
     post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/reconfigure`, body),
+
+  /* ---- VM templates (Lot 4A) ---- */
+  // Mark/unmark a VM as a golden-image TEMPLATE (admin; "templates" cap). The VM
+  // must be shut off. List the provider's templates (reuses the VM list shape).
+  // Deploy-from-template is the existing vmClone (it yields a non-template VM).
+  vmMarkTemplate: (pid: string, vmId: string, isTemplate: boolean) =>
+    post<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/template`, { isTemplate }),
+  vmTemplates: (pid: string) => get<VM[]>(`/vm/providers/${encId(pid)}/templates`),
+
+  /* ---- host maintenance mode + evacuation (Lot 4B) ---- */
+  // Enter maintenance (optionally evacuate the host's running VMs to another host
+  // via live-migrate); exit clears the mark. Both return a Task whose message
+  // describes the evacuation outcome. Gated on the "maintenance" cap +
+  // vm.host.maintenance (admin).
+  vmHostEnterMaintenance: (pid: string, hostId: string, evacuate: boolean) =>
+    post<VMTask>(`/vm/providers/${encId(pid)}/hosts/${encId(hostId)}/maintenance`, { evacuate }),
+  vmHostExitMaintenance: (pid: string, hostId: string) =>
+    del<VMTask>(`/vm/providers/${encId(pid)}/hosts/${encId(hostId)}/maintenance`),
+
+  /* ---- bulk operations (multi-select fan-out, Lot 4B) ---- */
+  // Fan a single action (power|snapshot|delete) across many VMs (possibly across
+  // providers). Each target is re-gated server-side by the SAME permission the
+  // single action needs; the response carries a per-target result.
+  vmBulk: (body: VMBulkRequest) => post<VMBulkResponse>("/vm/bulk", body),
   // Create (admin) / delete.
   vmCreate: (pid: string, body: VMSpec) => post<VMTask>(`/vm/providers/${encId(pid)}/vms`, body),
   vmDelete: (pid: string, vmId: string, opts: { force?: boolean; deleteDisks?: boolean } = {}) => {
@@ -889,6 +918,14 @@ export const api = {
 
   /* ---- Insights (drift / health / best-practice feed) ---- */
   insights: () => get<InsightsFeed>("/insights"),
+
+  /* ---- API tokens (scoped personal access tokens, Lot 4B) ---- */
+  // List the caller's active tokens (metadata only; the raw value is shown ONCE
+  // at create and never retrievable again). Create returns the record + the raw
+  // token exactly once. Delete revokes by id.
+  apiTokens: () => get<ApiTokenRecord[]>("/tokens"),
+  apiTokenCreate: (body: ApiTokenCreateRequest) => post<ApiTokenCreateResponse>("/tokens", body),
+  apiTokenDelete: (id: string) => del<void>(`/tokens/${encId(id)}`),
 
   /* ---- settings ---- */
   settings: () => get<SettingsResponse>("/settings"),

@@ -109,6 +109,9 @@ var permissionCatalog = []string{
 	"vm.export",
 	"vm.create",
 	"vm.delete",
+	// Lot 4B: host maintenance mode + evacuation (admin-grade). Putting a host
+	// into maintenance drains/evacuates its VMs, an infrastructure-level action.
+	"vm.host.maintenance",
 	// UniHV VM extension features: graphical console, virtual-network write,
 	// storage volume/ISO read+write.
 	"vm.console",
@@ -120,6 +123,9 @@ var permissionCatalog = []string{
 	"vm.hotplug",
 	// Online disk resize (grow a VM's disk live via DomainBlockResize). Operator-grade.
 	"vm.disk.resize",
+	// Lot 4A: mark/unmark a VM as a golden-image template. Admin-grade
+	// (provisioning-class); clone-from-template reuses vm.clone.
+	"vm.template",
 	// UniHV V2V cross-hypervisor migration: read job status / run a migration.
 	"v2v.read",
 	"v2v.migrate",

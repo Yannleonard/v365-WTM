@@ -212,6 +212,26 @@ func (b *simBackend) reconfigureDomain(uuid string, vcpus *int, memMB *int64) er
 	return nil
 }
 
+// markTemplate toggles the in-memory domain's template flag + label (Lot 4A).
+func (b *simBackend) markTemplate(uuid string, isTemplate bool) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	d, ok := b.domains[uuid]
+	if !ok {
+		return vp.ErrNotFound
+	}
+	d.IsTemplate = isTemplate
+	if isTemplate {
+		if d.Labels == nil {
+			d.Labels = map[string]string{}
+		}
+		d.Labels[labelTemplate] = "true"
+	} else {
+		delete(d.Labels, labelTemplate)
+	}
+	return nil
+}
+
 func (b *simBackend) domainsOnHost(hostID string) int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()

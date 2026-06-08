@@ -18,6 +18,7 @@ import {
   gateVMAction,
   gateVMConsole,
   gateVMHotPlug,
+  gateVMTemplate,
   type GateResult,
 } from "../lib/rbac";
 import { ActionButton } from "./ActionButton";
@@ -39,6 +40,7 @@ import {
   IconEject,
   IconChevronDown,
   IconRefresh,
+  IconStacks,
 } from "./icons";
 
 /** Everything the bar/menu drives — all already provided by useVMActions(). */
@@ -56,6 +58,10 @@ export interface VMActionHandlers {
   onDelete: (vm: VM) => void;
   onConsole?: (vm: VM) => void;
   onRefresh?: () => void;
+  // Templates (Lot 4A). Optional — present on the VM list. onDeploy deploys a fresh
+  // VM from a template (reuses Clone); onMarkTemplate toggles the template marking.
+  onDeploy?: (vm: VM) => void;
+  onMarkTemplate?: (vm: VM, isTemplate: boolean) => void;
 }
 
 interface Props extends VMActionHandlers {
@@ -304,7 +310,9 @@ function ActionsMenu(props: Props & { compact?: boolean }) {
   const gHotPlug = gateVMHotPlug(caps, permissions);
   const gClone = gateVMAction("clone", caps, permissions);
   const gMigrate = gateVMAction("migrate", caps, permissions);
+  const gTemplate = gateVMTemplate(caps, permissions);
   const gDelete = deleteGate(vm, gateVMAction("delete_vm", caps, permissions), permissions);
+  const isTemplate = vm.labels?.["unihv.template"] === "true";
 
   const close = () => {
     setOpen(false);
@@ -431,6 +439,19 @@ function ActionsMenu(props: Props & { compact?: boolean }) {
           )}
 
           <div className="menu-divider" />
+          {/* Templates (Lot 4A): Deploy-from-template appears for template VMs; the
+              Mark/Unmark toggle is offered when the provider supports templates. */}
+          {props.onDeploy && isTemplate
+            ? item("Deploy from template…", <IconStacks size={15} />, gClone, () => props.onDeploy!(vm))
+            : null}
+          {props.onMarkTemplate
+            ? item(
+                isTemplate ? "Unmark template" : "Mark as template",
+                <IconStacks size={15} />,
+                gTemplate,
+                () => props.onMarkTemplate!(vm, !isTemplate),
+              )
+            : null}
           {item("Clone…", <IconClone size={15} />, gClone, () => props.onClone(vm))}
           {item("Migrate…", <IconMigrate size={15} />, gMigrate, () => props.onMigrate(vm))}
           <div className="menu-divider" />

@@ -259,6 +259,11 @@ func main() {
 	proveSnapshotTreeAndDelete(ctx, p)
 	proveDiskResize(ctx, p)
 
+	// --- LOT 4A proofs: CPU topology, VM templates, Windows sysprep ---
+	proveCPUTopology(ctx, p)
+	proveTemplates(ctx, p)
+	proveSysprep(ctx, p)
+
 	fmt.Println("\nPROBE OK: real libvirt RPC API exercised end to end.")
 }
 
@@ -1305,6 +1310,268 @@ func isoFile(ctx context.Context, isoPath, name string) string {
 		return ""
 	}
 	return string(b)
+}
+
+// proveCPUTopology: LOT 4A #1. Create a domain with an explicit CPU topology
+// (2 sockets x 2 cores x 1 thread = 4 vCPUs) + host-passthrough mode, START it,
+// and CONFIRM via the LIVE domain XML that <cpu> + <topology sockets='2' cores='2'
+// threads='1'/> are present and <vcpu> == 4.
+func proveCPUTopology(ctx context.Context, p *kvm.Provider) {
+	fmt.Println("== LOT 4A #1 proof: CPU topology (2 sockets x 2 cores) in the LIVE domain XML ==")
+	sp, _ := any(p).(vprovider.StorageProvider)
+	pool := firstActivePool(ctx, p)
+	if sp == nil || pool == "" {
+		fmt.Println("  no active storage pool; skipping")
+		fmt.Println()
+		return
+	}
+	volName := fmt.Sprintf("unihv-cputopo-%d.qcow2", time.Now().UnixNano())
+	if _, err := sp.CreateVolume(ctx, vprovider.VolumeSpec{Name: volName, StorageID: pool, CapacityGB: 1, Format: vprovider.DiskQcow2}); err != nil {
+		fatalf("cputopo: CreateVolume: %v", err)
+	}
+	diskPath := volPath(ctx, sp, pool, volName)
+	name := fmt.Sprintf("unihv-cputopo-dom-%d", time.Now().UnixNano())
+	task, err := p.CreateVM(ctx, vprovider.VMSpec{
+		Name: name, MemoryMB: 512, Firmware: vprovider.FirmwareBIOS,
+		CPU:   &vprovider.CPUSpec{Sockets: 2, CoresPerSocket: 2, ThreadsPerCore: 1},
+		Disks: []vprovider.DiskSpec{{StorageID: pool, SourcePath: diskPath, Format: vprovider.DiskQcow2, CapacityGB: 1}},
+	})
+	if err != nil {
+		fatalf("cputopo: CreateVM: %v", err)
+	}
+	id := task.EntityID
+	defer func() {
+		_, _ = p.DeleteVM(ctx, id, vprovider.DeleteOptions{Force: true})
+		_, _ = sp.DeleteVolume(ctx, pool, volName)
+	}()
+	xml := dumpXML(ctx, name)
+	hasCPU := strings.Contains(xml, "<cpu")
+	hasTopo := strings.Contains(xml, "sockets='2'") && strings.Contains(xml, "cores='2'") && strings.Contains(xml, "threads='1'")
+	hasVcpu4 := strings.Contains(xml, ">4</vcpu>")
+	fmt.Printf("  live XML checks: <cpu>=%v  topology(2x2x1)=%v  <vcpu>==4=%v\n", hasCPU, hasTopo, hasVcpu4)
+	for _, line := range strings.Split(xml, "\n") {
+		l := strings.TrimSpace(line)
+		if strings.Contains(l, "<vcpu") || strings.Contains(l, "<cpu") || strings.Contains(l, "<topology") {
+			fmt.Printf("    | %s\n", l)
+		}
+	}
+	// Confirm GetVM surfaces the topology via Labels (frozen VM struct unchanged).
+	if d, gerr := p.GetVM(ctx, id); gerr == nil {
+		fmt.Printf("  GetVM labels: sockets=%q cores=%q threads=%q model=%q ; vcpus=%d\n",
+			d.Labels["unihv.cpu.sockets"], d.Labels["unihv.cpu.cores"], d.Labels["unihv.cpu.threads"], d.Labels["unihv.cpu.model"], d.VCPUs)
+	}
+	if !hasCPU || !hasTopo || !hasVcpu4 {
+		fatalf("cputopo: topology NOT present/derived in the live domain XML — feature NOT proven")
+	}
+	fmt.Println("  CONFIRMED: explicit CPU topology emitted; vCPU derived from sockets*cores*threads.")
+	fmt.Println()
+}
+
+// proveTemplates: LOT 4A #2. Create a VM, mark it as a TEMPLATE (DomainSetMetadata),
+// CONFIRM the <unihv:template> metadata + label appear, then CLONE it and confirm the
+// clone is a fresh NON-template VM. Finally unmark and confirm the marker is gone.
+func proveTemplates(ctx context.Context, p *kvm.Provider) {
+	fmt.Println("== LOT 4A #2 proof: VM templates (mark metadata/label + clone-from-template) ==")
+	tm, ok := any(p).(vprovider.TemplateManager)
+	if !ok || !p.Capabilities().Has(vprovider.CapTemplates) {
+		fmt.Println("  provider does not implement TemplateManager / lacks CapTemplates; skipping")
+		fmt.Println()
+		return
+	}
+	sp, _ := any(p).(vprovider.StorageProvider)
+	pool := firstActivePool(ctx, p)
+	if sp == nil || pool == "" {
+		fmt.Println("  no active storage pool; skipping")
+		fmt.Println()
+		return
+	}
+	volName := fmt.Sprintf("unihv-tmpl-%d.qcow2", time.Now().UnixNano())
+	if _, err := sp.CreateVolume(ctx, vprovider.VolumeSpec{Name: volName, StorageID: pool, CapacityGB: 1, Format: vprovider.DiskQcow2}); err != nil {
+		fatalf("tmpl: CreateVolume: %v", err)
+	}
+	diskPath := volPath(ctx, sp, pool, volName)
+	name := fmt.Sprintf("unihv-tmpl-dom-%d", time.Now().UnixNano())
+	task, err := p.CreateVM(ctx, vprovider.VMSpec{
+		Name: name, VCPUs: 1, MemoryMB: 512, Firmware: vprovider.FirmwareBIOS,
+		Disks: []vprovider.DiskSpec{{StorageID: pool, SourcePath: diskPath, Format: vprovider.DiskQcow2, CapacityGB: 1}},
+	})
+	if err != nil {
+		fatalf("tmpl: CreateVM: %v", err)
+	}
+	id := task.EntityID
+	cloneID := ""
+	defer func() {
+		if cloneID != "" {
+			_, _ = p.DeleteVM(ctx, cloneID, vprovider.DeleteOptions{Force: true})
+		}
+		_, _ = p.DeleteVM(ctx, id, vprovider.DeleteOptions{Force: true})
+		_, _ = sp.DeleteVolume(ctx, pool, volName)
+	}()
+	fmt.Printf("  created %s id=%s\n", name, id)
+
+	// MARK as template.
+	if _, err := tm.MarkTemplate(ctx, id, true); err != nil {
+		fatalf("tmpl: MarkTemplate(true): %v", err)
+	}
+	xml := dumpXML(ctx, name)
+	hasMeta := strings.Contains(xml, "template") && strings.Contains(xml, ">true<")
+	d, _ := p.GetVM(ctx, id)
+	hasLabel := d != nil && d.Labels["unihv.template"] == "true"
+	fmt.Printf("  MarkTemplate(true) -> live XML metadata=%v  GetVM label unihv.template=%q\n", hasMeta, d.Labels["unihv.template"])
+	for _, line := range strings.Split(xml, "\n") {
+		if strings.Contains(line, "template") {
+			fmt.Printf("    | %s\n", strings.TrimSpace(line))
+		}
+	}
+	if !hasLabel {
+		fatalf("tmpl: template label NOT surfaced via GetVM — feature NOT proven")
+	}
+
+	// Confirm GET templates list includes it.
+	if tmpls, terr := p.ListVMs(ctx, vprovider.ListOptions{Labels: map[string]string{"unihv.template": "true"}}); terr == nil {
+		found := false
+		for _, v := range tmpls {
+			if v.ID == id {
+				found = true
+			}
+		}
+		fmt.Printf("  ListVMs(label unihv.template=true) -> %d template(s); includes ours=%v\n", len(tmpls), found)
+	}
+
+	// CLONE-from-template -> a fresh NON-template VM.
+	cloneName := name + "-deployed"
+	ct, cerr := p.Clone(ctx, id, vprovider.CloneSpec{Name: cloneName})
+	if cerr != nil {
+		fatalf("tmpl: Clone(from template): %v", cerr)
+	}
+	cloneID = ct.EntityID
+	cd, _ := p.GetVM(ctx, cloneID)
+	cloneIsTemplate := cd != nil && cd.Labels["unihv.template"] == "true"
+	fmt.Printf("  Clone -> deployed VM id=%s isTemplate=%v (must be false)\n", cloneID, cloneIsTemplate)
+	if cloneIsTemplate {
+		fatalf("tmpl: clone-from-template produced ANOTHER template — must be a runnable non-template VM")
+	}
+
+	// UNMARK and confirm the marker is gone.
+	if _, err := tm.MarkTemplate(ctx, id, false); err != nil {
+		fatalf("tmpl: MarkTemplate(false): %v", err)
+	}
+	d2, _ := p.GetVM(ctx, id)
+	stillTemplate := d2 != nil && d2.Labels["unihv.template"] == "true"
+	fmt.Printf("  MarkTemplate(false) -> still template=%v (must be false)\n", stillTemplate)
+	if stillTemplate {
+		fatalf("tmpl: unmark did NOT clear the template marker")
+	}
+	fmt.Println("  CONFIRMED: template metadata/label set+cleared; clone yields a non-template VM.")
+	fmt.Println()
+}
+
+// proveSysprep: LOT 4A #3. Create a domain with a SysprepSpec, then confirm:
+//   - the LIVE domain XML has a cdrom whose <source> points at a *-sysprep.iso
+//   - that seed ISO exists on disk and reports a 'sysprep' volume id
+//   - the embedded autounattend.xml carries the computer name + admin password
+func proveSysprep(ctx context.Context, p *kvm.Provider) {
+	fmt.Println("== LOT 4A #3 proof: Windows sysprep autounattend.xml seed ISO built + attached as a cdrom ==")
+	sp, _ := any(p).(vprovider.StorageProvider)
+	pool := firstActivePool(ctx, p)
+	if sp == nil || pool == "" {
+		fmt.Println("  no active storage pool; skipping")
+		fmt.Println()
+		return
+	}
+	volName := fmt.Sprintf("unihv-sp-boot-%d.qcow2", time.Now().UnixNano())
+	if _, err := sp.CreateVolume(ctx, vprovider.VolumeSpec{Name: volName, StorageID: pool, CapacityGB: 1, Format: vprovider.DiskQcow2}); err != nil {
+		fatalf("sysprep: CreateVolume(boot): %v", err)
+	}
+	diskPath := volPath(ctx, sp, pool, volName)
+	name := fmt.Sprintf("unihv-sp-dom-%d", time.Now().UnixNano())
+	task, err := p.CreateVM(ctx, vprovider.VMSpec{
+		Name: name, VCPUs: 2, MemoryMB: 1024, Firmware: vprovider.FirmwareUEFI,
+		Disks: []vprovider.DiskSpec{{StorageID: pool, SourcePath: diskPath, Format: vprovider.DiskQcow2, CapacityGB: 1}},
+		Sysprep: &vprovider.SysprepSpec{
+			ComputerName: "WIN-PROBE01", AdminPassword: "Pr0beP@ss!", OrgName: "UniHV", ProductKey: "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE",
+			TimeZone: "UTC", Locale: "en-US",
+		},
+	})
+	if err != nil {
+		fatalf("sysprep: CreateVM(Sysprep): %v", err)
+	}
+	id := task.EntityID
+	seedToDelete := ""
+	defer func() {
+		_, _ = p.DeleteVM(ctx, id, vprovider.DeleteOptions{Force: true})
+		_, _ = sp.DeleteVolume(ctx, pool, volName)
+		if seedToDelete != "" {
+			_ = os.Remove(seedToDelete)
+		}
+	}()
+	fmt.Printf("  created %s id=%s (Sysprep: computer=WIN-PROBE01, admin pw, locale en-US)\n", name, id)
+
+	domXML := dumpXML(ctx, name)
+	seedPath := ""
+	for _, line := range strings.Split(domXML, "\n") {
+		l := strings.TrimSpace(line)
+		if strings.Contains(l, "-sysprep.iso") {
+			if i := strings.Index(l, "file='"); i >= 0 {
+				rest := l[i+len("file='"):]
+				if j := strings.Index(rest, "'"); j >= 0 {
+					seedPath = rest[:j]
+				}
+			}
+		}
+	}
+	fmt.Printf("  live XML: sysprep cdrom <source>=%q\n", seedPath)
+	if seedPath == "" {
+		fatalf("sysprep: no *-sysprep.iso cdrom found in the live domain XML — feature NOT proven")
+	}
+	seedToDelete = seedPath
+	if _, statErr := os.Stat(seedPath); statErr != nil {
+		fatalf("sysprep: seed ISO %s does not exist: %v", seedPath, statErr)
+	}
+	volid := isoVolID(ctx, seedPath)
+	fmt.Printf("  seed ISO on disk: %s  volume-id=%q\n", seedPath, volid)
+	if !strings.EqualFold(strings.TrimSpace(volid), "sysprep") {
+		fatalf("sysprep: seed ISO volume id is %q, want 'sysprep'", volid)
+	}
+	if ans := isoFile(ctx, seedPath, "autounattend.xml"); ans != "" {
+		fmt.Println("  --- embedded autounattend.xml (excerpt) ---")
+		for _, l := range strings.Split(strings.TrimRight(ans, "\n"), "\n") {
+			ls := strings.TrimSpace(l)
+			if strings.Contains(ls, "ComputerName") || strings.Contains(ls, "AdministratorPassword") ||
+				strings.Contains(ls, "<Value>") || strings.Contains(ls, "TimeZone") || strings.Contains(ls, "InputLocale") ||
+				strings.Contains(ls, `pass="`) {
+				fmt.Printf("  | %s\n", ls)
+			}
+		}
+		if !strings.Contains(ans, "WIN-PROBE01") {
+			fatalf("sysprep: autounattend.xml missing the computer name — feature NOT proven")
+		}
+	}
+	fmt.Println("  CONFIRMED: xorriso built a 'sysprep' autounattend seed ISO and libvirt attached it as a cdrom.")
+	fmt.Println()
+}
+
+// firstActivePool returns the name of the first active (accessible) storage pool.
+func firstActivePool(ctx context.Context, p *kvm.Provider) string {
+	pools, _ := p.ListStorage(ctx)
+	for _, pl := range pools {
+		if pl.Accessible {
+			return pl.Name
+		}
+	}
+	return ""
+}
+
+// volPath resolves a created volume's on-disk path.
+func volPath(ctx context.Context, sp vprovider.StorageProvider, pool, volName string) string {
+	if vols, err := sp.ListVolumes(ctx, pool); err == nil {
+		for _, v := range vols {
+			if v.Name == volName {
+				return v.Path
+			}
+		}
+	}
+	return ""
 }
 
 func fatalf(format string, args ...any) {

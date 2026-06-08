@@ -49,10 +49,16 @@ func (s *Server) Router() http.Handler {
 		api.Get("/auth/oidc/callback", s.audited("auth.oidc.callback", s.bootstrapGate(http.HandlerFunc(s.OIDCCallback))))
 		api.Post("/auth/ldap/login", s.audited("auth.ldap.login", s.bootstrapGate(http.HandlerFunc(s.LDAPLogin))))
 
-		// ---- protected routes (SessionAuth required) ----
+		// ---- protected routes (session cookie OR bearer API token) ----
+		// BearerOrSession authenticates via an "Authorization: Bearer <raw>" API
+		// token when present (hash + lookup the active, non-expired token; load its
+		// owner with the token's SCOPED permissions), otherwise the session cookie.
+		// CSRF only applies to the cookie path (a bearer token is not a browser
+		// cookie, so it is immune to CSRF) — the CSRF middleware skips bearer-authed
+		// requests internally.
 		api.Group(func(pr chi.Router) {
 			pr.Use(s.bootstrapGateMW)
-			pr.Use(az.SessionAuth)
+			pr.Use(az.BearerOrSession)
 			pr.Use(az.CSRF)
 
 			// auth surfaces (SessionAuth only; AAL handled per-route where needed)
@@ -94,6 +100,19 @@ func (s *Server) Router() http.Handler {
 			s.mountReplicationRoutes(pr)
 			s.mountHypervisorConnRoutes(pr)
 			s.mountStorageBackendRoutes(pr)
+			s.mountLot4BRoutes(pr)
+
+			// Bulk operations (multi-select fan-out). Each target is re-gated inside
+			// the handler by the SAME permission the single action needs, so the route
+			// only needs an authenticated principal. AuditWrap records one row for the
+			// batch. Works under EITHER a session OR a bearer token (the group's
+			// BearerOrSession handles both).
+			pr.With(az.AuditWrap("vm.bulk")).Post("/vm/bulk", s.VMBulk)
+
+			// API-token management (create/list/revoke). Self-service: any
+			// authenticated principal manages their OWN tokens; ownership enforced in
+			// the handlers/store.
+			s.mountAPITokenRoutes(pr)
 		})
 	})
 
@@ -559,6 +578,34 @@ func (s *Server) mountStackRoutes(pr chi.Router) {
 	// Builder: pure compose-YAML generation. Global-scoped, deploy-capable only.
 	pr.With(az.RequirePermission("docker.container.create", g)).
 		Post("/stacks/builder/generate", s.BuilderGenerate)
+}
+
+// mountLot4BRoutes wires the Lot 4B host-maintenance surface (the API-token and
+// bulk surfaces are wired in the bearer-or-session group in Router). Entering/
+// exiting maintenance is an admin-grade host action gated by vm.host.maintenance
+// at provider scope; it follows the fixed mutation chain AuditWrap (OUTERMOST) ->
+// RequireAAL -> RequirePermission -> handler so a denied mutation still records
+// exactly one audit row. The handler type-asserts MaintenanceProvider +
+// CapMaintenance, else 405.
+func (s *Server) mountLot4BRoutes(pr chi.Router) {
+	az := s.authz
+
+	pr.With(az.AuditWrap("vm.host.maintenance.enter"), az.RequireAAL, az.RequirePermission("vm.host.maintenance", scopeFromProvider)).
+		Post("/vm/providers/{providerID}/hosts/{hostID}/maintenance", s.VMHostEnterMaintenance)
+	pr.With(az.AuditWrap("vm.host.maintenance.exit"), az.RequireAAL, az.RequirePermission("vm.host.maintenance", scopeFromProvider)).
+		Delete("/vm/providers/{providerID}/hosts/{hostID}/maintenance", s.VMHostExitMaintenance)
+}
+
+// mountAPITokenRoutes wires the scoped API-token management surface. Tokens are
+// self-service: any authenticated principal manages their OWN tokens (ownership is
+// enforced in the handlers). Create returns the raw token ONCE; list never returns
+// it; delete revokes by id. Mutations are audited.
+func (s *Server) mountAPITokenRoutes(br chi.Router) {
+	az := s.authz
+
+	br.Get("/tokens", s.ListAPITokens)
+	br.With(az.AuditWrap("apitoken.create")).Post("/tokens", s.CreateAPIToken)
+	br.With(az.AuditWrap("apitoken.delete")).Delete("/tokens/{id}", s.DeleteAPIToken)
 }
 
 // audited wraps a handler with AuditWrap for the given action (used on auth

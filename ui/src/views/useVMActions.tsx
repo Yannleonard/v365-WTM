@@ -36,6 +36,7 @@ import {
   IconHelp,
   IconCheck,
   IconScale,
+  IconStacks,
 } from "../components/icons";
 import type { VM, VMDisk, VMNic, VMPowerOp, VMSnapshot } from "../lib/types";
 
@@ -51,6 +52,9 @@ interface CloneForm {
   name: string;
   linked: boolean;
   powerOn: boolean;
+  // deploy=true renders the same clone drawer as "Deploy from template" — the
+  // backend Clone always yields a fresh NON-template VM (Lot 4A).
+  deploy?: boolean;
 }
 interface ReconfigureForm {
   vm: VM;
@@ -100,6 +104,7 @@ export function useVMActions() {
   const [cloneBusy, setCloneBusy] = useState(false);
   const [recfg, setRecfg] = useState<ReconfigureForm | null>(null);
   const [recfgBusy, setRecfgBusy] = useState(false);
+  const [templateBusyId, setTemplateBusyId] = useState<string | null>(null);
   const [migrate, setMigrate] = useState<MigrateForm | null>(null);
   const [migrateBusy, setMigrateBusy] = useState(false);
   const [del, setDel] = useState<VM | null>(null);
@@ -143,6 +148,11 @@ export function useVMActions() {
     setSnap({ vm, name: "", description: "", memory: false, quiesce: false });
   const triggerClone = (vm: VM) =>
     setClone({ vm, name: `${vm.name}-clone`, linked: false, powerOn: false });
+  // Deploy a fresh VM FROM a template — reuses the clone path (the backend Clone of
+  // a template produces a NON-template runnable VM). Opens the same drawer, labeled
+  // "Deploy from template" and defaulting to power-on.
+  const triggerDeploy = (vm: VM) =>
+    setClone({ vm, name: `${vm.name}-vm`, linked: false, powerOn: true, deploy: true });
   const triggerReconfigure = (vm: VM) => {
     // Present memory in GB when it divides evenly, else MB — nicer default.
     const gbExact = vm.memoryMb % 1024 === 0 && vm.memoryMb >= 1024;
@@ -164,6 +174,21 @@ export function useVMActions() {
   const triggerResizeDisk = (vm: VM, disk: VMDisk) =>
     setResize({ vm, disk, capacityGb: String(Math.max(1, Math.round(disk.capacityGb)) + 1) });
   const triggerDeleteSnapshot = (vm: VM, snap: VMSnapshot) => setDelSnap({ vm, snap });
+
+  /* ---- templates (Lot 4A): mark / unmark a VM as a golden image (direct) ---- */
+  const isTemplateVM = (vm: VM) => vm.labels?.["unihv.template"] === "true";
+  const markTemplate = async (vm: VM, isTemplate: boolean) => {
+    setTemplateBusyId(vm.id);
+    try {
+      await api.vmMarkTemplate(vm.providerId, vm.id, isTemplate);
+      toast.success(isTemplate ? "Marked as template" : "Template mark removed", vm.name);
+      invalidate(vm);
+    } catch (err) {
+      toastError(isTemplate ? "Mark as template failed" : "Unmark template failed", err);
+    } finally {
+      setTemplateBusyId(null);
+    }
+  };
 
   /* ---- confirms ---- */
   const confirmSnapshot = async () => {
@@ -196,11 +221,11 @@ export function useVMActions() {
         linked: clone.linked,
         powerOn: clone.powerOn,
       });
-      toast.success("Clone requested", clone.name.trim());
+      toast.success(clone.deploy ? "Deploy requested" : "Clone requested", clone.name.trim());
       invalidate(clone.vm);
       setClone(null);
     } catch (err) {
-      toastError("Clone failed", err);
+      toastError(clone.deploy ? "Deploy failed" : "Clone failed", err);
     } finally {
       setCloneBusy(false);
     }
@@ -472,12 +497,12 @@ export function useVMActions() {
         ) : null}
       </Drawer>
 
-      {/* Clone */}
+      {/* Clone / Deploy-from-template (same path; deploy yields a non-template VM) */}
       <Drawer
         open={clone !== null}
-        title="Clone virtual machine"
+        title={clone?.deploy ? "Deploy from template" : "Clone virtual machine"}
         subtitle={clone ? clone.vm.name : undefined}
-        icon={<IconClone size={18} />}
+        icon={clone?.deploy ? <IconStacks size={18} /> : <IconClone size={18} />}
         busy={cloneBusy}
         onClose={() => setClone(null)}
         footer={
@@ -491,13 +516,22 @@ export function useVMActions() {
               disabled={!clone?.name.trim()}
               onClick={confirmClone}
             >
-              Clone
+              {clone?.deploy ? "Deploy" : "Clone"}
             </ActionButton>
           </>
         }
       >
         {clone ? (
           <div className="drawer-section">
+            {clone.deploy ? (
+              <div className="drawer-banner info">
+                <IconHelp size={15} />
+                <span>
+                  Deploy a new, runnable VM from the <strong>{clone.vm.name}</strong> template. The new
+                  VM is independent and is <strong>not</strong> itself a template.
+                </span>
+              </div>
+            ) : null}
             <TextField
               label="New name"
               value={clone.name}
@@ -832,6 +866,11 @@ export function useVMActions() {
     triggerReconfigure,
     triggerMigrate,
     triggerDelete,
+    // templates (Lot 4A)
+    triggerDeploy,
+    markTemplate,
+    isTemplateVM,
+    templateBusyId,
     // hot-plug
     triggerAddDisk,
     triggerAddNic,

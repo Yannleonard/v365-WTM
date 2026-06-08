@@ -27,7 +27,7 @@ const FullCaps = vp.CapListHosts | vp.CapListVMs | vp.CapGetVM | vp.CapListClust
 	vp.CapPowerStop | vp.CapPowerReset | vp.CapPowerSuspend | vp.CapDeleteVM |
 	vp.CapReconfigureVM | vp.CapSnapshot | vp.CapRevertSnapshot | vp.CapClone |
 	vp.CapMigrate | vp.CapExport | vp.CapClusterTopology | vp.CapNodeState |
-	vp.CapMetrics | vp.CapEvents
+	vp.CapMetrics | vp.CapEvents | vp.CapMaintenance | vp.CapTemplates
 
 // libvirtBackend is the seam between the pure-Go normalization core and a concrete
 // libvirt transport. The default build wires it to an in-memory simulator
@@ -62,6 +62,10 @@ type libvirtBackend interface {
 	// vcpus / memMB are nil when that field is unchanged.
 	reconfigureDomain(uuid string, vcpus *int, memMB *int64) error
 	domainsOnHost(hostID string) int
+	// markTemplate (Lot 4A) toggles a domain's TEMPLATE status. The live backend
+	// re-defines the domain (DomainDefineXML) with/without the <unihv:template>
+	// metadata + adjusts the "unihv.template" Label; the sim mutates its struct.
+	markTemplate(uuid string, isTemplate bool) error
 
 	// snapshots
 	listSnapshots(uuid string) []vp.Snapshot
@@ -144,6 +148,10 @@ type Provider struct {
 	mu     sync.Mutex
 	seq    int64
 	closed bool
+	// maint tracks hosts placed into maintenance mode by EnterMaintenance. KVM's
+	// libvirt node has no native maintenance flag, so the provider records it here
+	// and reflects it in normalizeNode/ListHosts. Keyed by host id.
+	maint map[string]bool
 }
 
 // Option configures a Provider.
@@ -166,6 +174,7 @@ func New(id string, opts ...Option) *Provider {
 		caps:      FullCaps,
 		clusterID: "kvm-logical-cluster",
 		tracker:   vp.NewTaskTracker(),
+		maint:     map[string]bool{},
 	}
 	for _, o := range opts {
 		o(p)
@@ -323,7 +332,10 @@ func (p *Provider) CreateVM(ctx context.Context, spec vp.VMSpec) (*vp.Task, erro
 	if !p.caps.Has(vp.CapCreateVM) {
 		return nil, vp.ErrUnsupported
 	}
-	if strings.TrimSpace(spec.Name) == "" || spec.VCPUs <= 0 || spec.MemoryMB <= 0 {
+	// vCPUs may be supplied either as a flat count OR as a CPU topology
+	// (sockets*cores*threads); accept the create when EITHER yields a positive count.
+	if strings.TrimSpace(spec.Name) == "" || spec.MemoryMB <= 0 ||
+		(spec.VCPUs <= 0 && cpuTopologyVCPUs(spec.CPU) <= 0) {
 		return nil, vp.ErrInvalidSpec
 	}
 	uuid := p.nextID("dom")
@@ -351,6 +363,33 @@ func (p *Provider) CreateVM(ctx context.Context, spec vp.VMSpec) (*vp.Task, erro
 		// NoCloud 'cidata' seed ISO and attaches it as an extra cdrom. The sim backend
 		// ignores it (cloud-init is a live-only feature; the create still succeeds).
 		CloudInit:  spec.CloudInit,
+		// CPU topology/model (Lot 4A): when set, renderDomainXML emits <cpu> + a
+		// <topology> and computes <vcpu> = sockets*cores*threads.
+		CPU: spec.CPU,
+		// IsTemplate (Lot 4A): renderDomainXML emits the template metadata and the
+		// backend also reflects it as the Label "unihv.template=true".
+		IsTemplate: spec.IsTemplate,
+		// Sysprep (Lot 4A): the LIVE backend builds a Windows autounattend.xml seed
+		// ISO and attaches it as an extra cdrom; the sim backend ignores it.
+		Sysprep: spec.Sysprep,
+	}
+	if spec.IsTemplate {
+		if d.Labels == nil {
+			d.Labels = map[string]string{}
+		} else {
+			// copy so we don't mutate the caller's map
+			cp := make(map[string]string, len(d.Labels)+1)
+			for k, val := range d.Labels {
+				cp[k] = val
+			}
+			d.Labels = cp
+		}
+		d.Labels[labelTemplate] = "true"
+	}
+	// When a CPU topology is given, derive the effective vCPU count so the rest of the
+	// model (and the sim) stays consistent with sockets*cores*threads.
+	if n := cpuTopologyVCPUs(spec.CPU); n > 0 {
+		d.VCPUs = n
 	}
 	for i, dk := range spec.Disks {
 		d.Disks = append(d.Disks, libvirtDisk{
@@ -562,6 +601,11 @@ func (p *Provider) Clone(ctx context.Context, vmID string, spec vp.CloneSpec) (*
 	if spec.HostID != "" {
 		clone.HostID = spec.HostID
 	}
+	// Clone-from-template ALWAYS produces a fresh, NON-template VM: a deployed VM is
+	// runnable and must not itself be a golden image. Strip the template marking +
+	// label from the clone (Lot 4A).
+	clone.IsTemplate = false
+	delete(clone.Labels, labelTemplate)
 	// deep-copy disks/NICs so the clone is independent
 	clone.Disks = append([]libvirtDisk(nil), src.Disks...)
 	clone.NICs = append([]libvirtNIC(nil), src.NICs...)
@@ -569,6 +613,53 @@ func (p *Provider) Clone(ctx context.Context, vmID string, spec vp.CloneSpec) (*
 		return nil, err
 	}
 	return p.finishTask("clone", clone.UUID), nil
+}
+
+// --- templates (Lot 4A): mark / unmark a VM as a template ---
+
+// MarkTemplate toggles a VM's TEMPLATE status (TemplateManager). It re-defines the
+// domain with/without the <unihv:template> metadata + the "unihv.template" Label.
+// The VM must be SHUT OFF (a running VM cannot be (un)marked — templates are not
+// run as-is), so a running domain returns ErrConflict.
+func (p *Provider) MarkTemplate(ctx context.Context, vmID string, isTemplate bool) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapTemplates) {
+		return nil, vp.ErrUnsupported
+	}
+	d, ok := p.backend.getDomain(vmID)
+	if !ok {
+		return nil, vp.ErrNotFound
+	}
+	if normalizeState(d.State) == vp.StateRunning {
+		return nil, vp.ErrConflict
+	}
+	if err := p.backend.markTemplate(vmID, isTemplate); err != nil {
+		return nil, err
+	}
+	// Keep the in-memory model consistent (no-op for the live backend, which re-reads
+	// from libvirt; correct for the sim).
+	d.IsTemplate = isTemplate
+	if isTemplate {
+		if d.Labels == nil {
+			d.Labels = map[string]string{}
+		}
+		d.Labels[labelTemplate] = "true"
+	} else {
+		delete(d.Labels, labelTemplate)
+	}
+	return p.finishTask("markTemplate", vmID), nil
+}
+
+// cpuTopologyVCPUs returns sockets*cores*threads for a CPUSpec (0 when nil or any
+// dimension is unset/<=0 — the caller then keeps the flat VCPUs count).
+func cpuTopologyVCPUs(c *vp.CPUSpec) int {
+	if c == nil {
+		return 0
+	}
+	s, co, t := c.Sockets, c.CoresPerSocket, c.ThreadsPerCore
+	if s <= 0 || co <= 0 || t <= 0 {
+		return 0
+	}
+	return s * co * t
 }
 
 // --- migration ---
@@ -1084,4 +1175,5 @@ var (
 	_ vp.GuestAgentProvider  = (*Provider)(nil)
 	_ vp.SnapshotManager     = (*Provider)(nil)
 	_ vp.DiskResizer         = (*Provider)(nil)
+	_ vp.TemplateManager     = (*Provider)(nil)
 )

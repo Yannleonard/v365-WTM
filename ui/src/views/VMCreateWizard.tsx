@@ -58,6 +58,14 @@ export function VMCreateWizard() {
 
   const [vcpus, setVcpus] = useState("2");
   const [memoryMb, setMemoryMb] = useState("2048");
+  // ---- CPU topology + model (Lot 4A; optional advanced — off by default) ----
+  const [cpuTopo, setCpuTopo] = useState(false);
+  const [cpuSockets, setCpuSockets] = useState("1");
+  const [cpuCores, setCpuCores] = useState("2");
+  const [cpuThreads, setCpuThreads] = useState("1");
+  const [cpuModel, setCpuModel] = useState(""); // "" = host-passthrough (default)
+  // ---- Mark the created VM as a golden-image template (Lot 4A) ----
+  const [isTemplate, setIsTemplate] = useState(false);
 
   const [diskGb, setDiskGb] = useState("20");
   const [diskFormat, setDiskFormat] = useState<string>("qcow2");
@@ -78,6 +86,15 @@ export function VMCreateWizard() {
   const [ciPassword, setCiPassword] = useState("");
   const [ciSshKeys, setCiSshKeys] = useState(""); // one public key per line
   const [ciRunCmd, setCiRunCmd] = useState(""); // one command per line
+
+  // ---- Windows guest customization (sysprep / autounattend.xml) ----
+  const [spEnabled, setSpEnabled] = useState(false);
+  const [spComputerName, setSpComputerName] = useState("");
+  const [spAdminPassword, setSpAdminPassword] = useState("");
+  const [spProductKey, setSpProductKey] = useState("");
+  const [spOrgName, setSpOrgName] = useState("");
+  const [spTimeZone, setSpTimeZone] = useState("");
+  const [spLocale, setSpLocale] = useState("");
 
   const [submitting, setSubmitting] = useState(false);
   const [task, setTask] = useState<VMTask | null>(null);
@@ -109,8 +126,21 @@ export function VMCreateWizard() {
   const memNum = Number(memoryMb);
   const diskNum = Number(diskGb);
 
+  // CPU topology (Lot 4A): when enabled, the effective vCPU count is
+  // sockets*cores*threads (the backend derives <vcpu> the same way).
+  const sNum = Number(cpuSockets);
+  const cNum = Number(cpuCores);
+  const tNum = Number(cpuThreads);
+  const topoOk =
+    Number.isInteger(sNum) && sNum > 0 &&
+    Number.isInteger(cNum) && cNum > 0 &&
+    Number.isInteger(tNum) && tNum > 0;
+  const topoTotal = topoOk ? sNum * cNum * tNum : 0;
+
   const step0Ok = name.trim().length > 0 && !!pid;
-  const step1Ok = Number.isInteger(vcpusNum) && vcpusNum > 0 && Number.isFinite(memNum) && memNum > 0;
+  const step1Ok = cpuTopo
+    ? topoOk && Number.isFinite(memNum) && memNum > 0
+    : Number.isInteger(vcpusNum) && vcpusNum > 0 && Number.isFinite(memNum) && memNum > 0;
   const step2Ok = Number.isFinite(diskNum) && diskNum > 0;
   const step3Ok = networks.length === 0 || !!networkId;
   const step4Ok = true; // Security toggles are always optional.
@@ -145,7 +175,18 @@ export function VMCreateWizard() {
       bootIso: bootIso || undefined,
       tpm: tpm || undefined,
       secureBoot: secureBoot || undefined,
+      isTemplate: isTemplate || undefined,
     };
+    // CPU topology + model (Lot 4A): when enabled, send the explicit topology; the
+    // backend sets <vcpu> = sockets*cores*threads. Empty model => host-passthrough.
+    if (cpuTopo && topoOk) {
+      spec.cpu = {
+        sockets: sNum,
+        coresPerSocket: cNum,
+        threadsPerCore: tNum,
+        model: cpuModel.trim() || undefined,
+      };
+    }
     if (ciEnabled) {
       const sshKeys = ciSshKeys.split("\n").map((s) => s.trim()).filter(Boolean);
       const runCmd = ciRunCmd.split("\n").map((s) => s.trim()).filter(Boolean);
@@ -155,6 +196,17 @@ export function VMCreateWizard() {
         password: ciPassword || undefined,
         sshAuthorizedKeys: sshKeys.length > 0 ? sshKeys : undefined,
         runCmd: runCmd.length > 0 ? runCmd : undefined,
+      };
+    }
+    // Windows sysprep (Lot 4A): autounattend.xml seed for an unattended Windows deploy.
+    if (spEnabled) {
+      spec.sysprep = {
+        computerName: spComputerName.trim() || undefined,
+        adminPassword: spAdminPassword || undefined,
+        productKey: spProductKey.trim() || undefined,
+        orgName: spOrgName.trim() || undefined,
+        timeZone: spTimeZone.trim() || undefined,
+        locale: spLocale.trim() || undefined,
       };
     }
     setSubmitting(true);
@@ -340,15 +392,48 @@ export function VMCreateWizard() {
 
         {step === 1 ? (
           <div className="col" style={{ gap: "var(--sp-3)" }}>
-            <TextField
-              label="vCPUs"
-              type="number"
-              min={1}
-              value={vcpus}
-              onChange={(e) => setVcpus(e.target.value)}
-              error={vcpus !== "" && !step1Ok ? "Enter a positive whole number of vCPUs." : undefined}
-              style={{ maxWidth: 200 }}
-            />
+            {!cpuTopo ? (
+              <TextField
+                label="vCPUs"
+                type="number"
+                min={1}
+                value={vcpus}
+                onChange={(e) => setVcpus(e.target.value)}
+                error={vcpus !== "" && !step1Ok ? "Enter a positive whole number of vCPUs." : undefined}
+                style={{ maxWidth: 200 }}
+              />
+            ) : null}
+
+            {/* CPU topology + model (Lot 4A): optional advanced layout. Off by default
+                keeps the simple flat vCPU field. */}
+            <label className="checkbox-row">
+              <input type="checkbox" checked={cpuTopo} onChange={(e) => setCpuTopo(e.target.checked)} />
+              <span className="col" style={{ gap: 2 }}>
+                <span>Advanced CPU topology</span>
+                <span className="text-xs muted">Pin sockets / cores / threads and an optional CPU model (vCPUs = sockets × cores × threads).</span>
+              </span>
+            </label>
+            {cpuTopo ? (
+              <>
+                <div className="row-wrap" style={{ gap: "var(--sp-3)" }}>
+                  <TextField label="Sockets" type="number" min={1} value={cpuSockets} onChange={(e) => setCpuSockets(e.target.value)} style={{ maxWidth: 130 }} />
+                  <TextField label="Cores / socket" type="number" min={1} value={cpuCores} onChange={(e) => setCpuCores(e.target.value)} style={{ maxWidth: 150 }} />
+                  <TextField label="Threads / core" type="number" min={1} value={cpuThreads} onChange={(e) => setCpuThreads(e.target.value)} style={{ maxWidth: 150 }} />
+                </div>
+                <SelectField label="CPU model" value={cpuModel} onChange={(e) => setCpuModel(e.target.value)} style={{ maxWidth: 280 }}>
+                  <option value="">host-passthrough (default — best performance)</option>
+                  <option value="host-model">host-model (migratable within identical CPUs)</option>
+                  <option value="Skylake-Server">Skylake-Server</option>
+                  <option value="Cascadelake-Server">Cascadelake-Server</option>
+                  <option value="EPYC">EPYC</option>
+                  <option value="Westmere">Westmere (broad compatibility)</option>
+                </SelectField>
+                <span className="text-xs muted">
+                  {topoOk ? `Total: ${topoTotal} vCPU${topoTotal === 1 ? "" : "s"}` : "Enter positive whole numbers for sockets, cores and threads."}
+                </span>
+              </>
+            ) : null}
+
             <TextField
               label="Memory (MB)"
               type="number"
@@ -358,6 +443,17 @@ export function VMCreateWizard() {
               hint={Number.isFinite(memNum) && memNum > 0 ? formatBytes(memNum * 1024 * 1024, 0) : undefined}
               style={{ maxWidth: 200 }}
             />
+
+            <div style={{ borderTop: "1px solid var(--border)", margin: "var(--sp-1) 0" }} />
+
+            {/* Mark as template (Lot 4A) */}
+            <label className="checkbox-row">
+              <input type="checkbox" checked={isTemplate} onChange={(e) => setIsTemplate(e.target.checked)} />
+              <span className="col" style={{ gap: 2 }}>
+                <span>Mark as template</span>
+                <span className="text-xs muted">Create this VM as a golden-image template — a source to deploy (clone) new VMs from, not run as-is.</span>
+              </span>
+            </label>
           </div>
         ) : null}
 
@@ -534,6 +630,43 @@ export function VMCreateWizard() {
                 </label>
                 <span className="text-xs muted">
                   Cloud-init is applied by KVM/libvirt providers only; non-cloud-init guest images will ignore the seed.
+                </span>
+              </>
+            ) : null}
+
+            <div style={{ borderTop: "1px solid var(--border)", margin: "var(--sp-1) 0" }} />
+
+            {/* Windows sysprep (Lot 4A) — the Windows analogue of cloud-init */}
+            <label className="row" style={{ gap: "var(--sp-2)", alignItems: "flex-start", cursor: "pointer" }}>
+              <input type="checkbox" checked={spEnabled} onChange={(e) => setSpEnabled(e.target.checked)} />
+              <span className="col" style={{ gap: 2 }}>
+                <span style={{ fontWeight: 600 }}>Enable Windows sysprep (unattended)</span>
+                <span className="text-xs muted">
+                  Generates an <strong>autounattend.xml</strong> seed ISO so a <strong>Windows</strong> guest installs
+                  unattended (computer name, admin password, locale, time zone). Windows guests only.
+                </span>
+              </span>
+            </label>
+            {spEnabled ? (
+              <>
+                <div className="row-wrap" style={{ gap: "var(--sp-3)" }}>
+                  <TextField label="Computer name" value={spComputerName} onChange={(e) => setSpComputerName(e.target.value)} placeholder="WIN-APP01" />
+                  <TextField
+                    label="Administrator password"
+                    type="password"
+                    value={spAdminPassword}
+                    onChange={(e) => setSpAdminPassword(e.target.value)}
+                    placeholder="optional"
+                  />
+                  <TextField label="Organization" value={spOrgName} onChange={(e) => setSpOrgName(e.target.value)} placeholder="optional" />
+                </div>
+                <div className="row-wrap" style={{ gap: "var(--sp-3)" }}>
+                  <TextField label="Product key" value={spProductKey} onChange={(e) => setSpProductKey(e.target.value)} placeholder="XXXXX-XXXXX-XXXXX-XXXXX-XXXXX" />
+                  <TextField label="Locale" value={spLocale} onChange={(e) => setSpLocale(e.target.value)} placeholder="en-US" />
+                  <TextField label="Time zone" value={spTimeZone} onChange={(e) => setSpTimeZone(e.target.value)} placeholder="UTC" />
+                </div>
+                <span className="text-xs muted">
+                  Sysprep is applied by KVM/libvirt providers only; the answer file drives Windows Setup's specialize/OOBE passes.
                 </span>
               </>
             ) : null}

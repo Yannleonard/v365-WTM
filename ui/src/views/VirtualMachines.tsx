@@ -18,10 +18,13 @@ import { VMActions } from "../components/VMActions";
 import { ProtectedTag } from "../components/ProtectedTag";
 import { LoadingFill } from "../components/Spinner";
 import { ActionButton } from "../components/ActionButton";
-import { IconRefresh, IconSearch, IconVM, IconPlus } from "../components/icons";
-import { hasVMCap } from "../lib/rbac";
+import { ConfirmDestructiveDialog } from "../components/ConfirmDestructiveDialog";
+import { IconRefresh, IconSearch, IconVM, IconPlus, IconPlay, IconStop, IconSnapshot, IconTrash, IconClose, IconStacks } from "../components/icons";
+import { hasVMCap, gateVMAction } from "../lib/rbac";
 import { formatBytes, shortId } from "../lib/format";
-import type { VM, VMState } from "../lib/types";
+import { api } from "../lib/api";
+import { toast, toastError } from "../lib/toast";
+import type { VM, VMState, VMBulkRequest, VMBulkResponse } from "../lib/types";
 
 const EMPTY_VMS: VM[] = [];
 
@@ -71,6 +74,13 @@ export function VirtualMachines() {
   const [state, setState] = useState<"" | VMState>("");
   const [search, setSearch] = useState("");
 
+  // --- multi-select + bulk operations ---
+  // Selection is keyed by "providerId:vmId" (the same key DataTable rows use).
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const vmKey = (v: VM) => `${v.providerId}:${v.id}`;
+
   const filtered = useMemo(() => {
     const s = search.trim().toLowerCase();
     return vms.filter((v) => {
@@ -91,7 +101,93 @@ export function VirtualMachines() {
     return Array.from(set).sort();
   }, [vms, providers]);
 
+  // The currently-selected VM objects (only those still present after filtering).
+  const selectedVMs = useMemo(() => filtered.filter((v) => selected.has(vmKey(v))), [filtered, selected]);
+  const allFilteredSelected = filtered.length > 0 && filtered.every((v) => selected.has(vmKey(v)));
+
+  const toggleOne = (v: VM) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      const k = vmKey(v);
+      if (next.has(k)) next.delete(k);
+      else next.add(k);
+      return next;
+    });
+
+  const toggleAll = () =>
+    setSelected((prev) => {
+      if (filtered.every((v) => prev.has(vmKey(v)))) {
+        // deselect everything currently visible
+        const next = new Set(prev);
+        for (const v of filtered) next.delete(vmKey(v));
+        return next;
+      }
+      const next = new Set(prev);
+      for (const v of filtered) next.add(vmKey(v));
+      return next;
+    });
+
+  const clearSelection = () => setSelected(new Set());
+
+  // runBulk fans a single action across the selected VMs via POST /vm/bulk. Each
+  // target is re-gated server-side by the same permission the single action needs;
+  // a per-target result drives the summary toast. The action is only OFFERED for
+  // VMs whose provider+RBAC permit it (we filter before sending), so the common
+  // case succeeds and only genuine conflicts surface as per-target failures.
+  const runBulk = async (req: Omit<VMBulkRequest, "targets">, eligible: VM[]) => {
+    if (eligible.length === 0) return;
+    setBulkBusy(true);
+    try {
+      const res: VMBulkResponse = await api.vmBulk({
+        ...req,
+        targets: eligible.map((v) => ({ providerId: v.providerId, vmId: v.id })),
+      });
+      const verb = req.op ?? req.action;
+      if (res.failed === 0) {
+        toast.success(`Bulk ${verb}: ${res.succeeded} succeeded`);
+      } else if (res.succeeded === 0) {
+        toast.warning(`Bulk ${verb}: all ${res.failed} failed`, res.results.find((r) => r.error)?.error);
+      } else {
+        toast.warning(`Bulk ${verb}: ${res.succeeded} ok, ${res.failed} failed`, res.results.find((r) => r.error)?.error);
+      }
+      clearSelection();
+      inventoryQ.refetch();
+    } catch (err) {
+      toastError("Bulk operation failed", err);
+    } finally {
+      setBulkBusy(false);
+    }
+  };
+
+  // Eligibility per action: a VM is eligible when its provider advertises the cap
+  // AND the user holds the permission (gateVMAction), so we never send a target
+  // the backend would 405/403. resume/start share the start gate.
+  const eligibleFor = (action: "start" | "stop" | "snapshot" | "delete_vm") =>
+    selectedVMs.filter((v) => gateVMAction(action, capsForProvider(v.providerId), permissions).allowed);
+
   const columns: Column<VM>[] = [
+    {
+      key: "select",
+      header: (
+        <span onClick={(e) => e.stopPropagation()} style={{ display: "inline-flex" }}>
+          <input
+            type="checkbox"
+            aria-label="Select all"
+            checked={allFilteredSelected}
+            ref={(el) => {
+              if (el) el.indeterminate = !allFilteredSelected && selectedVMs.length > 0;
+            }}
+            onChange={toggleAll}
+          />
+        </span>
+      ),
+      width: "40px",
+      cell: (v) => (
+        <span onClick={(e) => e.stopPropagation()} style={{ display: "inline-flex" }}>
+          <input type="checkbox" aria-label={`Select ${v.name}`} checked={selected.has(vmKey(v))} onChange={() => toggleOne(v)} />
+        </span>
+      ),
+    },
     {
       key: "name",
       header: "Name",
@@ -102,6 +198,11 @@ export function VirtualMachines() {
             <span style={{ fontWeight: 600 }} className="truncate">
               {v.name}
             </span>
+            {v.labels?.["unihv.template"] === "true" ? (
+              <span className="chip" title="This VM is a golden-image template (deploy new VMs from it)">
+                <IconStacks size={12} /> Template
+              </span>
+            ) : null}
             {v.protected ? <ProtectedTag /> : null}
           </div>
           <span className="text-xs muted mono">{shortId(v.id)}</span>
@@ -178,6 +279,8 @@ export function VirtualMachines() {
           onMountIso={actions.triggerMountIso}
           onEjectIso={actions.ejectIso}
           onDelete={actions.triggerDelete}
+          onDeploy={actions.triggerDeploy}
+          onMarkTemplate={actions.markTemplate}
         />
       ),
     },
@@ -238,6 +341,65 @@ export function VirtualMachines() {
         </div>
       </div>
 
+      {selectedVMs.length > 0 ? (
+        <div
+          className="card card-pad row-wrap"
+          style={{ gap: "var(--sp-3)", alignItems: "center", borderColor: "var(--accent)" }}
+        >
+          <span className="text-sm" style={{ fontWeight: 600 }}>
+            {selectedVMs.length} selected
+          </span>
+          <span className="spacer" />
+          <ActionButton
+            size="sm"
+            variant="ghost"
+            loading={bulkBusy}
+            disabled={bulkBusy || eligibleFor("start").length === 0}
+            tooltip={eligibleFor("start").length === 0 ? "No selected VM can be powered on" : `Power on ${eligibleFor("start").length}`}
+            onClick={() => runBulk({ action: "power", op: "start" }, eligibleFor("start"))}
+          >
+            <IconPlay size={14} />
+            Power On ({eligibleFor("start").length})
+          </ActionButton>
+          <ActionButton
+            size="sm"
+            variant="ghost"
+            loading={bulkBusy}
+            disabled={bulkBusy || eligibleFor("stop").length === 0}
+            tooltip={eligibleFor("stop").length === 0 ? "No selected VM can be powered off" : `Power off ${eligibleFor("stop").length}`}
+            onClick={() => runBulk({ action: "power", op: "stop" }, eligibleFor("stop"))}
+          >
+            <IconStop size={14} />
+            Power Off ({eligibleFor("stop").length})
+          </ActionButton>
+          <ActionButton
+            size="sm"
+            variant="ghost"
+            loading={bulkBusy}
+            disabled={bulkBusy || eligibleFor("snapshot").length === 0}
+            tooltip={eligibleFor("snapshot").length === 0 ? "No selected VM supports snapshots" : `Snapshot ${eligibleFor("snapshot").length}`}
+            onClick={() => runBulk({ action: "snapshot", name: `bulk-${new Date().toISOString().slice(0, 19)}` }, eligibleFor("snapshot"))}
+          >
+            <IconSnapshot size={14} />
+            Snapshot ({eligibleFor("snapshot").length})
+          </ActionButton>
+          <ActionButton
+            size="sm"
+            variant="ghost"
+            disabled={bulkBusy || eligibleFor("delete_vm").length === 0}
+            tooltip={eligibleFor("delete_vm").length === 0 ? "No selected VM can be deleted" : `Delete ${eligibleFor("delete_vm").length}`}
+            onClick={() => setBulkDeleteOpen(true)}
+            style={eligibleFor("delete_vm").length > 0 ? { color: "var(--danger)" } : undefined}
+          >
+            <IconTrash size={14} />
+            Delete ({eligibleFor("delete_vm").length})
+          </ActionButton>
+          <ActionButton size="sm" variant="ghost" iconOnly tooltip="Clear selection" aria-label="Clear selection" onClick={clearSelection}>
+            <IconClose size={15} />
+          </ActionButton>
+        </div>
+      ) : null}
+
       {inventoryQ.isLoading ? (
         <LoadingFill label="Loading virtual machines…" />
       ) : (
@@ -252,6 +414,23 @@ export function VirtualMachines() {
           emptyMessage="Adjust the filters above, or connect a hypervisor provider."
         />
       )}
+
+      <ConfirmDestructiveDialog
+        open={bulkDeleteOpen}
+        title="Delete selected VMs"
+        variant="danger"
+        confirmLabel={`Delete ${eligibleFor("delete_vm").length}`}
+        description={
+          <>
+            Permanently delete <strong>{eligibleFor("delete_vm").length}</strong> selected virtual machine(s)? This destroys the guests and cannot be undone.
+          </>
+        }
+        onConfirm={async () => {
+          await runBulk({ action: "delete", force: true }, eligibleFor("delete_vm"));
+          setBulkDeleteOpen(false);
+        }}
+        onClose={() => setBulkDeleteOpen(false)}
+      />
 
       {actions.dialogs}
     </div>

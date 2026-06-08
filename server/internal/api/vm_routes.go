@@ -113,4 +113,13 @@ func (s *Server) mountVMRoutes(pr chi.Router) {
 	// handler type-asserts DiskResizer + CapDiskResize, else 405.
 	pr.With(az.AuditWrap("vm.disk.resize"), az.RequireAAL, az.RequirePermission("vm.disk.resize", scopeFromProvider)).
 		Post("/vm/providers/{providerID}/vms/{vmID}/disks/{diskID}/resize", s.VMDiskResize)
+
+	// --- VM templates (Lot 4A): mark/unmark a VM as a template + list templates.
+	// Mark is admin-grade (vm.template — provisioning-class golden-image management);
+	// the handler type-asserts TemplateManager + CapTemplates, else 405. The list is
+	// a plain read (vm.read), reusing ListVMs with the template Label filter. ---
+	pr.With(az.AuditWrap("vm.template"), az.RequireAAL, az.RequirePermission("vm.template", scopeFromProvider)).
+		Post("/vm/providers/{providerID}/vms/{vmID}/template", s.VMMarkTemplate)
+	pr.With(az.RequirePermission("vm.read", scopeFromProvider)).
+		Get("/vm/providers/{providerID}/templates", s.VMTemplates)
 }

@@ -45,6 +45,7 @@ import { Registries } from "./views/Registries";
 import { Catalogs } from "./views/Catalogs";
 import { Authentication } from "./views/Authentication";
 import { Settings } from "./views/Settings";
+import { ApiTokens } from "./views/ApiTokens";
 import { Profile } from "./views/Profile";
 import { NotFound } from "./views/NotFound";
 
@@ -314,6 +315,8 @@ export const router = createBrowserRouter([
         ),
       },
       { path: "profile", element: <Profile /> },
+      // API tokens are self-service: any authenticated user manages their own.
+      { path: "api-tokens", element: <ApiTokens /> },
       { path: "404", element: <NotFound /> },
     ],
   },

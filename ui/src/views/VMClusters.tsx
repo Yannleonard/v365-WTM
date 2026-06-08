@@ -7,17 +7,23 @@
 
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { useInventory, useVMClusterTopology } from "../lib/hooks";
+import { useQueryClient } from "@tanstack/react-query";
+import { useInventory, useVMClusterTopology, useVMCapabilityLookup } from "../lib/hooks";
+import { useAuth } from "../lib/auth";
 import { PageHeader } from "../components/PageHeader";
 import { DataTable, type Column } from "../components/DataTable";
 import { VMStateBadge } from "../components/VMStateBadge";
 import { LoadingFill } from "../components/Spinner";
 import { EmptyState } from "../components/EmptyState";
 import { ActionButton } from "../components/ActionButton";
+import { Modal } from "../components/Modal";
 import { StatusDot } from "../components/StatusDot";
 import { IconRefresh, IconNetworks, IconChevronDown, IconVM } from "../components/icons";
+import { gateVMMaintenance } from "../lib/rbac";
+import { api } from "../lib/api";
+import { toast, toastError } from "../lib/toast";
 import { formatBytes } from "../lib/format";
-import type { VM, VMCluster } from "../lib/types";
+import type { VM, VMCluster, VMCapability } from "../lib/types";
 
 export function VMClusters() {
   const inventoryQ = useInventory();
@@ -149,14 +155,55 @@ function ClusterTopology({ pid, cid, vms }: { pid: string; cid: string; vms: VM[
   return (
     <div className="col" style={{ gap: "var(--sp-4)", padding: "var(--sp-4)" }}>
       {nodes.map((node) => (
-        <NodePanel key={node.nodeId} node={node} vms={vmsByNode.get(node.nodeId) ?? []} />
+        <NodePanel key={node.nodeId} pid={pid} node={node} vms={vmsByNode.get(node.nodeId) ?? []} />
       ))}
     </div>
   );
 }
 
-function NodePanel({ node, vms }: { node: import("../lib/types").VMClusterNode; vms: VM[] }) {
+function NodePanel({ pid, node, vms }: { pid: string; node: import("../lib/types").VMClusterNode; vms: VM[] }) {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const { permissions } = useAuth();
+  const { capsForProvider } = useVMCapabilityLookup();
+  const caps = capsForProvider(pid) as VMCapability[] | undefined;
+
+  const inMaintenance = node.state === "maintenance";
+  const maintGate = gateVMMaintenance(caps, permissions);
+
+  const [maintModalOpen, setMaintModalOpen] = useState(false);
+  const [evacuate, setEvacuate] = useState(true);
+  const [busy, setBusy] = useState(false);
+
+  const refreshTopology = () => queryClient.invalidateQueries({ queryKey: ["vm", "topology", pid] });
+
+  const enterMaintenance = async () => {
+    setBusy(true);
+    try {
+      const task = await api.vmHostEnterMaintenance(pid, node.nodeId, evacuate);
+      toast.success(`${node.nodeId}: entering maintenance`, task?.message);
+      setMaintModalOpen(false);
+      refreshTopology();
+    } catch (err) {
+      toastError("Enter maintenance failed", err);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const exitMaintenance = async () => {
+    setBusy(true);
+    try {
+      await api.vmHostExitMaintenance(pid, node.nodeId);
+      toast.success(`${node.nodeId}: maintenance cleared`);
+      refreshTopology();
+    } catch (err) {
+      toastError("Exit maintenance failed", err);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const vmColumns: Column<VM>[] = [
     { key: "name", header: "VM", sortValue: (v) => v.name, cell: (v) => <span style={{ fontWeight: 600 }} className="truncate">{v.name}</span> },
     { key: "state", header: "State", sortValue: (v) => v.state, cell: (v) => <VMStateBadge state={v.state} raw={v.stateRaw} /> },
@@ -177,9 +224,31 @@ function NodePanel({ node, vms }: { node: import("../lib/types").VMClusterNode; 
             {node.message ? <span className="text-xs muted">{node.message}</span> : null}
           </div>
         </div>
-        <div className="row-wrap" style={{ gap: "var(--sp-2)" }}>
+        <div className="row-wrap" style={{ gap: "var(--sp-2)", alignItems: "center" }}>
           {node.state ? <span className="chip">{node.state}</span> : null}
           <span className="chip">{node.vmCount ?? vms.length} VMs</span>
+          {inMaintenance ? (
+            <ActionButton
+              size="sm"
+              variant="ghost"
+              loading={busy}
+              disabled={busy || !maintGate.allowed}
+              tooltip={maintGate.allowed ? "Return this host to service" : maintGate.reason}
+              onClick={exitMaintenance}
+            >
+              Exit Maintenance
+            </ActionButton>
+          ) : (
+            <ActionButton
+              size="sm"
+              variant="ghost"
+              disabled={busy || !maintGate.allowed}
+              tooltip={maintGate.allowed ? "Put this host into maintenance" : maintGate.reason}
+              onClick={() => setMaintModalOpen(true)}
+            >
+              Enter Maintenance
+            </ActionButton>
+          )}
         </div>
       </div>
       <div className="card-body" style={{ padding: 0 }}>
@@ -193,6 +262,42 @@ function NodePanel({ node, vms }: { node: import("../lib/types").VMClusterNode; 
           emptyTitle="No VMs on this node"
         />
       </div>
+
+      {maintModalOpen ? (
+        <Modal
+          open
+          title={`Enter maintenance — ${node.nodeId}`}
+          busy={busy}
+          onClose={() => setMaintModalOpen(false)}
+          footer={
+            <>
+              <button className="btn" onClick={() => setMaintModalOpen(false)} disabled={busy}>
+                Cancel
+              </button>
+              <ActionButton variant="primary" loading={busy} onClick={enterMaintenance}>
+                Enter Maintenance
+              </ActionButton>
+            </>
+          }
+        >
+          <div className="col" style={{ gap: "var(--sp-3)" }}>
+            <p className="text-sm muted">
+              Marking <strong>{node.nodeId}</strong> for maintenance drains it from scheduling. Optionally evacuate its running VMs
+              to another host first via live migration.
+            </p>
+            <label className="checkbox-row">
+              <input type="checkbox" checked={evacuate} onChange={(e) => setEvacuate(e.target.checked)} />
+              <span>Evacuate running VMs (live-migrate to another host where available)</span>
+            </label>
+            <div className="banner info">
+              <span>
+                On a single-host hypervisor there is nowhere to evacuate to — the host is still marked maintenance and the VMs stay
+                in place (the result message will say so).
+              </span>
+            </div>
+          </div>
+        </Modal>
+      ) : null}
     </div>
   );
 }

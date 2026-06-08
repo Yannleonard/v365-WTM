@@ -126,7 +126,37 @@ type libvirtDomain struct {
 	// set, renderDomainXML attaches it as an additional read-only cdrom so the guest
 	// reads the cloud-init datasource from a CD labeled 'cidata'.
 	SeedISO string
+
+	// --- CPU topology + model (Lot 4A) ---
+	// CPU, when non-nil, requests an explicit <cpu> topology (sockets/cores/threads)
+	// and/or a CPU model. renderDomainXML emits <cpu mode=...><topology .../></cpu>
+	// and sets <vcpu> = sockets*cores*threads. nil falls back to the flat VCPUs count
+	// and the default CPU model (host-passthrough).
+	CPU *vp.CPUSpec
+
+	// --- templates (Lot 4A) ---
+	// IsTemplate marks the domain as a TEMPLATE (golden image): renderDomainXML emits
+	// <metadata><unihv:template>true</unihv:template></metadata> AND the backend sets
+	// the Label "unihv.template=true". Templates are not run as-is; they are the
+	// source for clone-from-template.
+	IsTemplate bool
+
+	// --- Windows sysprep (Lot 4A) ---
+	// Sysprep, when non-nil, requests a Windows autounattend.xml seed ISO at define
+	// time (the Windows analogue of cloud-init). The LIVE backend builds it
+	// (buildSysprepISO) and sets SysprepISO; the sim backend ignores it.
+	Sysprep *vp.SysprepSpec
+	// SysprepISO is the on-disk path of the generated 'sysprep' autounattend seed ISO.
+	// When set, renderDomainXML attaches it as an additional read-only cdrom so the
+	// Windows installer/specialize pass reads autounattend.xml from a CD.
+	SysprepISO string
 }
+
+// unihvMetadataNS is the metadata namespace UniHV uses on libvirt domains.
+const unihvMetadataNS = "https://unihv.gtek.it/metadata/1"
+
+// labelTemplate is the Label key the provider sets/reads to mark a template VM.
+const labelTemplate = "unihv.template"
 
 // libvirtDisk subsets a <disk> element.
 type libvirtDisk struct {
@@ -197,6 +227,33 @@ func (p *Provider) normalizeDomain(d *libvirtDomain) vp.VM {
 		IPAddresses: append([]string(nil), d.IPs...),
 		Labels:      d.Labels,
 	}
+	// Surface template + CPU topology through Labels (the VM struct is frozen). The
+	// UI reads Labels["unihv.template"] for the template badge and the cpu.* labels
+	// for the topology summary. We copy-on-write so we never mutate the backend map.
+	if d.IsTemplate || d.CPU != nil {
+		lbls := map[string]string{}
+		for k, val := range d.Labels {
+			lbls[k] = val
+		}
+		if d.IsTemplate {
+			lbls[labelTemplate] = "true"
+		}
+		if c := d.CPU; c != nil {
+			if c.Sockets > 0 {
+				lbls["unihv.cpu.sockets"] = itoa(c.Sockets)
+			}
+			if c.CoresPerSocket > 0 {
+				lbls["unihv.cpu.cores"] = itoa(c.CoresPerSocket)
+			}
+			if c.ThreadsPerCore > 0 {
+				lbls["unihv.cpu.threads"] = itoa(c.ThreadsPerCore)
+			}
+			if c.Model != "" {
+				lbls["unihv.cpu.model"] = c.Model
+			}
+		}
+		v.Labels = lbls
+	}
 	if d.Created > 0 {
 		v.CreatedAt = unixUTC(d.Created)
 	}
@@ -265,6 +322,12 @@ func (p *Provider) normalizeNode(n *libvirtNode) vp.Host {
 	state := vp.NodeDown
 	if n.Online {
 		state = vp.NodeUp
+	}
+	// A host placed into maintenance via EnterMaintenance overrides the up/down
+	// availability so ListHosts / NodeState / topology all reflect it (KVM's
+	// libvirt node has no native maintenance flag — the provider tracks it).
+	if p.isMaint(n.ID) {
+		state = vp.NodeMaintenance
 	}
 	return vp.Host{
 		ID:         n.ID,

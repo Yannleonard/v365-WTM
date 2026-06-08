@@ -202,6 +202,38 @@ type VMSpec struct {
 	// CloudInit, when non-nil, generates a NoCloud seed ISO (user-data + meta-data)
 	// attached to the VM so a cloud-init-enabled guest image self-configures on boot.
 	CloudInit *CloudInitSpec `json:"cloudInit,omitempty"`
+
+	// --- CPU topology / model (vSphere "CPU" advanced) ---
+	// CPU, when non-nil, sets explicit sockets/cores/threads + an optional CPU model
+	// (instead of a flat vCPU count). Improves guest perf and live-migrate/EVC compat.
+	CPU *CPUSpec `json:"cpu,omitempty"`
+
+	// --- templates / customization ---
+	// IsTemplate marks the created VM as a TEMPLATE (golden image for clone-from-
+	// template; not run as-is). For libvirt this is domain metadata + a label.
+	IsTemplate bool `json:"isTemplate,omitempty"`
+	// Sysprep, when non-nil, requests Windows guest customization (autounattend.xml
+	// seed) — the Windows analogue of cloud-init.
+	Sysprep *SysprepSpec `json:"sysprep,omitempty"`
+}
+
+// CPUSpec is the normalized CPU topology + model.
+type CPUSpec struct {
+	Sockets        int    `json:"sockets,omitempty"`
+	CoresPerSocket int    `json:"coresPerSocket,omitempty"`
+	ThreadsPerCore int    `json:"threadsPerCore,omitempty"`
+	Model          string `json:"model,omitempty"` // "" = hypervisor default (e.g. host-passthrough)
+}
+
+// SysprepSpec is normalized Windows guest customization (autounattend.xml).
+type SysprepSpec struct {
+	ComputerName     string `json:"computerName,omitempty"`
+	AdminPassword    string `json:"adminPassword,omitempty"`
+	ProductKey       string `json:"productKey,omitempty"`
+	OrgName          string `json:"orgName,omitempty"`
+	TimeZone         string `json:"timeZone,omitempty"`
+	Locale           string `json:"locale,omitempty"`
+	UnattendXMLExtra string `json:"unattendXmlExtra,omitempty"` // advanced: raw extra
 }
 
 // CloudInitSpec is normalized guest customization applied via a NoCloud seed.

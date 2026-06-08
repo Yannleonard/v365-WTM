@@ -360,6 +360,23 @@ export function gateVMDiskResize(
 }
 
 /**
+ * Gate marking/unmarking a VM as a TEMPLATE (Lot 4A) — cap "templates" +
+ * vm.template (admin-grade). A read-only provider disables it. Deploy-from-template
+ * reuses gateVMAction("clone").
+ */
+export function gateVMTemplate(
+  caps: VMCapability[] | undefined,
+  permissions: string[] | undefined,
+): GateResult {
+  if (hasVMCap(caps, "readonly")) return { allowed: false, reason: "This hypervisor is read-only" };
+  if (!hasVMCap(caps, "templates"))
+    return { allowed: false, reason: "Provider does not support VM templates" };
+  if (!can(permissions, "vm.template"))
+    return { allowed: false, reason: "You lack the vm.template permission" };
+  return { allowed: true, reason: "" };
+}
+
+/**
  * Gate showing guest-agent info — cap "guest_agent" + vm.read (anyone who can
  * see the VM). Read-only does NOT disable it (it is a read affordance).
  */
@@ -369,6 +386,22 @@ export function gateVMGuestAgent(
 ): GateResult {
   if (!hasVMCap(caps, "guest_agent"))
     return { allowed: false, reason: "Provider does not expose guest-agent info" };
+  return { allowed: true, reason: "" };
+}
+
+/**
+ * Gate entering/exiting host maintenance mode (cap "maintenance" +
+ * vm.host.maintenance, admin-grade). A read-only provider disables it.
+ */
+export function gateVMMaintenance(
+  caps: VMCapability[] | undefined,
+  permissions: string[] | undefined,
+): GateResult {
+  if (hasVMCap(caps, "readonly")) return { allowed: false, reason: "This hypervisor is read-only" };
+  if (!hasVMCap(caps, "maintenance"))
+    return { allowed: false, reason: "Provider does not support host maintenance" };
+  if (!can(permissions, "vm.host.maintenance"))
+    return { allowed: false, reason: "You lack the vm.host.maintenance permission" };
   return { allowed: true, reason: "" };
 }
 

@@ -90,7 +90,22 @@ type ctxKey int
 const (
 	ctxKeyUser ctxKey = iota
 	ctxKeyRequestID
+	ctxKeyBearer
 )
+
+// WithBearerAuth marks the request context as authenticated by an API bearer
+// token (not a session cookie). The CSRF middleware uses this to SKIP the CSRF
+// check for bearer-authed mutations — a bearer token is sent in a header, never
+// a cookie, so it is structurally immune to CSRF.
+func WithBearerAuth(ctx context.Context) context.Context {
+	return context.WithValue(ctx, ctxKeyBearer, true)
+}
+
+// IsBearerAuth reports whether the request was authenticated by a bearer token.
+func IsBearerAuth(r *http.Request) bool {
+	v, _ := r.Context().Value(ctxKeyBearer).(bool)
+	return v
+}
 
 // WithUser stores the authenticated user in the context.
 func WithUser(ctx context.Context, u *User) context.Context {

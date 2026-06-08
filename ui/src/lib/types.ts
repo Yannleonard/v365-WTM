@@ -1193,6 +1193,8 @@ export type VMCapability =
   | "hotplug"
   | "disk_resize"
   | "guest_agent"
+  | "maintenance"
+  | "templates"
   | "readonly"
   | (string & {});
 
@@ -1490,6 +1492,37 @@ export interface VMSpec {
   // cloudInit, when set, generates a NoCloud seed ISO (cloud-init guest
   // customization) attached to the VM. Requires a cloud-init-enabled guest image.
   cloudInit?: CloudInitSpec;
+  // cpu, when set, pins an explicit CPU topology (sockets/cores/threads) + model.
+  // vcpus is then derived from sockets*cores*threads. Omit for a flat vCPU count.
+  cpu?: CPUSpec;
+  // isTemplate marks the created VM as a golden-image TEMPLATE (not run as-is; the
+  // source for clone-from-template).
+  isTemplate?: boolean;
+  // sysprep, when set, generates a Windows autounattend.xml seed ISO (the Windows
+  // analogue of cloud-init) attached to the VM. Requires a Windows guest image.
+  sysprep?: SysprepSpec;
+}
+
+// CPUSpec pins an explicit CPU topology + model. Mirrors vprovider.CPUSpec. An
+// empty model means the hypervisor default (KVM: host-passthrough).
+export interface CPUSpec {
+  sockets?: number;
+  coresPerSocket?: number;
+  threadsPerCore?: number;
+  model?: string;
+}
+
+// SysprepSpec is Windows guest customization applied via an autounattend.xml seed
+// ISO. Mirrors vprovider.SysprepSpec. All fields optional; requires a Windows guest.
+export interface SysprepSpec {
+  computerName?: string;
+  adminPassword?: string;
+  productKey?: string;
+  orgName?: string;
+  timeZone?: string;
+  locale?: string;
+  // unattendXmlExtra is optional raw extra unattend settings appended (advanced).
+  unattendXmlExtra?: string;
 }
 
 // CloudInitSpec is guest customization applied via a NoCloud seed ISO. Mirrors the
@@ -1515,6 +1548,67 @@ export interface CloudInitSpec {
 
 // VM power operation tokens (path segment for the power endpoint).
 export type VMPowerOp = "start" | "stop" | "reset" | "suspend" | "resume";
+
+/* ===================== Bulk operations (Lot 4B) ===================== */
+
+// One VM in a bulk request: its owning provider + vm id.
+export interface VMBulkTarget {
+  providerId: string;
+  vmId: string;
+}
+
+// POST /vm/bulk body. action is the verb; op qualifies a power action.
+export interface VMBulkRequest {
+  action: "power" | "snapshot" | "delete";
+  op?: VMPowerOp;
+  name?: string; // optional snapshot name
+  force?: boolean; // delete: force-destroy a running VM
+  targets: VMBulkTarget[];
+}
+
+// Per-target outcome.
+export interface VMBulkResult {
+  providerId: string;
+  vmId: string;
+  ok: boolean;
+  error?: string;
+  taskId?: string;
+}
+
+// Aggregated bulk fan-out response.
+export interface VMBulkResponse {
+  action: string;
+  op?: string;
+  succeeded: number;
+  failed: number;
+  results: VMBulkResult[];
+}
+
+/* ===================== API tokens (scoped PATs, Lot 4B) ===================== */
+
+// A persisted API-token record (metadata only; the raw value is NEVER returned
+// after creation). expiresAt/lastUsedAt are unix epoch seconds.
+export interface ApiTokenRecord {
+  id: string;
+  name: string;
+  userId: string;
+  permissions: string[];
+  expiresAt?: number;
+  lastUsedAt?: number;
+  createdAt: number;
+}
+
+// POST /tokens body.
+export interface ApiTokenCreateRequest {
+  name: string;
+  scopes: string[];
+  expiresInDays?: number;
+}
+
+// POST /tokens response: the record PLUS the raw token shown exactly ONCE.
+export interface ApiTokenCreateResponse extends ApiTokenRecord {
+  token: string;
+}
 
 /* ===================== Unified inventory (single pane of glass) ===================== */
 

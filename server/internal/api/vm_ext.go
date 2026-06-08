@@ -405,3 +405,61 @@ func (s *Server) VMDiskResize(w http.ResponseWriter, r *http.Request) {
 	ok(w, task)
 }
 
+// --- VM templates (Lot 4A): mark/unmark + list templates ---
+
+// vmTemplateBody is the mark-as-template request body.
+type vmTemplateBody struct {
+	IsTemplate bool `json:"isTemplate"`
+}
+
+// VMMarkTemplate marks/unmarks a VM as a TEMPLATE (golden image). Requires
+// TemplateManager + CapTemplates. A running VM cannot be (un)marked (409).
+func (s *Server) VMMarkTemplate(w http.ResponseWriter, r *http.Request) {
+	p, found := s.resolveVMProvider(w, r)
+	if !found {
+		return
+	}
+	tm, impl := p.(vprovider.TemplateManager)
+	if !impl || !p.Capabilities().Has(vprovider.CapTemplates) {
+		authz.WriteError(w, r, authz.ErrMethodNotAllowed)
+		return
+	}
+	var body vmTemplateBody
+	if err := decodeJSON(w, r, &body); err != nil {
+		authz.WriteError(w, r, err)
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 30*time.Second)
+	defer cancel()
+	task, err := tm.MarkTemplate(ctx, chi.URLParam(r, "vmID"), body.IsTemplate)
+	if err != nil {
+		authz.WriteError(w, r, vmProviderError(err))
+		return
+	}
+	ok(w, task)
+}
+
+// VMTemplates lists the provider's TEMPLATE VMs (those carrying the
+// "unihv.template=true" Label). Reuses ListVMs with a label filter so the result is
+// the SAME normalized VM shape the list view already renders. Requires CapTemplates.
+func (s *Server) VMTemplates(w http.ResponseWriter, r *http.Request) {
+	p, found := s.resolveVMProvider(w, r)
+	if !found {
+		return
+	}
+	if !p.Capabilities().Has(vprovider.CapTemplates) {
+		authz.WriteError(w, r, authz.ErrMethodNotAllowed)
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 10*time.Second)
+	defer cancel()
+	vms, err := p.ListVMs(ctx, vprovider.ListOptions{
+		Labels: map[string]string{"unihv.template": "true"},
+	})
+	if err != nil {
+		authz.WriteError(w, r, vmProviderError(err))
+		return
+	}
+	ok(w, vms)
+}
+

@@ -158,6 +158,28 @@ type GuestAgentProvider interface {
 
 // --- online disk resize ---
 
+// --- host maintenance mode + evacuation ---
+
+// MaintenanceProvider is implemented by providers that can put a HOST into
+// maintenance mode and (optionally) evacuate its running VMs to another host
+// before doing so (KVM: mark the node maintenance + live-migrate running domains
+// off it via MigrateVM where a target host exists). ExitMaintenance clears the
+// maintenance mark, returning the host to normal scheduling. Requires
+// CapMaintenance.
+//
+// EnterMaintenance with evacuate=false succeeds immediately (the host is simply
+// drained of new placement). With evacuate=true it live-migrates every running
+// VM to another available host; when no other host exists it still marks the
+// node maintenance but reports an honest "no target" note in the returned Task
+// rather than failing (a single-host KVM has nowhere to evacuate to).
+type MaintenanceProvider interface {
+	// EnterMaintenance marks the host maintenance and, when evacuate is set,
+	// live-migrates its running VMs off it where another host is available.
+	EnterMaintenance(ctx context.Context, hostID string, evacuate bool) (*Task, error)
+	// ExitMaintenance clears the host's maintenance mark.
+	ExitMaintenance(ctx context.Context, hostID string) (*Task, error)
+}
+
 // DiskResizer is implemented by providers that can grow a VM's virtual disk
 // online (KVM: DomainBlockResize on the running domain's block device, growing the
 // underlying volume first where needed). Shrink is rejected with ErrInvalidSpec.
@@ -179,6 +201,20 @@ type SnapshotManager interface {
 	DeleteSnapshot(ctx context.Context, vmID, snapID string) (*Task, error)
 }
 
+// --- VM templates (mark / clone-from-template) ---
+
+// TemplateManager is implemented by providers that can mark an existing VM as a
+// TEMPLATE (golden image) and back. For KVM this re-defines the domain with
+// <metadata><unihv:template>true</unihv:template></metadata> + the
+// "unihv.template=true" Label. Templates are not run as-is; clone-from-template is
+// the existing Clone op, which produces a fresh NON-template VM. Requires
+// CapTemplates. The VM must be SHUT OFF to (un)mark it.
+type TemplateManager interface {
+	// MarkTemplate toggles a VM's template status. Returns ErrConflict if the VM is
+	// running (it must be shut off to be (un)marked).
+	MarkTemplate(ctx context.Context, vmID string, isTemplate bool) (*Task, error)
+}
+
 // Capability bits for the optional interfaces (continue the CapabilityMatrix).
 // They are defined here (not in capability.go) to keep the extension self-contained;
 // being in the same package they share the same iota space is NOT required because
@@ -197,6 +233,13 @@ const (
 	CapGuestAgent CapabilityMatrix = 1 << 36
 	// CapDiskResize declares online (live) virtual-disk grow (DiskResizer).
 	CapDiskResize CapabilityMatrix = 1 << 37
+	// CapMaintenance declares host maintenance mode + (optional) evacuation
+	// (MaintenanceProvider). 1<<38 is chosen distinct from Lot 4A's CapTemplates.
+	CapMaintenance CapabilityMatrix = 1 << 38
+	// CapTemplates declares VM template support: mark/unmark a VM as a template
+	// (TemplateManager) + clone-from-template (the existing Clone op produces a
+	// fresh non-template VM). Lot 4A.
+	CapTemplates CapabilityMatrix = 1 << 39
 )
 
 // extTokens maps the extension capability bits to wire tokens (appended to the
@@ -211,6 +254,8 @@ var extTokens = []struct {
 	{CapHotPlug, "hotplug"},
 	{CapGuestAgent, "guest_agent"},
 	{CapDiskResize, "disk_resize"},
+	{CapMaintenance, "maintenance"},
+	{CapTemplates, "templates"},
 }
 
 // ExtStrings returns the active EXTENSION capability tokens (console/network_write/

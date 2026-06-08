@@ -31,6 +31,7 @@ import {
   IconSettings,
   IconStats,
   IconAlert,
+  IconLock,
 } from "./icons";
 import { BrandLock } from "./BrandLock";
 
@@ -137,6 +138,8 @@ const GROUPS: NavGroup[] = [
         perms: ["auth.provider.read", "auth.provider.write"],
       },
       { to: "/settings", label: "Settings", icon: <IconSettings size={18} />, perms: ["settings.read"] },
+      // API tokens are self-service: shown to every authenticated user (no perm gate).
+      { to: "/api-tokens", label: "API Tokens", icon: <IconLock size={18} /> },
     ],
   },
 ];
