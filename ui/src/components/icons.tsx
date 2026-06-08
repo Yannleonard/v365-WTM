@@ -339,6 +339,54 @@ export const IconMigrate = (p: IconProps) => (
   </svg>
 );
 
+// CD / DVD optical disc: outer rim, inner spindle hole, and a sheen arc — used
+// for the Mount ISO action (a disc, NOT a terminal/console).
+export const IconDisc = (p: IconProps) => (
+  <svg {...base(p)}>
+    <circle cx="12" cy="12" r="9" />
+    <circle cx="12" cy="12" r="2.6" />
+    <path d="M12 3a9 9 0 0 1 6.4 2.65" opacity="0.55" />
+  </svg>
+);
+
+// Alias so call sites can use either name.
+export const IconCdrom = IconDisc;
+
+// Network adapter / NIC card: a board with a port edge — distinct from the
+// topology IconNetworks.
+export const IconNic = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="3" y="6" width="18" height="12" rx="2" />
+    <path d="M7 18v2M11 18v2M15 18v2M7 10h6" />
+    <path d="M17 9.5h.01" />
+  </svg>
+);
+
+// Disk drive / HDD platter stack — used for disk device rows.
+export const IconDisk = (p: IconProps) => (
+  <svg {...base(p)}>
+    <ellipse cx="12" cy="6" rx="8" ry="3" />
+    <path d="M4 6v12c0 1.66 3.58 3 8 3s8-1.34 8-3V6" />
+    <path d="M4 12c0 1.66 3.58 3 8 3s8-1.34 8-3" />
+  </svg>
+);
+
+// CPU / processor chip — used in the hardware editor heading.
+export const IconCpu = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="7" y="7" width="10" height="10" rx="1.5" />
+    <path d="M9.5 2v3M14.5 2v3M9.5 19v3M14.5 19v3M2 9.5h3M2 14.5h3M19 9.5h3M19 14.5h3" />
+  </svg>
+);
+
+// Memory / RAM module — used in the hardware editor heading.
+export const IconMemory = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="3" y="7" width="18" height="10" rx="1.5" />
+    <path d="M7 7V4M12 7V4M17 7V4M8 11v2M12 11v2M16 11v2" />
+  </svg>
+);
+
 // Edit / pencil.
 export const IconEdit = (p: IconProps) => (
   <svg {...base(p)}>

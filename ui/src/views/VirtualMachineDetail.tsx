@@ -37,8 +37,9 @@ import {
   IconMigrate,
   IconRestart,
   IconTerminal,
-  IconPlus,
-  IconNetworks,
+  IconDisc,
+  IconDisk,
+  IconNic,
   IconTrash,
   IconClose,
 } from "../components/icons";
@@ -170,7 +171,7 @@ export function VirtualMachineDetail() {
                     aria-label="Add disk"
                     onClick={() => actions.triggerAddDisk(detail)}
                   >
-                    <IconPlus size={16} />
+                    <IconDisk size={16} />
                   </ActionButton>
                   <ActionButton
                     variant="ghost"
@@ -180,7 +181,7 @@ export function VirtualMachineDetail() {
                     aria-label="Add network adapter"
                     onClick={() => actions.triggerAddNic(detail)}
                   >
-                    <IconNetworks size={16} />
+                    <IconNic size={16} />
                   </ActionButton>
                   <ActionButton
                     variant="ghost"
@@ -190,7 +191,7 @@ export function VirtualMachineDetail() {
                     aria-label="Mount ISO"
                     onClick={() => actions.triggerMountIso(detail)}
                   >
-                    <IconTerminal size={16} />
+                    <IconDisc size={16} />
                   </ActionButton>
                   <ActionButton
                     variant="ghost"

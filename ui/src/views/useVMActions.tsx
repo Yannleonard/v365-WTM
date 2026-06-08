@@ -1,21 +1,42 @@
 // ui/src/views/useVMActions.tsx
 //
 // Shared VM lifecycle action handling: power (start/stop/reset/suspend/resume),
-// snapshot create, clone, reconfigure, intra-hypervisor migrate, and delete.
-// Power ops fire directly (with optimistic toast + cache invalidation); the
-// destructive/parameterized ops open a Modal. Mirrors useWorkloadActions so VM
-// views stay declarative — they call trigger* and render `actions.dialogs`.
+// snapshot create, clone, reconfigure, intra-hypervisor migrate, and the
+// hot-plug device ops (add/detach disk + NIC, mount/eject ISO).
+//
+// Power ops fire directly (optimistic toast + cache invalidation). Every
+// parameterized action now opens a RIGHT-SIDE DRAWER (volet latéral) instead of
+// a centered popup — see <Drawer/>. The Reconfigure drawer is a rich "Edit
+// Settings" hardware editor (vCPU / memory / disks / NICs / boot / firmware)
+// modeled on vCenter. Destructive delete keeps the small ConfirmDestructiveDialog.
 
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { toast, toastError } from "../lib/toast";
-import { Modal } from "../components/Modal";
+import { Drawer } from "../components/Drawer";
 import { ActionButton } from "../components/ActionButton";
 import { ConfirmDestructiveDialog } from "../components/ConfirmDestructiveDialog";
 import { TextField, SelectField } from "../components/Field";
 import { useVMStorage, useVMVolumes, useVMNetworks } from "../lib/hooks";
-import type { VM, VMPowerOp } from "../lib/types";
+import { formatBytes } from "../lib/format";
+import {
+  IconEdit,
+  IconClone,
+  IconSnapshot,
+  IconMigrate,
+  IconDisc,
+  IconDisk,
+  IconNic,
+  IconCpu,
+  IconMemory,
+  IconPlus,
+  IconTrash,
+  IconAlert,
+  IconHelp,
+  IconCheck,
+} from "../components/icons";
+import type { VM, VMDisk, VMNic, VMPowerOp } from "../lib/types";
 
 interface SnapForm {
   vm: VM;
@@ -33,7 +54,8 @@ interface CloneForm {
 interface ReconfigureForm {
   vm: VM;
   vcpus: string;
-  memoryMb: string;
+  memValue: string;
+  memUnit: "MB" | "GB";
 }
 interface MigrateForm {
   vm: VM;
@@ -101,13 +123,21 @@ export function useVMActions() {
     }
   };
 
-  /* ---- triggers (open dialogs) ---- */
+  /* ---- triggers (open drawers) ---- */
   const triggerSnapshot = (vm: VM) =>
     setSnap({ vm, name: "", description: "", memory: false, quiesce: false });
   const triggerClone = (vm: VM) =>
     setClone({ vm, name: `${vm.name}-clone`, linked: false, powerOn: false });
-  const triggerReconfigure = (vm: VM) =>
-    setRecfg({ vm, vcpus: String(vm.vcpus), memoryMb: String(vm.memoryMb) });
+  const triggerReconfigure = (vm: VM) => {
+    // Present memory in GB when it divides evenly, else MB — nicer default.
+    const gbExact = vm.memoryMb % 1024 === 0 && vm.memoryMb >= 1024;
+    setRecfg({
+      vm,
+      vcpus: String(vm.vcpus),
+      memValue: gbExact ? String(vm.memoryMb / 1024) : String(vm.memoryMb),
+      memUnit: gbExact ? "GB" : "MB",
+    });
+  };
   const triggerMigrate = (vm: VM) =>
     setMigrate({ vm, targetHost: "", live: true, targetStorage: "" });
   const triggerDelete = (vm: VM) => setDel(vm);
@@ -157,15 +187,21 @@ export function useVMActions() {
     }
   };
 
+  const recfgMemoryMb = (f: ReconfigureForm): number => {
+    const v = Number(f.memValue);
+    if (!Number.isFinite(v) || v <= 0) return 0;
+    return f.memUnit === "GB" ? Math.round(v * 1024) : Math.round(v);
+  };
+
   const confirmReconfigure = async () => {
     if (!recfg) return;
     const vcpus = Number(recfg.vcpus);
-    const memoryMb = Number(recfg.memoryMb);
+    const memoryMb = recfgMemoryMb(recfg);
     setRecfgBusy(true);
     try {
       await api.vmReconfigure(recfg.vm.providerId, recfg.vm.id, {
         vcpus: Number.isFinite(vcpus) && vcpus > 0 ? vcpus : undefined,
-        memoryMb: Number.isFinite(memoryMb) && memoryMb > 0 ? memoryMb : undefined,
+        memoryMb: memoryMb > 0 ? memoryMb : undefined,
       });
       toast.success("Reconfigure requested", recfg.vm.name);
       invalidate(recfg.vm);
@@ -197,16 +233,28 @@ export function useVMActions() {
   };
 
   /* ---- hot-plug (live, no reboot) ---- */
+  // diskFromForm/nicFromForm centralize the attach payload so the rich
+  // reconfigure editor and the standalone "Add disk/NIC" drawers share code.
+  const attachDisk = async (vm: VM, form: { capacityGb: string; format: string; storageId: string }) => {
+    const cap = Number(form.capacityGb);
+    await api.vmDiskAttach(vm.providerId, vm.id, {
+      capacityGb: Number.isFinite(cap) && cap > 0 ? cap : 1,
+      format: form.format || undefined,
+      storageId: form.storageId.trim() || undefined,
+    });
+  };
+  const attachNic = async (vm: VM, form: { networkId: string; model: string }) => {
+    await api.vmNicAttach(vm.providerId, vm.id, {
+      networkId: form.networkId.trim(),
+      model: form.model || undefined,
+    });
+  };
+
   const confirmAddDisk = async () => {
     if (!addDisk) return;
-    const cap = Number(addDisk.capacityGb);
     setAddDiskBusy(true);
     try {
-      await api.vmDiskAttach(addDisk.vm.providerId, addDisk.vm.id, {
-        capacityGb: Number.isFinite(cap) && cap > 0 ? cap : 1,
-        format: addDisk.format || undefined,
-        storageId: addDisk.storageId.trim() || undefined,
-      });
+      await attachDisk(addDisk.vm, addDisk);
       toast.success("Disk attached", addDisk.vm.name);
       invalidate(addDisk.vm);
       setAddDisk(null);
@@ -221,10 +269,7 @@ export function useVMActions() {
     if (!addNic) return;
     setAddNicBusy(true);
     try {
-      await api.vmNicAttach(addNic.vm.providerId, addNic.vm.id, {
-        networkId: addNic.networkId.trim(),
-        model: addNic.model || undefined,
-      });
+      await attachNic(addNic.vm, addNic);
       toast.success("Network adapter attached", addNic.vm.name);
       invalidate(addNic.vm);
       setAddNic(null);
@@ -303,10 +348,28 @@ export function useVMActions() {
 
   const dialogs = (
     <>
+      {/* Reconfigure — the rich "Edit Settings" hardware editor */}
+      <ReconfigureDrawer
+        form={recfg}
+        busy={recfgBusy}
+        memoryMb={recfg ? recfgMemoryMb(recfg) : 0}
+        onChange={setRecfg}
+        onClose={() => setRecfg(null)}
+        onApply={confirmReconfigure}
+        attachDisk={attachDisk}
+        attachNic={attachNic}
+        detachDisk={detachDisk}
+        detachNic={detachNic}
+        detachBusyId={detachBusyId}
+        invalidate={invalidate}
+      />
+
       {/* Snapshot */}
-      <Modal
+      <Drawer
         open={snap !== null}
         title="Create snapshot"
+        subtitle={snap ? snap.vm.name : undefined}
+        icon={<IconSnapshot size={18} />}
         busy={snapBusy}
         onClose={() => setSnap(null)}
         footer={
@@ -326,19 +389,18 @@ export function useVMActions() {
         }
       >
         {snap ? (
-          <div className="col" style={{ gap: "var(--sp-3)" }}>
-            <div className="text-sm secondary">
-              Snapshot <strong className="mono">{snap.vm.name}</strong>.
-            </div>
+          <div className="drawer-section">
             <TextField
               label="Name"
               value={snap.name}
               autoFocus
+              placeholder="e.g. before-upgrade"
               onChange={(e) => setSnap({ ...snap, name: e.target.value })}
             />
             <TextField
               label="Description"
               value={snap.description}
+              placeholder="Optional"
               onChange={(e) => setSnap({ ...snap, description: e.target.value })}
             />
             <label className="checkbox-row">
@@ -359,12 +421,14 @@ export function useVMActions() {
             </label>
           </div>
         ) : null}
-      </Modal>
+      </Drawer>
 
       {/* Clone */}
-      <Modal
+      <Drawer
         open={clone !== null}
         title="Clone virtual machine"
+        subtitle={clone ? clone.vm.name : undefined}
+        icon={<IconClone size={18} />}
         busy={cloneBusy}
         onClose={() => setClone(null)}
         footer={
@@ -384,10 +448,7 @@ export function useVMActions() {
         }
       >
         {clone ? (
-          <div className="col" style={{ gap: "var(--sp-3)" }}>
-            <div className="text-sm secondary">
-              Clone <strong className="mono">{clone.vm.name}</strong>.
-            </div>
+          <div className="drawer-section">
             <TextField
               label="New name"
               value={clone.name}
@@ -412,53 +473,14 @@ export function useVMActions() {
             </label>
           </div>
         ) : null}
-      </Modal>
-
-      {/* Reconfigure */}
-      <Modal
-        open={recfg !== null}
-        title="Reconfigure hardware"
-        busy={recfgBusy}
-        onClose={() => setRecfg(null)}
-        footer={
-          <>
-            <button className="btn" onClick={() => setRecfg(null)} disabled={recfgBusy}>
-              Cancel
-            </button>
-            <ActionButton variant="primary" loading={recfgBusy} onClick={confirmReconfigure}>
-              Apply
-            </ActionButton>
-          </>
-        }
-      >
-        {recfg ? (
-          <div className="col" style={{ gap: "var(--sp-3)" }}>
-            <div className="text-sm secondary">
-              Reconfigure <strong className="mono">{recfg.vm.name}</strong>. Some hypervisors require a
-              powered-off VM for CPU/memory changes.
-            </div>
-            <TextField
-              label="vCPUs"
-              type="number"
-              min={1}
-              value={recfg.vcpus}
-              onChange={(e) => setRecfg({ ...recfg, vcpus: e.target.value })}
-            />
-            <TextField
-              label="Memory (MB)"
-              type="number"
-              min={1}
-              value={recfg.memoryMb}
-              onChange={(e) => setRecfg({ ...recfg, memoryMb: e.target.value })}
-            />
-          </div>
-        ) : null}
-      </Modal>
+      </Drawer>
 
       {/* Migrate (intra-hypervisor) */}
-      <Modal
+      <Drawer
         open={migrate !== null}
         title="Migrate (intra-hypervisor)"
+        subtitle={migrate ? migrate.vm.name : undefined}
+        icon={<IconMigrate size={18} />}
         busy={migrateBusy}
         onClose={() => setMigrate(null)}
         footer={
@@ -478,10 +500,13 @@ export function useVMActions() {
         }
       >
         {migrate ? (
-          <div className="col" style={{ gap: "var(--sp-3)" }}>
-            <div className="text-sm secondary">
-              Move <strong className="mono">{migrate.vm.name}</strong> to another host on the same
-              hypervisor. For cross-hypervisor moves use the Migration (V2V) wizard.
+          <div className="drawer-section">
+            <div className="drawer-banner info">
+              <IconHelp size={15} />
+              <span>
+                Move this VM to another host on the <strong>same</strong> hypervisor. For
+                cross-hypervisor moves use the Migration (V2V) wizard.
+              </span>
             </div>
             <TextField
               label="Target host id"
@@ -490,7 +515,8 @@ export function useVMActions() {
               onChange={(e) => setMigrate({ ...migrate, targetHost: e.target.value })}
             />
             <TextField
-              label="Target storage id (optional)"
+              label="Target storage id"
+              hint="Optional — leave blank to keep current storage"
               value={migrate.targetStorage}
               onChange={(e) => setMigrate({ ...migrate, targetStorage: e.target.value })}
             />
@@ -504,12 +530,14 @@ export function useVMActions() {
             </label>
           </div>
         ) : null}
-      </Modal>
+      </Drawer>
 
       {/* Add disk (hot-plug) */}
-      <Modal
+      <Drawer
         open={addDisk !== null}
-        title="Add disk (live)"
+        title="Add disk"
+        subtitle={addDisk ? `${addDisk.vm.name} · live, no reboot` : undefined}
+        icon={<IconDisk size={18} />}
         busy={addDiskBusy}
         onClose={() => setAddDisk(null)}
         footer={
@@ -518,48 +546,53 @@ export function useVMActions() {
               Cancel
             </button>
             <ActionButton variant="primary" loading={addDiskBusy} onClick={confirmAddDisk}>
+              <IconPlus size={14} />
               Attach disk
             </ActionButton>
           </>
         }
       >
         {addDisk ? (
-          <div className="col" style={{ gap: "var(--sp-3)" }}>
-            <div className="text-sm secondary">
-              Hot-attach a new disk to <strong className="mono">{addDisk.vm.name}</strong> with no
-              reboot. Leave storage blank to provision in the default pool.
+          <div className="drawer-section">
+            <div className="drawer-banner info">
+              <IconHelp size={15} />
+              <span>Hot-attach a new virtual disk with no reboot. Leave the pool on default to provision in the provider's default datastore.</span>
             </div>
-            <TextField
-              label="Capacity (GB)"
-              type="number"
-              min={1}
-              value={addDisk.capacityGb}
-              autoFocus
-              onChange={(e) => setAddDisk({ ...addDisk, capacityGb: e.target.value })}
-            />
-            <SelectField
-              label="Format"
-              value={addDisk.format}
-              onChange={(e) => setAddDisk({ ...addDisk, format: e.target.value })}
-            >
-              <option value="qcow2">qcow2</option>
-              <option value="raw">raw</option>
-            </SelectField>
+            <div className="field-grid">
+              <TextField
+                label="Capacity (GB)"
+                type="number"
+                min={1}
+                value={addDisk.capacityGb}
+                autoFocus
+                onChange={(e) => setAddDisk({ ...addDisk, capacityGb: e.target.value })}
+              />
+              <SelectField
+                label="Format"
+                value={addDisk.format}
+                onChange={(e) => setAddDisk({ ...addDisk, format: e.target.value })}
+              >
+                <option value="qcow2">qcow2 (thin)</option>
+                <option value="raw">raw (thick)</option>
+              </SelectField>
+            </div>
             <StoragePoolSelect
               pid={addDisk.vm.providerId}
               value={addDisk.storageId}
               onChange={(v) => setAddDisk({ ...addDisk, storageId: v })}
-              label="Storage pool (optional)"
+              label="Storage pool"
               allowEmpty
             />
           </div>
         ) : null}
-      </Modal>
+      </Drawer>
 
       {/* Add network adapter (hot-plug) */}
-      <Modal
+      <Drawer
         open={addNic !== null}
-        title="Add network adapter (live)"
+        title="Add network adapter"
+        subtitle={addNic ? `${addNic.vm.name} · live, no reboot` : undefined}
+        icon={<IconNic size={18} />}
         busy={addNicBusy}
         onClose={() => setAddNic(null)}
         footer={
@@ -573,39 +606,38 @@ export function useVMActions() {
               disabled={!addNic?.networkId.trim()}
               onClick={confirmAddNic}
             >
+              <IconPlus size={14} />
               Attach adapter
             </ActionButton>
           </>
         }
       >
         {addNic ? (
-          <div className="col" style={{ gap: "var(--sp-3)" }}>
-            <div className="text-sm secondary">
-              Hot-attach a virtual NIC to <strong className="mono">{addNic.vm.name}</strong> with no
-              reboot.
-            </div>
+          <div className="drawer-section">
             <NetworkSelect
               pid={addNic.vm.providerId}
               value={addNic.networkId}
               onChange={(v) => setAddNic({ ...addNic, networkId: v })}
             />
             <SelectField
-              label="Model"
+              label="Adapter model"
               value={addNic.model}
               onChange={(e) => setAddNic({ ...addNic, model: e.target.value })}
             >
-              <option value="virtio">virtio</option>
+              <option value="virtio">virtio (paravirtual, fastest)</option>
               <option value="e1000">e1000</option>
               <option value="rtl8139">rtl8139</option>
             </SelectField>
           </div>
         ) : null}
-      </Modal>
+      </Drawer>
 
       {/* Mount ISO (hot-plug) */}
-      <Modal
+      <Drawer
         open={mountIso !== null}
-        title="Mount ISO (live)"
+        title="Mount ISO"
+        subtitle={mountIso ? `${mountIso.vm.name} · CD/DVD drive` : undefined}
+        icon={<IconDisc size={18} />}
         busy={mountIsoBusy}
         onClose={() => setMountIso(null)}
         footer={
@@ -619,16 +651,17 @@ export function useVMActions() {
               disabled={!mountIso?.isoPath.trim()}
               onClick={confirmMountIso}
             >
+              <IconDisc size={14} />
               Mount ISO
             </ActionButton>
           </>
         }
       >
         {mountIso ? (
-          <div className="col" style={{ gap: "var(--sp-3)" }}>
-            <div className="text-sm secondary">
-              Insert an ISO into <strong className="mono">{mountIso.vm.name}</strong>'s CD-ROM with no
-              reboot. Pick a pool, then an ISO from its library.
+          <div className="drawer-section">
+            <div className="drawer-banner info">
+              <IconHelp size={15} />
+              <span>Insert an ISO into the virtual CD/DVD drive with no reboot. Pick a pool, then an image from its library.</span>
             </div>
             <StoragePoolSelect
               pid={mountIso.vm.providerId}
@@ -644,7 +677,7 @@ export function useVMActions() {
             />
           </div>
         ) : null}
-      </Modal>
+      </Drawer>
 
       {/* Delete */}
       <ConfirmDestructiveDialog
@@ -685,7 +718,419 @@ export function useVMActions() {
   };
 }
 
-/* ---- inline selectors for the hot-plug dialogs ---- */
+/* ===================== Rich Reconfigure ("Edit Settings") ===================== */
+
+function ReconfigureDrawer({
+  form,
+  busy,
+  memoryMb,
+  onChange,
+  onClose,
+  onApply,
+  attachDisk,
+  attachNic,
+  detachDisk,
+  detachNic,
+  detachBusyId,
+  invalidate,
+}: {
+  form: ReconfigureForm | null;
+  busy: boolean;
+  memoryMb: number;
+  onChange: (f: ReconfigureForm) => void;
+  onClose: () => void;
+  onApply: () => void;
+  attachDisk: (vm: VM, f: { capacityGb: string; format: string; storageId: string }) => Promise<void>;
+  attachNic: (vm: VM, f: { networkId: string; model: string }) => Promise<void>;
+  detachDisk: (vm: VM, diskId: string) => void;
+  detachNic: (vm: VM, nicId: string) => void;
+  detachBusyId: string | null;
+  invalidate: (vm: VM) => void;
+}) {
+  if (!form) return <Drawer open={false} title="" onClose={onClose}>{null}</Drawer>;
+  return (
+    <ReconfigureBody
+      form={form}
+      busy={busy}
+      memoryMb={memoryMb}
+      onChange={onChange}
+      onClose={onClose}
+      onApply={onApply}
+      attachDisk={attachDisk}
+      attachNic={attachNic}
+      detachDisk={detachDisk}
+      detachNic={detachNic}
+      detachBusyId={detachBusyId}
+      invalidate={invalidate}
+    />
+  );
+}
+
+function ReconfigureBody({
+  form,
+  busy,
+  memoryMb,
+  onChange,
+  onClose,
+  onApply,
+  attachDisk,
+  attachNic,
+  detachDisk,
+  detachNic,
+  detachBusyId,
+  invalidate,
+}: {
+  form: ReconfigureForm;
+  busy: boolean;
+  memoryMb: number;
+  onChange: (f: ReconfigureForm) => void;
+  onClose: () => void;
+  onApply: () => void;
+  attachDisk: (vm: VM, f: { capacityGb: string; format: string; storageId: string }) => Promise<void>;
+  attachNic: (vm: VM, f: { networkId: string; model: string }) => Promise<void>;
+  detachDisk: (vm: VM, diskId: string) => void;
+  detachNic: (vm: VM, nicId: string) => void;
+  detachBusyId: string | null;
+  invalidate: (vm: VM) => void;
+}) {
+  const vm = form.vm;
+  const running = vm.state === "running";
+  const disks = vm.disks ?? [];
+  const nics = vm.nics ?? [];
+
+  // local "add device" sub-forms (collapsed until the user clicks Add)
+  const [newDisk, setNewDisk] = useState<{ capacityGb: string; format: string; storageId: string } | null>(null);
+  const [diskBusy, setDiskBusy] = useState(false);
+  const [newNic, setNewNic] = useState<{ networkId: string; model: string } | null>(null);
+  const [nicBusy, setNicBusy] = useState(false);
+
+  const cpuChanged = Number(form.vcpus) !== vm.vcpus && Number(form.vcpus) > 0;
+  const memChanged = memoryMb > 0 && memoryMb !== vm.memoryMb;
+  const compute = cpuChanged || memChanged;
+
+  const submitDisk = async () => {
+    if (!newDisk) return;
+    setDiskBusy(true);
+    try {
+      await attachDisk(vm, newDisk);
+      toast.success("Disk attached", vm.name);
+      invalidate(vm);
+      setNewDisk(null);
+    } catch (err) {
+      toastError("Attach disk failed", err);
+    } finally {
+      setDiskBusy(false);
+    }
+  };
+  const submitNic = async () => {
+    if (!newNic || !newNic.networkId.trim()) return;
+    setNicBusy(true);
+    try {
+      await attachNic(vm, newNic);
+      toast.success("Network adapter attached", vm.name);
+      invalidate(vm);
+      setNewNic(null);
+    } catch (err) {
+      toastError("Attach NIC failed", err);
+    } finally {
+      setNicBusy(false);
+    }
+  };
+
+  return (
+    <Drawer
+      open
+      size="lg"
+      icon={<IconEdit size={18} />}
+      title="Edit settings"
+      subtitle={
+        <span>
+          {vm.name} · {vm.kind}
+          {vm.firmware ? ` · ${vm.firmware}` : ""}
+        </span>
+      }
+      busy={busy}
+      onClose={onClose}
+      footer={
+        <>
+          <button className="btn" onClick={onClose} disabled={busy}>
+            Close
+          </button>
+          <ActionButton
+            variant="primary"
+            loading={busy}
+            disabled={!compute}
+            tooltip={compute ? undefined : "Change vCPU or memory to apply"}
+            onClick={onApply}
+          >
+            <IconCheck size={14} />
+            Apply CPU / memory
+          </ActionButton>
+        </>
+      }
+    >
+      {running ? (
+        <div className="drawer-banner warn" style={{ marginBottom: "var(--sp-4)" }}>
+          <IconAlert size={15} />
+          <span>
+            This VM is <strong>running</strong>. Many hypervisors require a power-off before changing
+            vCPU or memory. Disk and adapter add/remove apply live (hot-plug).
+          </span>
+        </div>
+      ) : null}
+
+      {/* Compute */}
+      <div className="drawer-section">
+        <div className="drawer-section-head">
+          <span className="drawer-section-title">
+            <IconCpu size={15} /> Compute
+          </span>
+        </div>
+        <div className="field-grid">
+          <TextField
+            label="vCPUs"
+            type="number"
+            min={1}
+            value={form.vcpus}
+            onChange={(e) => onChange({ ...form, vcpus: e.target.value })}
+            hint={`Current: ${vm.vcpus}`}
+          />
+          <div className="field">
+            <label className="field-label">Memory</label>
+            <div className="row" style={{ gap: "var(--sp-2)" }}>
+              <input
+                className="input"
+                type="number"
+                min={1}
+                value={form.memValue}
+                style={{ flex: 1 }}
+                onChange={(e) => onChange({ ...form, memValue: e.target.value })}
+              />
+              <select
+                className="select"
+                value={form.memUnit}
+                style={{ width: 80 }}
+                onChange={(e) => onChange({ ...form, memUnit: e.target.value as "MB" | "GB" })}
+              >
+                <option value="MB">MB</option>
+                <option value="GB">GB</option>
+              </select>
+            </div>
+            <span className="field-hint">Current: {formatBytes(vm.memoryMb * 1024 * 1024, 0)}</span>
+          </div>
+        </div>
+
+        {/* current vs new summary */}
+        <dl className="spec-summary">
+          <dt>vCPUs</dt>
+          <dd>
+            {vm.vcpus}
+            {cpuChanged ? <span className="delta"> → {Number(form.vcpus)}</span> : null}
+          </dd>
+          <dt>Memory</dt>
+          <dd>
+            {formatBytes(vm.memoryMb * 1024 * 1024, 0)}
+            {memChanged ? <span className="delta"> → {formatBytes(memoryMb * 1024 * 1024, 0)}</span> : null}
+          </dd>
+        </dl>
+      </div>
+
+      {/* Disks */}
+      <div className="drawer-section">
+        <div className="drawer-section-head">
+          <span className="drawer-section-title">
+            <IconDisk size={15} /> Hard disks ({disks.length})
+          </span>
+          {newDisk === null ? (
+            <ActionButton
+              size="sm"
+              variant="ghost"
+              onClick={() => setNewDisk({ capacityGb: "10", format: "qcow2", storageId: "" })}
+            >
+              <IconPlus size={13} /> Add disk
+            </ActionButton>
+          ) : null}
+        </div>
+
+        {disks.length === 0 && newDisk === null ? (
+          <span className="muted text-sm">No disks attached.</span>
+        ) : null}
+
+        {disks.map((d: VMDisk) => (
+          <div key={d.id} className="device-row">
+            <span className="device-icon">
+              <IconDisk size={16} />
+            </span>
+            <div className="device-main">
+              <span className="device-title">{d.label || d.id}</span>
+              <span className="device-meta">
+                <span>{formatBytes(d.capacityGb * 1024 ** 3, 0)}</span>
+                {d.format ? <span className="chip">{d.format}</span> : null}
+                {d.storageId ? <span className="mono">{d.storageId}</span> : null}
+              </span>
+            </div>
+            <ActionButton
+              size="sm"
+              variant="ghost"
+              iconOnly
+              tooltip="Detach disk (live)"
+              aria-label="Detach disk"
+              loading={detachBusyId === d.id}
+              onClick={() => detachDisk(vm, d.id)}
+              style={{ color: "var(--danger)" }}
+            >
+              <IconTrash size={14} />
+            </ActionButton>
+          </div>
+        ))}
+
+        {newDisk ? (
+          <div className="device-add">
+            <div className="field-grid">
+              <TextField
+                label="Capacity (GB)"
+                type="number"
+                min={1}
+                autoFocus
+                value={newDisk.capacityGb}
+                onChange={(e) => setNewDisk({ ...newDisk, capacityGb: e.target.value })}
+              />
+              <SelectField
+                label="Format"
+                value={newDisk.format}
+                onChange={(e) => setNewDisk({ ...newDisk, format: e.target.value })}
+              >
+                <option value="qcow2">qcow2 (thin)</option>
+                <option value="raw">raw (thick)</option>
+              </SelectField>
+            </div>
+            <StoragePoolSelect
+              pid={vm.providerId}
+              value={newDisk.storageId}
+              onChange={(v) => setNewDisk({ ...newDisk, storageId: v })}
+              label="Storage pool"
+              allowEmpty
+            />
+            <div className="row" style={{ justifyContent: "flex-end", gap: "var(--sp-2)" }}>
+              <button className="btn btn-sm" onClick={() => setNewDisk(null)} disabled={diskBusy}>
+                Cancel
+              </button>
+              <ActionButton size="sm" variant="primary" loading={diskBusy} onClick={submitDisk}>
+                Attach disk
+              </ActionButton>
+            </div>
+          </div>
+        ) : null}
+      </div>
+
+      {/* Network adapters */}
+      <div className="drawer-section">
+        <div className="drawer-section-head">
+          <span className="drawer-section-title">
+            <IconNic size={15} /> Network adapters ({nics.length})
+          </span>
+          {newNic === null ? (
+            <ActionButton
+              size="sm"
+              variant="ghost"
+              onClick={() => setNewNic({ networkId: "", model: "virtio" })}
+            >
+              <IconPlus size={13} /> Add adapter
+            </ActionButton>
+          ) : null}
+        </div>
+
+        {nics.length === 0 && newNic === null ? (
+          <span className="muted text-sm">No network adapters attached.</span>
+        ) : null}
+
+        {nics.map((n: VMNic) => (
+          <div key={n.id} className="device-row">
+            <span className="device-icon">
+              <IconNic size={16} />
+            </span>
+            <div className="device-main">
+              <span className="device-title">{n.networkId || n.id}</span>
+              <span className="device-meta">
+                {n.model ? <span className="chip">{n.model}</span> : null}
+                {n.mac ? <span className="mono">{n.mac}</span> : null}
+                <span>{n.connected ? "connected" : "disconnected"}</span>
+              </span>
+            </div>
+            <ActionButton
+              size="sm"
+              variant="ghost"
+              iconOnly
+              tooltip="Detach adapter (live)"
+              aria-label="Detach adapter"
+              loading={detachBusyId === n.id}
+              onClick={() => detachNic(vm, n.id)}
+              style={{ color: "var(--danger)" }}
+            >
+              <IconTrash size={14} />
+            </ActionButton>
+          </div>
+        ))}
+
+        {newNic ? (
+          <div className="device-add">
+            <NetworkSelect
+              pid={vm.providerId}
+              value={newNic.networkId}
+              onChange={(v) => setNewNic({ ...newNic, networkId: v })}
+            />
+            <SelectField
+              label="Adapter model"
+              value={newNic.model}
+              onChange={(e) => setNewNic({ ...newNic, model: e.target.value })}
+            >
+              <option value="virtio">virtio (paravirtual, fastest)</option>
+              <option value="e1000">e1000</option>
+              <option value="rtl8139">rtl8139</option>
+            </SelectField>
+            <div className="row" style={{ justifyContent: "flex-end", gap: "var(--sp-2)" }}>
+              <button className="btn btn-sm" onClick={() => setNewNic(null)} disabled={nicBusy}>
+                Cancel
+              </button>
+              <ActionButton
+                size="sm"
+                variant="primary"
+                loading={nicBusy}
+                disabled={!newNic.networkId.trim()}
+                onClick={submitNic}
+              >
+                Attach adapter
+              </ActionButton>
+            </div>
+          </div>
+        ) : null}
+      </div>
+
+      {/* Firmware & boot (display) */}
+      <div className="drawer-section">
+        <div className="drawer-section-head">
+          <span className="drawer-section-title">
+            <IconMemory size={15} /> Boot & firmware
+          </span>
+        </div>
+        <dl className="spec-summary">
+          <dt>Firmware</dt>
+          <dd>{vm.firmware || "—"}</dd>
+          <dt>Guest OS</dt>
+          <dd>{vm.guestOs || "—"}</dd>
+          <dt>Boot order</dt>
+          <dd>{disks.length ? "Disk → Network → CD/DVD" : "Network → CD/DVD"}</dd>
+        </dl>
+        <div className="drawer-banner info">
+          <IconHelp size={15} />
+          <span>Firmware and boot order are reported by the hypervisor. Changing them requires a power-off and is managed in the create wizard / native console.</span>
+        </div>
+      </div>
+    </Drawer>
+  );
+}
+
+/* ---- inline selectors shared across drawers ---- */
 
 function StoragePoolSelect({
   pid,
