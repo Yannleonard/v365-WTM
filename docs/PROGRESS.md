@@ -8,8 +8,8 @@
 | Phase | Title | Status | Gate |
 |---|---|---|---|
 | 0 | Bootstrap (Castor socle imported, builds green in Docker) | ✅ | baseline image builds + boots healthy + Go tests |
-| 1 | Foundations: HypervisorProvider contract + conformance + simulators + unified inventory schema | 🟡 | conformance suite runs against a fake provider |
-| 2 | VM providers (KVM, Hyper-V, ESXi, Xen) | ⬜ | 100% conformance × 4 |
+| 1 | Foundations: HypervisorProvider contract + conformance + simulators + unified inventory schema | ✅ | conformance suite runs green against sim (full + read-only) |
+| 2 | VM providers (KVM, Hyper-V, ESXi, Xen) | ✅ | 100% conformance × 4, CGO-free, go.mod clean |
 | 2b | Container providers wired into unified inventory (reuse Castor) | ⬜ | container conformance green |
 | 3 | Platform: unified inventory + aggregated API + monitoring + multi-tenant RBAC | ⬜ | API tested, tenant isolation, unified metrics |
 | 4 | V2V migration engine (cross-hypervisor) | ⬜ | 2 directions validated on test disks |

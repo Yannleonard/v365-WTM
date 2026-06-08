@@ -14,8 +14,10 @@ import (
 	"github.com/gtek-it/castor/server/internal/authz"
 	"github.com/gtek-it/castor/server/internal/cache"
 	"github.com/gtek-it/castor/server/internal/config"
+	"github.com/gtek-it/castor/server/internal/inventory"
 	"github.com/gtek-it/castor/server/internal/provider"
 	"github.com/gtek-it/castor/server/internal/store"
+	"github.com/gtek-it/castor/server/internal/vprovider"
 )
 
 // Server bundles the dependencies shared by all handlers.
@@ -26,18 +28,54 @@ type Server struct {
 	guard   *authz.Guard
 	manager *cache.Manager
 	reg     *provider.Registry
+
+	// UniHV VM domain: the hypervisor provider registry and the unified
+	// (VM + container) inventory aggregator. vreg may be empty (no hypervisors
+	// configured); agg is always set (it tolerates nil domains).
+	vreg *vprovider.Registry
+	agg  *inventory.Aggregator
 }
 
-// NewServer constructs the API server.
-func NewServer(cfg *config.Config, st *store.Store, az *authz.Deps, guard *authz.Guard, mgr *cache.Manager, reg *provider.Registry) *Server {
-	return &Server{
+// NewServer constructs the API server. vreg is the hypervisor registry (may be an
+// empty registry); it is wired into the unified inventory aggregator alongside the
+// container cache.
+func NewServer(cfg *config.Config, st *store.Store, az *authz.Deps, guard *authz.Guard, mgr *cache.Manager, reg *provider.Registry, vreg *vprovider.Registry) *Server {
+	if vreg == nil {
+		vreg = vprovider.NewRegistry()
+	}
+	s := &Server{
 		cfg:     cfg,
 		store:   st,
 		authz:   az,
 		guard:   guard,
 		manager: mgr,
 		reg:     reg,
+		vreg:    vreg,
 	}
+	s.agg = inventory.New(vreg, containerSnapshotAdapter{mgr: mgr})
+	return s
+}
+
+// containerSnapshotAdapter adapts the container cache.Manager to the inventory
+// package's ContainerSnapshots interface, keeping inventory decoupled from cache
+// internals. In V1 the container cache models a single "local" host.
+type containerSnapshotAdapter struct{ mgr *cache.Manager }
+
+func (a containerSnapshotAdapter) ContainerHostSnapshots() []inventory.ContainerHostSnapshot {
+	if a.mgr == nil {
+		return nil
+	}
+	snap, ok := a.mgr.Store().Get("local")
+	if !ok {
+		return nil
+	}
+	return []inventory.ContainerHostSnapshot{{
+		HostID:    "local",
+		Workloads: snap.Workloads,
+		Swarm:     snap.Swarm,
+		Kube:      snap.Kube,
+		Degraded:  snap.Degraded,
+	}}
 }
 
 // maxBodyBytes caps request bodies to a sane size (anti-DoS).

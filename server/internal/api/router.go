@@ -87,6 +87,7 @@ func (s *Server) Router() http.Handler {
 			s.mountTemplateRoutes(pr)
 			s.mountMarketplaceConfigRoutes(pr)
 			s.mountStackRoutes(pr)
+			s.mountVMRoutes(pr)
 		})
 	})
 

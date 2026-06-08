@@ -1,0 +1,10 @@
+# Normalize line endings: keep LF in the repo, let Git handle working-tree CRLF on
+# Windows silently. Prevents the noisy "LF will be replaced by CRLF" warnings.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary

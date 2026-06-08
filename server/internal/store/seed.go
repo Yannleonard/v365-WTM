@@ -40,6 +40,13 @@ var AllReadPermissions = []string{
 	"k8s.storage.read",
 	"helm.repo.read",
 	"helm.release.read",
+	// UniHV VM domain (read).
+	"vm.read",
+	"vm.metrics.read",
+	"vm.cluster.read",
+	"vm.storage.read",
+	"vm.network.read",
+	"inventory.read",
 	"audit.read",
 	"settings.read",
 }
@@ -102,6 +109,16 @@ var operatorExtraPermissions = []string{
 	"helm.release.install",
 	"helm.release.upgrade",
 	"helm.release.rollback",
+	// UniHV VM domain day-to-day ops: power, snapshots, reconfigure, clone, intra-
+	// hypervisor migrate. Destructive/cross-host actions stay admin-only:
+	// vm.delete (destroys a VM), vm.create (provisioning), vm.export and vm.migrate
+	// are operator-grade ops here EXCEPT vm.delete + vm.create which are admin-only.
+	"vm.power",        // start/stop/reset/suspend/resume
+	"vm.snapshot",     // snapshot + revert
+	"vm.reconfigure",  // cpu/mem/device changes
+	"vm.clone",        // clone an existing VM
+	"vm.migrate",      // intra-hypervisor live/cold migrate
+	"vm.export",       // export disks (for V2V); non-destructive read of disk
 }
 
 // Seed inserts the built-in roles, the local host row, and default settings.

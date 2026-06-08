@@ -30,6 +30,8 @@ import (
 	"github.com/gtek-it/castor/server/internal/provider/swarm"
 	"github.com/gtek-it/castor/server/internal/store"
 	"github.com/gtek-it/castor/server/internal/version"
+	"github.com/gtek-it/castor/server/internal/vprovider"
+	"github.com/gtek-it/castor/server/internal/vprovider/sim"
 )
 
 func main() {
@@ -176,6 +178,20 @@ func run() error {
 	mgr := cache.NewManager(cfg, dockerP, swarmP, kubeP)
 	mgr.Start(rootCtx)
 
+	// 4b. UniHV hypervisor (VM) registry. Real hypervisors are registered here from
+	// configured connections (KVM/libvirt, Hyper-V, Xen/XAPI, ESXi/vSphere) — each
+	// is a vprovider.HypervisorProvider behind the same seam. When UNIHV_DEMO_HYPERVISOR
+	// is set, a zero-hardware in-memory sim provider per hypervisor kind is registered
+	// so the unified inventory + VM console are populated out of the box for evaluation.
+	vreg := vprovider.NewRegistry()
+	if cfg.DemoHypervisor {
+		vreg.Register(sim.New("demo-kvm", sim.WithKind(vprovider.KindKVM)))
+		vreg.Register(sim.New("demo-esxi", sim.WithKind(vprovider.KindVMware)))
+		vreg.Register(sim.New("demo-hyperv", sim.WithKind(vprovider.KindHyperV)))
+		vreg.Register(sim.New("demo-xen", sim.WithKind(vprovider.KindXen)))
+		log.Printf("castor: UniHV demo hypervisors registered (4 sim providers; set UNIHV_DEMO_HYPERVISOR=false to disable)")
+	}
+
 	// 5. Authz dependencies + destructive-action guard.
 	azDeps := &authz.Deps{
 		Store:              st,
@@ -189,7 +205,7 @@ func run() error {
 	guard := authz.NewGuard(st, selfID, selfResolved)
 
 	// 6. API server + router (REST + WS + embedded UI).
-	apiServer := api.NewServer(cfg, st, azDeps, guard, mgr, reg)
+	apiServer := api.NewServer(cfg, st, azDeps, guard, mgr, reg, vreg)
 	handler := apiServer.Router()
 
 	// 7. HTTP server with sane timeouts.

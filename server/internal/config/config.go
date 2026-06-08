@@ -57,6 +57,12 @@ type Config struct {
 	// EnableSwarm, when true, registers the read-only Swarm provider.
 	EnableSwarm bool
 
+	// DemoHypervisor, when true (UNIHV_DEMO_HYPERVISOR, default true), registers
+	// in-memory simulator hypervisor providers (KVM/ESXi/Hyper-V/Xen) so the unified
+	// VM+container inventory and the VM console are populated without real hypervisor
+	// access. Set false in production and register real hypervisor connections.
+	DemoHypervisor bool
+
 	// --- ADR-001 intervals (env-overridable) ---
 
 	DockerSnapshotInterval time.Duration // default 10s
@@ -119,6 +125,7 @@ func Load() *Config {
 		SelfContainerID:        os.Getenv("CASTOR_SELF_CONTAINER_ID"),
 		AllowedOrigins:         envList("CASTOR_ALLOWED_ORIGINS"),
 		EnableSwarm:            envBool("CASTOR_ENABLE_SWARM", true),
+		DemoHypervisor:         envBool("UNIHV_DEMO_HYPERVISOR", true),
 		DockerSnapshotInterval: envDur("CASTOR_DOCKER_SNAPSHOT_INTERVAL", 10*time.Second),
 		SwarmSnapshotInterval:  envDur("CASTOR_SWARM_SNAPSHOT_INTERVAL", 15*time.Second),
 		K8sSnapshotInterval:    envDur("CASTOR_K8S_SNAPSHOT_INTERVAL", 15*time.Second),

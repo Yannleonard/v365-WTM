@@ -90,6 +90,25 @@ var permissionCatalog = []string{
 	"rbac.role.delete",
 	"rbac.binding.create",
 	"rbac.binding.delete",
+	// UniHV VM / hypervisor domain. Reads: vm.read (VMs), vm.cluster/storage/
+	// network.read, vm.metrics.read, inventory.read (unified VM+container view).
+	// Writes: vm.power (start/stop/reset/suspend), vm.snapshot (snap+revert),
+	// vm.reconfigure, vm.clone, vm.migrate (intra-hypervisor), vm.export (V2V disk
+	// export), vm.create + vm.delete (provisioning/destruction, admin-grade).
+	"vm.read",
+	"vm.cluster.read",
+	"vm.storage.read",
+	"vm.network.read",
+	"vm.metrics.read",
+	"inventory.read",
+	"vm.power",
+	"vm.snapshot",
+	"vm.reconfigure",
+	"vm.clone",
+	"vm.migrate",
+	"vm.export",
+	"vm.create",
+	"vm.delete",
 	// audit & settings
 	"audit.read",
 	"settings.read",

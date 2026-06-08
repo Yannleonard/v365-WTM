@@ -14,6 +14,8 @@ import (
 	"github.com/gtek-it/castor/server/internal/cache"
 	"github.com/gtek-it/castor/server/internal/config"
 	"github.com/gtek-it/castor/server/internal/provider"
+	"github.com/gtek-it/castor/server/internal/vprovider"
+	"github.com/gtek-it/castor/server/internal/vprovider/sim"
 	"github.com/gtek-it/castor/server/internal/store"
 )
 
@@ -56,7 +58,9 @@ func newTestEnv(t *testing.T) *testEnv {
 	// live poller (Docker is still never touched in these tests).
 	mgr.Store().SeedSnapshotForTest(cache.HostID)
 
-	srv := NewServer(cfg, st, az, guard, mgr, reg)
+	vreg := vprovider.NewRegistry()
+	vreg.Register(sim.New("test-kvm"))
+	srv := NewServer(cfg, st, az, guard, mgr, reg, vreg)
 	return &testEnv{srv: srv, mux: srv.Router(), st: st}
 }
 
