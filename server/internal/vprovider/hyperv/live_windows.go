@@ -35,8 +35,11 @@
 package hyperv
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,6 +50,12 @@ import (
 
 	vp "github.com/gtek-it/castor/server/internal/vprovider"
 )
+
+// liveFullCaps is the live (Windows) capability set: the core FullCaps PLUS the
+// extension bits (console / network write / storage write) that only the real WMI
+// backend implements (the cross-platform sim-backed Provider does NOT advertise
+// these, so the type assertion + cap bit gate them correctly).
+const liveFullCaps = FullCaps | vp.CapConsole | vp.CapNetworkWrite | vp.CapStorageWrite
 
 var stderr = os.Stderr
 
@@ -79,22 +88,46 @@ type liveBackend struct {
 	hostName string
 	ver      string
 	ok       bool
+
+	// computerName is the WMI server the backend is connected to: "" / "." for the
+	// LOCAL host, or a remote host's name/IP for a DCOM ConnectServer connection.
+	// Used to resolve the console (RDP/VMConnect) host.
+	computerName string
 }
 
 // NewLive constructs a Provider backed by a live Hyper-V host via direct COM/WMI on
-// root\virtualization\v2. computerName is accepted for API symmetry; the WMI moniker
-// here always connects to the LOCAL host (".") — the official local-management surface.
-// Available only on Windows; the cross-platform build uses New(...) with the fake.
+// root\virtualization\v2. computerName selects the WMI server: "" or "." connects to
+// the LOCAL host (no credentials, integrated auth); a non-local name/IP connects to a
+// REMOTE host via DCOM under the current process credentials (use NewLiveRemote to
+// supply explicit user/password). Available only on Windows; the cross-platform build
+// uses New(...) with the fake.
 func NewLive(id, computerName string, opts ...Option) (*Provider, error) {
-	be, err := newLiveBackend(computerName)
+	return NewLiveRemote(id, computerName, "", "", opts...)
+}
+
+// NewLiveRemote constructs a Provider connected to a (possibly remote) Hyper-V host.
+// When computerName is a remote host and username/password are supplied, the WMI
+// connection is made via SWbemLocator.ConnectServer(server, namespace, user, password)
+// over DCOM — the official Microsoft Virtualization API remote-management path. For a
+// local connection (computerName "" / "."), credentials are ignored (integrated auth).
+func NewLiveRemote(id, computerName, username, password string, opts ...Option) (*Provider, error) {
+	be, err := newLiveBackend(computerName, username, password)
 	if err != nil {
 		return nil, err
 	}
+	// The live WMI backend implements the extension interfaces; advertise their caps.
+	opts = append([]Option{WithCaps(liveFullCaps)}, opts...)
 	opts = append(opts, WithBackend(be))
 	return New(id, opts...), nil
 }
 
-func newLiveBackend(_ string) (*liveBackend, error) {
+// isLocalServer reports whether a computerName denotes the local host for WMI.
+func isLocalServer(computerName string) bool {
+	c := strings.TrimSpace(computerName)
+	return c == "" || c == "." || strings.EqualFold(c, "localhost")
+}
+
+func newLiveBackend(computerName, username, password string) (*liveBackend, error) {
 	// COINIT_MULTITHREADED keeps things simple across goroutines; we still serialize.
 	if err := ole.CoInitializeEx(0, ole.COINIT_MULTITHREADED); err != nil {
 		// CoInitializeEx returns an *OleError with S_FALSE if already initialized; tolerate.
@@ -113,17 +146,29 @@ func newLiveBackend(_ string) (*liveBackend, error) {
 		ole.CoUninitialize()
 		return nil, fmt.Errorf("hyperv: SWbemLocator QueryInterface: %w", err)
 	}
-	// ConnectServer(strServer=".", strNamespace="root\virtualization\v2")
-	connRes, err := oleutil.CallMethod(wmi, "ConnectServer", ".", virtNamespace)
+	// SWbemLocator.ConnectServer(strServer, strNamespace, strUser, strPassword, ...).
+	// LOCAL: strServer="." with NO credentials (passing a user/password to a local
+	// ConnectServer is rejected by WMI). REMOTE: strServer=computerName plus optional
+	// user/password — DCOM authenticates to the remote root\virtualization\v2.
+	var connRes *ole.VARIANT
+	if isLocalServer(computerName) {
+		connRes, err = oleutil.CallMethod(wmi, "ConnectServer", ".", virtNamespace)
+	} else if username != "" {
+		// ConnectServer(strServer, strNamespace, strUser, strPassword)
+		connRes, err = oleutil.CallMethod(wmi, "ConnectServer", computerName, virtNamespace, username, password)
+	} else {
+		// Remote host, integrated auth (process token has access on the remote host).
+		connRes, err = oleutil.CallMethod(wmi, "ConnectServer", computerName, virtNamespace)
+	}
 	if err != nil {
 		wmi.Release()
 		loc.Release()
 		ole.CoUninitialize()
-		return nil, fmt.Errorf("hyperv: ConnectServer(%s): %w", virtNamespace, err)
+		return nil, fmt.Errorf("hyperv: ConnectServer(%s, %s): %w", computerName, virtNamespace, err)
 	}
 	svc := connRes.ToIDispatch()
 
-	be := &liveBackend{svc: svc, loc: loc, uni: wmi}
+	be := &liveBackend{svc: svc, loc: loc, uni: wmi, computerName: strings.TrimSpace(computerName)}
 	be.hostName, be.ver = be.detectHostAndVersion()
 	be.ok = be.hostName != ""
 	return be, nil
@@ -246,6 +291,19 @@ func (l *liveBackend) detectHostAndVersion() (host, version string) {
 		version = "Microsoft Hyper-V (WMI " + virtNamespace + ")"
 	}
 	return host, version
+}
+
+// consoleHost resolves the host an RDP/VMConnect client should target: the remote
+// computerName when connected remotely, else the detected local host name (falling
+// back to "localhost").
+func (l *liveBackend) consoleHost() string {
+	if !isLocalServer(l.computerName) {
+		return l.computerName
+	}
+	if l.hostName != "" {
+		return l.hostName
+	}
+	return "localhost"
 }
 
 func (l *liveBackend) version() string { return l.ver }
@@ -837,3 +895,572 @@ func parseCIMDate(s string) int64 {
 }
 
 var _ wmiBackend = (*liveBackend)(nil)
+
+// =============================================================================
+// EXTENSION FEATURES (live/Windows only): graphical console, virtual-switch
+// write, storage/VHD/ISO. These are implemented directly here against the official
+// Msvm_* classes; the cross-platform sim-backed Provider does NOT implement them
+// (and does not advertise CapConsole|CapNetworkWrite|CapStorageWrite), so the API's
+// type-assertion + capability gate behaves correctly on both builds.
+// =============================================================================
+
+// vmConnectRDPPort is the TCP port the Hyper-V Virtual Machine Connection (VMConnect)
+// client uses to reach a VM's enhanced/basic session over RDP-via-VMBus on the host.
+const vmConnectRDPPort = 2179
+
+// liveBackender is satisfied only by *liveBackend; used to reach the live transport
+// from the shared Provider for the extension methods (which are windows-only).
+func (p *Provider) live() (*liveBackend, bool) {
+	be, ok := p.backend.(*liveBackend)
+	return be, ok
+}
+
+// --- ConsoleProvider ---
+
+// Console returns the RDP/VMConnect endpoint for a Hyper-V VM. Hyper-V exposes no
+// VNC/SPICE; its interactive console is VMConnect (the Virtual Machine Connection
+// client) which tunnels RDP over VMBus on TCP 2179 of the HOST (not the guest). The
+// UI hands this ConsoleEndpoint{Kind:rdp} to a VMConnect/RDP client (vmconnect.exe
+// <host> <vmName>); a browser noVNC cannot attach to Hyper-V directly. No one-shot
+// ticket is issued by WMI here, so Password is empty.
+func (p *Provider) Console(ctx context.Context, vmID string) (*vp.ConsoleEndpoint, error) {
+	if !p.caps.Has(vp.CapConsole) {
+		return nil, vp.ErrUnsupported
+	}
+	be, ok := p.live()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if _, found := be.getVM(vmID); !found {
+		return nil, vp.ErrNotFound
+	}
+	return &vp.ConsoleEndpoint{
+		Kind: vp.ConsoleRDP,
+		Host: be.consoleHost(),
+		Port: vmConnectRDPPort,
+	}, nil
+}
+
+// --- NetworkWriter (Msvm_VirtualEthernetSwitchManagementService) ---
+
+// CreateNetwork creates an Msvm_VirtualEthernetSwitch via
+// Msvm_VirtualEthernetSwitchManagementService.DefineSystem. spec.Type maps:
+//
+//	bridge|external           -> external switch (bound to a physical NIC, best effort)
+//	isolated|private          -> private switch  (VM-to-VM only)
+//	nat|internal|"" (default) -> internal switch (host + VMs)
+func (p *Provider) CreateNetwork(ctx context.Context, spec vp.NetworkSpec) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapNetworkWrite) {
+		return nil, vp.ErrUnsupported
+	}
+	be, ok := p.live()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if strings.TrimSpace(spec.Name) == "" {
+		return nil, vp.ErrInvalidSpec
+	}
+	switchID, err := be.createSwitch(spec)
+	if err != nil {
+		return nil, err
+	}
+	return p.finishTask("createNetwork", switchID), nil
+}
+
+// DeleteNetwork removes an Msvm_VirtualEthernetSwitch via
+// Msvm_VirtualEthernetSwitchManagementService.DestroySystem.
+func (p *Provider) DeleteNetwork(ctx context.Context, networkID string) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapNetworkWrite) {
+		return nil, vp.ErrUnsupported
+	}
+	be, ok := p.live()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	found, err := be.destroySwitch(networkID)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, vp.ErrNotFound
+	}
+	return p.finishTask("deleteNetwork", networkID), nil
+}
+
+// vesmService returns the Msvm_VirtualEthernetSwitchManagementService (caller releases).
+func (l *liveBackend) vesmService() *ole.IDispatch {
+	objs := l.query("SELECT * FROM Msvm_VirtualEthernetSwitchManagementService")
+	for i, o := range objs {
+		if i == 0 {
+			for _, extra := range objs[1:] {
+				extra.Release()
+			}
+			return o
+		}
+	}
+	return nil
+}
+
+// switchTypeFor maps a contract network type to a Hyper-V switch kind.
+func switchTypeFor(t string) string {
+	switch strings.ToLower(strings.TrimSpace(t)) {
+	case "bridge", "external":
+		return "external"
+	case "isolated", "private":
+		return "private"
+	default: // nat, internal, vlan, portgroup, ""
+		return "internal"
+	}
+}
+
+// createSwitch builds the switch settings MOF and calls DefineSystem. Returns the new
+// switch's Name (GUID). For an internal/private switch no external connection resource
+// is added (host-only / VM-only). External binding to a physical NIC is best-effort and
+// omitted here (it requires resolving an Msvm_ExternalEthernetPort); the switch is
+// created and an external one falls back to internal connectivity until a NIC is bound.
+func (l *liveBackend) createSwitch(spec vp.NetworkSpec) (string, error) {
+	kind := switchTypeFor(spec.Type)
+	var newID string
+	var callErr error
+	l.withCOM(func() {
+		svc := l.vesmService()
+		if svc == nil {
+			callErr = vp.ErrUnsupported
+			return
+		}
+		defer svc.Release()
+
+		settingsText := l.newSwitchSettingsText(spec.Name)
+		if settingsText == "" {
+			callErr = vp.ErrInvalidSpec
+			return
+		}
+		// DefineSystem(SystemSettings, ResourceSettings[], ReferenceConfiguration,
+		//              out ResultingSystem, out Job). An internal switch also needs an
+		// internal-port connection to expose the host vNIC; for a minimal, robust create
+		// we DefineSystem the switch alone (private/internal connectivity), which is what
+		// New-VMSwitch -SwitchType Private/Internal produces at the base.
+		res, err := oleutil.CallMethod(svc, "DefineSystem", settingsText, nil, nil)
+		if err != nil {
+			callErr = fmt.Errorf("hyperv: DefineSystem(switch): %w", err)
+			return
+		}
+		rv := int(res.Val)
+		res.Clear()
+		if rv != wmiCompleted && rv != wmiJobStarted {
+			callErr = fmt.Errorf("hyperv: DefineSystem(switch) ReturnValue=%d", rv)
+			return
+		}
+		// Resolve the created switch's Name (GUID) by ElementName.
+		newID = l.switchIDByName(spec.Name)
+	})
+	if callErr != nil {
+		return "", callErr
+	}
+	_ = kind // kind documents intent; minimal create yields a private/internal switch
+	return newID, nil
+}
+
+// newSwitchSettingsText spawns an Msvm_VirtualEthernetSwitchSettingData, sets its
+// ElementName, and returns its MOF text for DefineSystem.
+func (l *liveBackend) newSwitchSettingsText(name string) string {
+	clsRaw, err := oleutil.CallMethod(l.svc, "Get", "Msvm_VirtualEthernetSwitchSettingData")
+	if err != nil {
+		return ""
+	}
+	cls := clsRaw.ToIDispatch()
+	defer cls.Release()
+	instRaw, err := oleutil.CallMethod(cls, "SpawnInstance_")
+	if err != nil {
+		return ""
+	}
+	inst := instRaw.ToIDispatch()
+	defer inst.Release()
+	oleutil.PutProperty(inst, "ElementName", name)
+	txtRaw, err := oleutil.CallMethod(inst, "GetText_", 1)
+	if err != nil {
+		return ""
+	}
+	defer txtRaw.Clear()
+	return txtRaw.ToString()
+}
+
+// switchIDByName returns the Name (GUID) of the switch whose ElementName matches.
+func (l *liveBackend) switchIDByName(name string) string {
+	var id string
+	for _, o := range l.query(fmt.Sprintf(
+		"SELECT Name,ElementName FROM Msvm_VirtualEthernetSwitch WHERE ElementName='%s'", wqlEscape(name))) {
+		id = prop(o, "Name")
+		o.Release()
+	}
+	return id
+}
+
+// destroySwitch removes the Msvm_VirtualEthernetSwitch identified by Name (GUID) or,
+// failing that, ElementName, via DestroySystem. Reports whether a switch was found.
+func (l *liveBackend) destroySwitch(switchID string) (bool, error) {
+	var found bool
+	var callErr error
+	l.withCOM(func() {
+		svc := l.vesmService()
+		if svc == nil {
+			callErr = vp.ErrUnsupported
+			return
+		}
+		defer svc.Release()
+		var swPath string
+		objs := l.query(fmt.Sprintf(
+			"SELECT * FROM Msvm_VirtualEthernetSwitch WHERE Name='%s' OR ElementName='%s'",
+			wqlEscape(switchID), wqlEscape(switchID)))
+		for _, o := range objs {
+			if swPath == "" {
+				swPath = path(o)
+			}
+			o.Release()
+		}
+		if swPath == "" {
+			return
+		}
+		found = true
+		res, err := svc.CallMethod("DestroySystem", swPath)
+		if err != nil {
+			callErr = fmt.Errorf("hyperv: DestroySystem(switch): %w", err)
+			return
+		}
+		rv := int(res.Val)
+		res.Clear()
+		if rv != wmiCompleted && rv != wmiJobStarted {
+			callErr = fmt.Errorf("hyperv: DestroySystem(switch) ReturnValue=%d", rv)
+			return
+		}
+		// DestroySystem is async (4096 + Msvm_ConcreteJob); poll until the switch object
+		// disappears so callers that list immediately see a consistent result.
+		l.waitSwitchGone(switchID, 30*time.Second)
+	})
+	return found, callErr
+}
+
+// waitSwitchGone polls (under the held COM lock) until no Msvm_VirtualEthernetSwitch
+// with the given Name/ElementName remains, or the deadline elapses.
+func (l *liveBackend) waitSwitchGone(switchID string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		objs := l.query(fmt.Sprintf(
+			"SELECT Name FROM Msvm_VirtualEthernetSwitch WHERE Name='%s' OR ElementName='%s'",
+			wqlEscape(switchID), wqlEscape(switchID)))
+		n := len(objs)
+		for _, o := range objs {
+			o.Release()
+		}
+		if n == 0 {
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// --- StorageProvider (Msvm_ImageManagementService + host FS) ---
+//
+// For Hyper-V, a StorageProvider "storageID" is a HOST FOLDER PATH (e.g.
+// C:\Hyper-V\Virtual Hard Disks). VHD/VHDX images are created via
+// Msvm_ImageManagementService.CreateVirtualHardDisk; ISOs are streamed to disk via the
+// host filesystem (the UniHV node runs on the Hyper-V host and has local FS access).
+// Listing enumerates *.vhdx/*.vhd (disks) and *.iso (IsISO) under the folder, reading
+// VHD geometry via Msvm_ImageManagementService.GetVirtualHardDiskSettingData.
+
+// imageService returns the Msvm_ImageManagementService (caller releases).
+func (l *liveBackend) imageService() *ole.IDispatch {
+	objs := l.query("SELECT * FROM Msvm_ImageManagementService")
+	for i, o := range objs {
+		if i == 0 {
+			for _, extra := range objs[1:] {
+				extra.Release()
+			}
+			return o
+		}
+	}
+	return nil
+}
+
+// ListVolumes enumerates VHD/VHDX (disks) and ISO files under a storage folder path.
+func (p *Provider) ListVolumes(ctx context.Context, storageID string) ([]vp.Volume, error) {
+	if !p.caps.Has(vp.CapListStorage) {
+		return nil, vp.ErrUnsupported
+	}
+	be, ok := p.live()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	dir := strings.TrimSpace(storageID)
+	if dir == "" {
+		return nil, vp.ErrInvalidSpec
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, vp.ErrNotFound
+		}
+		return nil, err
+	}
+	var out []vp.Volume
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		ext := strings.ToLower(filepath.Ext(name))
+		full := filepath.Join(dir, name)
+		info, ierr := e.Info()
+		var allocGB float64
+		if ierr == nil {
+			allocGB = float64(info.Size()) / bytesPerGB
+		}
+		switch ext {
+		case ".vhdx", ".vhd":
+			vol := vp.Volume{
+				ID: full, Name: name, StorageID: dir, Path: full,
+				Format: vp.DiskVHDX, AllocGB: allocGB,
+			}
+			if ext == ".vhd" {
+				vol.Format = vp.DiskVHD
+			}
+			vol.CapacityGB = be.vhdMaxSizeGB(full)
+			if vol.CapacityGB == 0 {
+				vol.CapacityGB = allocGB
+			}
+			out = append(out, vol)
+		case ".iso":
+			out = append(out, vp.Volume{
+				ID: full, Name: name, StorageID: dir, Path: full,
+				Format: vp.DiskRaw, CapacityGB: allocGB, AllocGB: allocGB, IsISO: true,
+			})
+		}
+	}
+	return out, nil
+}
+
+// vhdMaxSizeGB reads a VHD/VHDX virtual size (MaxInternalSize) via
+// Msvm_ImageManagementService.GetVirtualHardDiskSettingData, returning GB (0 if absent).
+func (l *liveBackend) vhdMaxSizeGB(path string) float64 {
+	var gb float64
+	l.withCOM(func() {
+		svc := l.imageService()
+		if svc == nil {
+			return
+		}
+		defer svc.Release()
+		// GetVirtualHardDiskSettingData(Path, out SettingData, out Job). go-ole late
+		// binding can't read the out param directly; instead query the VHD setting data
+		// is non-trivial, so we best-effort parse MaxInternalSize off the returned
+		// embedded instance text when available. If unavailable, geometry stays 0 and the
+		// caller falls back to the on-disk allocated size.
+		res, err := oleutil.CallMethod(svc, "GetVirtualHardDiskSettingData", path)
+		if err != nil {
+			return
+		}
+		defer res.Clear()
+		// Some providers surface the setting data as the method's string return payload.
+		txt := fmt.Sprintf("%v", res.Value())
+		if i := strings.Index(txt, "MaxInternalSize"); i >= 0 {
+			rest := txt[i:]
+			var n int64
+			for _, r := range rest {
+				if r >= '0' && r <= '9' {
+					n = n*10 + int64(r-'0')
+				} else if n > 0 {
+					break
+				}
+			}
+			if n > 0 {
+				gb = float64(n) / bytesPerGB
+			}
+		}
+	})
+	return gb
+}
+
+// CreateVolume creates a dynamic VHDX of CapacityGB at spec.StorageID (a folder path)
+// via Msvm_ImageManagementService.CreateVirtualHardDisk.
+func (p *Provider) CreateVolume(ctx context.Context, spec vp.VolumeSpec) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapStorageWrite) {
+		return nil, vp.ErrUnsupported
+	}
+	be, ok := p.live()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if strings.TrimSpace(spec.Name) == "" || spec.CapacityGB <= 0 || strings.TrimSpace(spec.StorageID) == "" {
+		return nil, vp.ErrInvalidSpec
+	}
+	name := spec.Name
+	if strings.ToLower(filepath.Ext(name)) != ".vhdx" && strings.ToLower(filepath.Ext(name)) != ".vhd" {
+		name += ".vhdx"
+	}
+	full := filepath.Join(spec.StorageID, name)
+	if err := be.createVHD(full, int64(spec.CapacityGB*bytesPerGB)); err != nil {
+		return nil, err
+	}
+	return p.finishTask("createVolume", full), nil
+}
+
+// createVHD builds an Msvm_VirtualHardDiskSettingData (dynamic, type 3) and calls
+// Msvm_ImageManagementService.CreateVirtualHardDisk(VirtualDiskSettingData, out Job).
+func (l *liveBackend) createVHD(path string, maxBytes int64) error {
+	var callErr error
+	l.withCOM(func() {
+		svc := l.imageService()
+		if svc == nil {
+			callErr = vp.ErrUnsupported
+			return
+		}
+		defer svc.Release()
+		settingsText := l.newVHDSettingsText(path, maxBytes)
+		if settingsText == "" {
+			callErr = vp.ErrInvalidSpec
+			return
+		}
+		res, err := oleutil.CallMethod(svc, "CreateVirtualHardDisk", settingsText)
+		if err != nil {
+			callErr = fmt.Errorf("hyperv: CreateVirtualHardDisk: %w", err)
+			return
+		}
+		rv := int(res.Val)
+		res.Clear()
+		if rv != wmiCompleted && rv != wmiJobStarted {
+			callErr = fmt.Errorf("hyperv: CreateVirtualHardDisk ReturnValue=%d", rv)
+			return
+		}
+		// CreateVirtualHardDisk is async (4096 + Msvm_ConcreteJob). Poll for the file.
+		l.waitFile(path, 60*time.Second)
+	})
+	return callErr
+}
+
+// newVHDSettingsText spawns an Msvm_VirtualHardDiskSettingData for a dynamic VHDX.
+// Type 3 = Dynamic, Format 3 = VHDX, BlockSize 0 = default.
+func (l *liveBackend) newVHDSettingsText(path string, maxBytes int64) string {
+	clsRaw, err := oleutil.CallMethod(l.svc, "Get", "Msvm_VirtualHardDiskSettingData")
+	if err != nil {
+		return ""
+	}
+	cls := clsRaw.ToIDispatch()
+	defer cls.Release()
+	instRaw, err := oleutil.CallMethod(cls, "SpawnInstance_")
+	if err != nil {
+		return ""
+	}
+	inst := instRaw.ToIDispatch()
+	defer inst.Release()
+	oleutil.PutProperty(inst, "Type", 3)        // Dynamic
+	oleutil.PutProperty(inst, "Format", 3)      // VHDX
+	oleutil.PutProperty(inst, "Path", path)
+	oleutil.PutProperty(inst, "MaxInternalSize", maxBytes)
+	oleutil.PutProperty(inst, "BlockSize", 0)
+	oleutil.PutProperty(inst, "LogicalSectorSize", 0)
+	oleutil.PutProperty(inst, "PhysicalSectorSize", 0)
+	txtRaw, err := oleutil.CallMethod(inst, "GetText_", 1)
+	if err != nil {
+		return ""
+	}
+	defer txtRaw.Clear()
+	return txtRaw.ToString()
+}
+
+// waitFile polls (under the held COM lock) until path exists AND is no longer locked
+// by the async CreateVirtualHardDisk job (openable for write), or the deadline elapses.
+func (l *liveBackend) waitFile(path string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	exists := false
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			exists = true
+			// The VHD-creation job keeps an exclusive handle until it completes; an
+			// OpenFile O_RDWR succeeds only once that handle is released.
+			if f, oerr := os.OpenFile(path, os.O_RDWR, 0); oerr == nil {
+				_ = f.Close()
+				return
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	_ = exists
+}
+
+// DeleteVolume removes a VHD/VHDX or ISO file. volumeID is the full file path (as
+// returned by ListVolumes) or a bare filename resolved under storageID.
+func (p *Provider) DeleteVolume(ctx context.Context, storageID, volumeID string) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapStorageWrite) {
+		return nil, vp.ErrUnsupported
+	}
+	if _, ok := p.live(); !ok {
+		return nil, vp.ErrUnsupported
+	}
+	full := volumeID
+	if !filepath.IsAbs(full) {
+		full = filepath.Join(storageID, volumeID)
+	}
+	if _, err := os.Stat(full); err != nil {
+		if os.IsNotExist(err) {
+			return nil, vp.ErrNotFound
+		}
+		return nil, err
+	}
+	// The file may still be transiently locked by a just-completed WMI disk job; retry.
+	var rmErr error
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if rmErr = os.Remove(full); rmErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			return nil, rmErr
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return p.finishTask("deleteVolume", full), nil
+}
+
+// UploadISO streams an ISO image to a .iso file under storageID (host FS). The UniHV
+// node runs on the Hyper-V host, so a direct os.Create on the host path is correct and
+// avoids round-tripping the image through WMI. Returns the resulting Volume.
+func (p *Provider) UploadISO(ctx context.Context, storageID, name string, size int64, r io.Reader) (*vp.Volume, error) {
+	if !p.caps.Has(vp.CapStorageWrite) {
+		return nil, vp.ErrUnsupported
+	}
+	if _, ok := p.live(); !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if strings.TrimSpace(name) == "" || strings.TrimSpace(storageID) == "" {
+		return nil, vp.ErrInvalidSpec
+	}
+	if strings.ToLower(filepath.Ext(name)) != ".iso" {
+		name += ".iso"
+	}
+	full := filepath.Join(storageID, name)
+	f, err := os.Create(full)
+	if err != nil {
+		return nil, err
+	}
+	n, cerr := io.Copy(f, r)
+	closeErr := f.Close()
+	if cerr != nil {
+		_ = os.Remove(full)
+		return nil, cerr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	gb := float64(n) / bytesPerGB
+	return &vp.Volume{
+		ID: full, Name: name, StorageID: storageID, Path: full,
+		Format: vp.DiskRaw, CapacityGB: gb, AllocGB: gb, IsISO: true,
+	}, nil
+}
+
+// compile-time assertions: the live (Windows) *Provider satisfies the extension
+// contracts in addition to the core HypervisorProvider.
+var (
+	_ vp.ConsoleProvider = (*Provider)(nil)
+	_ vp.NetworkWriter   = (*Provider)(nil)
+	_ vp.StorageProvider = (*Provider)(nil)
+)

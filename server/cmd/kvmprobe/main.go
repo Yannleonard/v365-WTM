@@ -130,6 +130,114 @@ func main() {
 		}
 	}
 
+	// --- EXTENSION: console (read <graphics> from live domain XML) ---
+	fmt.Println("== extension: console ==")
+	if cp, ok := any(p).(vprovider.ConsoleProvider); ok {
+		printed := false
+		for _, v := range vms {
+			ep, err := cp.Console(ctx, v.ID)
+			if err != nil {
+				fmt.Printf("  Console(%s): %v\n", v.Name, err)
+				continue
+			}
+			fmt.Printf("  Console(%s): kind=%s host=%s port=%d tlsPort=%d passwordSet=%v\n",
+				v.Name, ep.Kind, ep.Host, ep.Port, ep.TLSPort, ep.Password != "")
+			printed = true
+		}
+		if !printed {
+			fmt.Println("  (no domain exposed a <graphics> console endpoint)")
+		}
+	} else {
+		fmt.Println("  provider does not implement ConsoleProvider")
+	}
+	fmt.Println()
+
+	// --- EXTENSION: network write (CreateNetwork + DeleteNetwork) ---
+	fmt.Println("== extension: network write ==")
+	if nw, ok := any(p).(vprovider.NetworkWriter); ok {
+		netName := fmt.Sprintf("unihv-probe-net-%d", time.Now().Unix())
+		ct, err := nw.CreateNetwork(ctx, vprovider.NetworkSpec{
+			Name: netName, Type: "nat", CIDR: "192.168.211.0/24",
+		})
+		if err != nil {
+			fatalf("CreateNetwork: %v", err)
+		}
+		fmt.Printf("  CreateNetwork(%s) task=%s state=%s\n", netName, ct.ID, ct.State)
+		// Confirm it now appears in the live network list.
+		if nets, err := p.ListNetworks(ctx); err == nil {
+			for _, n := range nets {
+				if n.Name == netName {
+					fmt.Printf("  ListNetworks confirms: id=%s name=%s mode=%s\n", n.ID, n.Name, n.Type)
+				}
+			}
+		}
+		dt, err := nw.DeleteNetwork(ctx, netName)
+		if err != nil {
+			fatalf("DeleteNetwork: %v", err)
+		}
+		fmt.Printf("  DeleteNetwork(%s) task=%s state=%s -> cleaned up\n", netName, dt.ID, dt.State)
+	} else {
+		fmt.Println("  provider does not implement NetworkWriter")
+	}
+	fmt.Println()
+
+	// --- EXTENSION: storage write (ListVolumes + CreateVolume + DeleteVolume) ---
+	fmt.Println("== extension: storage write ==")
+	if sp, ok := any(p).(vprovider.StorageProvider); ok {
+		pools, _ := p.ListStorage(ctx)
+		if len(pools) == 0 {
+			fmt.Println("  (no storage pool present; define a 'default' dir pool to exercise storage)")
+		}
+		for _, pl := range pools {
+			vols, err := sp.ListVolumes(ctx, pl.Name)
+			if err != nil {
+				fmt.Printf("  ListVolumes(%s): %v\n", pl.Name, err)
+				continue
+			}
+			fmt.Printf("  ListVolumes(%s): %d volume(s)\n", pl.Name, len(vols))
+			for _, v := range vols {
+				fmt.Printf("    - %s fmt=%s cap=%.2fGB alloc=%.2fGB iso=%v path=%s\n",
+					v.Name, v.Format, v.CapacityGB, v.AllocGB, v.IsISO, v.Path)
+			}
+		}
+		// Exercise create + delete against the first writable (active) pool.
+		var pool string
+		for _, pl := range pools {
+			if pl.Accessible {
+				pool = pl.Name
+				break
+			}
+		}
+		if pool != "" {
+			volName := fmt.Sprintf("unihv-probe-vol-%d.qcow2", time.Now().Unix())
+			ct, err := sp.CreateVolume(ctx, vprovider.VolumeSpec{
+				Name: volName, StorageID: pool, CapacityGB: 1, Format: vprovider.DiskQcow2,
+			})
+			if err != nil {
+				fatalf("CreateVolume: %v", err)
+			}
+			fmt.Printf("  CreateVolume(%s/%s) task=%s state=%s\n", pool, volName, ct.ID, ct.State)
+			if vols, err := sp.ListVolumes(ctx, pool); err == nil {
+				for _, v := range vols {
+					if v.Name == volName {
+						fmt.Printf("  ListVolumes confirms created: %s cap=%.2fGB fmt=%s path=%s\n",
+							v.Name, v.CapacityGB, v.Format, v.Path)
+					}
+				}
+			}
+			dt, err := sp.DeleteVolume(ctx, pool, volName)
+			if err != nil {
+				fatalf("DeleteVolume: %v", err)
+			}
+			fmt.Printf("  DeleteVolume(%s/%s) task=%s state=%s -> cleaned up\n", pool, volName, dt.ID, dt.State)
+		} else {
+			fmt.Println("  (no active pool to create/delete a volume in)")
+		}
+	} else {
+		fmt.Println("  provider does not implement StorageProvider")
+	}
+	fmt.Println()
+
 	fmt.Println("\nPROBE OK: real libvirt RPC API exercised end to end.")
 }
 

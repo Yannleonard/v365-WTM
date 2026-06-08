@@ -32,7 +32,9 @@ package kvm
 import (
 	"encoding/xml"
 	"fmt"
+	"io"
 	"net"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -74,8 +76,17 @@ func NewLiveWithID(id, endpoint string) (*Provider, error) {
 	if err != nil {
 		return nil, err
 	}
-	return New(id, WithBackend(be)), nil
+	// The live backend additionally services the extension contract (console,
+	// network write, storage/ISO write) against the real libvirt API, so the
+	// live provider advertises those capability bits on top of FullCaps. The
+	// sim-backed kvm.New keeps plain FullCaps (no extBackend behind it).
+	return New(id, WithBackend(be), WithCaps(LiveCaps)), nil
 }
+
+// LiveCaps is FullCaps plus the extension capability bits the REAL libvirt backend
+// fulfils: graphical console (<graphics> in domain XML), virtual-network write
+// (NetworkDefineXML/Create/Destroy/Undefine) and storage/ISO write (StorageVol*).
+const LiveCaps = FullCaps | vp.CapConsole | vp.CapNetworkWrite | vp.CapStorageWrite
 
 // newLiveBackend dials libvirt and runs the RPC handshake (the official
 // New(conn)+Connect() sequence).
@@ -582,6 +593,10 @@ func uuidString(u libvirt.UUID) string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
 }
 
+// errNoConn signals the live backend has no active libvirt connection (closed or
+// never dialed). It surfaces as a transport-level failure to the caller.
+var errNoConn = fmt.Errorf("kvm: libvirt connection unavailable")
+
 // mapLibvirtErr maps libvirt RPC error codes to the contract sentinels.
 func mapLibvirtErr(err error) error {
 	if err == nil {
@@ -593,7 +608,7 @@ func mapLibvirtErr(err error) error {
 	}
 	switch libvirt.ErrorNumber(le.Code) {
 	case libvirt.ErrNoDomain, libvirt.ErrNoNetwork, libvirt.ErrNoStoragePool,
-		libvirt.ErrNoDomainSnapshot:
+		libvirt.ErrNoStorageVol, libvirt.ErrNoDomainSnapshot:
 		return vp.ErrNotFound
 	case libvirt.ErrOperationInvalid:
 		return vp.ErrConflict
@@ -622,6 +637,559 @@ func errorAs(err error, target *libvirt.Error) bool {
 }
 
 var _ libvirtBackend = (*liveBackend)(nil)
+var _ extBackend = (*liveBackend)(nil)
+
+// =============================================================================
+// extension surface (console / network write / storage write) over the REAL
+// libvirt API. These are the methods behind the extBackend seam (kvm.go).
+// =============================================================================
+
+// --- console: read <graphics> from DomainGetXMLDesc ---
+
+// graphicsXML is the subset of <domain><devices><graphics> we read.
+type graphicsXML struct {
+	Devices struct {
+		Graphics []struct {
+			Type     string `xml:"type,attr"`     // vnc|spice
+			Port     string `xml:"port,attr"`     // numeric, or -1 if autoport not yet assigned
+			TLSPort  string `xml:"tlsPort,attr"`  // spice TLS port
+			Listen   string `xml:"listen,attr"`   // legacy listen addr attr
+			Passwd   string `xml:"passwd,attr"`   // console password, if set
+			ListenEl []struct {
+				Type    string `xml:"type,attr"`
+				Address string `xml:"address,attr"`
+			} `xml:"listen"`
+		} `xml:"graphics"`
+	} `xml:"devices"`
+}
+
+// console resolves a domain's graphical console endpoint from its live domain XML
+// <graphics> element (the official libvirt console-exposure mechanism). It prefers
+// VNC, then SPICE.
+func (b *liveBackend) console(uuid string) (*vp.ConsoleEndpoint, error) {
+	l, dom, ok := b.domainHandle(uuid)
+	if !ok {
+		return nil, vp.ErrNotFound
+	}
+	// VIR_DOMAIN_XML_SECURE surfaces the (otherwise redacted) <graphics passwd>
+	// console ticket, which is the one-shot Password the contract returns.
+	raw, err := l.DomainGetXMLDesc(dom, libvirt.DomainXMLSecure)
+	if err != nil {
+		// Fall back to the non-secure dump if the connection is unprivileged.
+		raw, err = l.DomainGetXMLDesc(dom, 0)
+		if err != nil {
+			b.fail(err)
+			return nil, mapLibvirtErr(err)
+		}
+	}
+	var gx graphicsXML
+	if err := xml.Unmarshal([]byte(raw), &gx); err != nil {
+		return nil, vp.ErrUnsupported
+	}
+	if len(gx.Devices.Graphics) == 0 {
+		// No <graphics> device -> no graphical console on this domain.
+		return nil, vp.ErrUnsupported
+	}
+	// Prefer a VNC graphics device, else fall back to the first one.
+	g := gx.Devices.Graphics[0]
+	for _, cand := range gx.Devices.Graphics {
+		if strings.EqualFold(cand.Type, "vnc") {
+			g = cand
+			break
+		}
+	}
+	kind := vp.ConsoleVNC
+	if strings.EqualFold(g.Type, "spice") {
+		kind = vp.ConsoleSPICE
+	}
+	host := g.Listen
+	if host == "" {
+		for _, le := range g.ListenEl {
+			if le.Address != "" {
+				host = le.Address
+				break
+			}
+		}
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		// libvirt listens on all interfaces; surface the hypervisor host instead.
+		b.mu.RLock()
+		host = b.nodeID
+		b.mu.RUnlock()
+		if host == "" {
+			host = "127.0.0.1"
+		}
+	}
+	ep := &vp.ConsoleEndpoint{
+		Kind:     kind,
+		Host:     host,
+		Port:     atoiSafe(g.Port),
+		TLSPort:  atoiSafe(g.TLSPort),
+		Password: g.Passwd,
+	}
+	return ep, nil
+}
+
+// --- network write ---
+
+func (b *liveBackend) createNetwork(spec vp.NetworkSpec) error {
+	b.mu.RLock()
+	l := b.l
+	b.mu.RUnlock()
+	if l == nil {
+		return errNoConn
+	}
+	xmlDesc := renderNetworkXML(spec)
+	net, err := l.NetworkDefineXML(xmlDesc)
+	if err != nil {
+		b.fail(err)
+		return mapLibvirtErr(err)
+	}
+	if err := l.NetworkCreate(net); err != nil {
+		// roll back the persistent definition so a failed start leaves no orphan.
+		_ = l.NetworkUndefine(net)
+		b.fail(err)
+		return mapLibvirtErr(err)
+	}
+	if err := l.NetworkSetAutostart(net, 1); err != nil {
+		b.fail(err)
+		// autostart is best-effort; the network is up, do not fail the op.
+	}
+	b.mu.Lock()
+	b.netHandles[uuidString(net.UUID)] = net
+	b.mu.Unlock()
+	return nil
+}
+
+func (b *liveBackend) deleteNetwork(id string) error {
+	net, err := b.networkHandle(id)
+	if err != nil {
+		return err
+	}
+	b.mu.RLock()
+	l := b.l
+	b.mu.RUnlock()
+	if l == nil {
+		return errNoConn
+	}
+	// Destroy (stop) if active, then undefine (remove persistent config).
+	_ = l.NetworkDestroy(net)
+	if err := l.NetworkUndefine(net); err != nil {
+		b.fail(err)
+		return mapLibvirtErr(err)
+	}
+	b.mu.Lock()
+	delete(b.netHandles, uuidString(net.UUID))
+	b.mu.Unlock()
+	return nil
+}
+
+// networkHandle resolves a network by UUID string or by name.
+func (b *liveBackend) networkHandle(id string) (libvirt.Network, error) {
+	b.mu.RLock()
+	l := b.l
+	net, ok := b.netHandles[id]
+	b.mu.RUnlock()
+	if l == nil {
+		return libvirt.Network{}, errNoConn
+	}
+	if ok {
+		return net, nil
+	}
+	// Try UUID, then name.
+	if u, perr := parseUUID(id); perr == nil {
+		if n, err := l.NetworkLookupByUUID(u); err == nil {
+			return n, nil
+		}
+	}
+	n, err := l.NetworkLookupByName(id)
+	if err != nil {
+		b.fail(err)
+		return libvirt.Network{}, mapLibvirtErr(err)
+	}
+	return n, nil
+}
+
+// --- storage write ---
+
+func (b *liveBackend) poolHandle(id string) (libvirt.StoragePool, error) {
+	b.mu.RLock()
+	l := b.l
+	pool, ok := b.poolHandles[id]
+	b.mu.RUnlock()
+	if l == nil {
+		return libvirt.StoragePool{}, errNoConn
+	}
+	if ok {
+		return pool, nil
+	}
+	if u, perr := parseUUID(id); perr == nil {
+		if p, err := l.StoragePoolLookupByUUID(u); err == nil {
+			return p, nil
+		}
+	}
+	p, err := l.StoragePoolLookupByName(id)
+	if err != nil {
+		b.fail(err)
+		return libvirt.StoragePool{}, mapLibvirtErr(err)
+	}
+	return p, nil
+}
+
+func (b *liveBackend) listVolumes(storageID string) ([]vp.Volume, error) {
+	pool, err := b.poolHandle(storageID)
+	if err != nil {
+		return nil, err
+	}
+	b.mu.RLock()
+	l := b.l
+	b.mu.RUnlock()
+	if l == nil {
+		return nil, errNoConn
+	}
+	vols, _, err := l.StoragePoolListAllVolumes(pool, 1, 0)
+	if err != nil {
+		b.fail(err)
+		return nil, mapLibvirtErr(err)
+	}
+	out := make([]vp.Volume, 0, len(vols))
+	for _, v := range vols {
+		_, capBytes, allocBytes, ierr := l.StorageVolGetInfo(v)
+		if ierr != nil {
+			b.fail(ierr)
+		}
+		format := vp.DiskQcow2
+		path := v.Key
+		if x, xerr := l.StorageVolGetXMLDesc(v, 0); xerr == nil {
+			if f := volFormatFromXML(x); f != "" {
+				format = normalizeDiskFormat(f)
+			}
+			if pth := volPathFromXML(x); pth != "" {
+				path = pth
+			}
+		}
+		out = append(out, vp.Volume{
+			ID:         v.Key,
+			Name:       v.Name,
+			StorageID:  storageID,
+			Format:     format,
+			CapacityGB: float64(capBytes) / bytesPerGB,
+			AllocGB:    float64(allocBytes) / bytesPerGB,
+			IsISO:      isISOName(v.Name),
+			Path:       path,
+		})
+	}
+	return out, nil
+}
+
+func (b *liveBackend) createVolume(spec vp.VolumeSpec) error {
+	pool, err := b.poolHandle(spec.StorageID)
+	if err != nil {
+		return err
+	}
+	b.mu.RLock()
+	l := b.l
+	b.mu.RUnlock()
+	if l == nil {
+		return errNoConn
+	}
+	format := "qcow2"
+	if spec.Format == vp.DiskRaw {
+		format = "raw"
+	}
+	sizeBytes := uint64(spec.CapacityGB * bytesPerGB)
+	xmlDesc := renderVolumeXML(spec.Name, format, sizeBytes)
+	if _, err := l.StorageVolCreateXML(pool, xmlDesc, 0); err != nil {
+		b.fail(err)
+		return mapLibvirtErr(err)
+	}
+	return nil
+}
+
+func (b *liveBackend) deleteVolume(storageID, volumeID string) error {
+	vol, err := b.volHandle(storageID, volumeID)
+	if err != nil {
+		return err
+	}
+	b.mu.RLock()
+	l := b.l
+	b.mu.RUnlock()
+	if l == nil {
+		return errNoConn
+	}
+	if err := l.StorageVolDelete(vol, libvirt.StorageVolDeleteNormal); err != nil {
+		b.fail(err)
+		return mapLibvirtErr(err)
+	}
+	return nil
+}
+
+// volHandle resolves a StorageVol by name within a pool. volumeID is matched
+// against the vol Key (path) first, then its Name.
+func (b *liveBackend) volHandle(storageID, volumeID string) (libvirt.StorageVol, error) {
+	pool, err := b.poolHandle(storageID)
+	if err != nil {
+		return libvirt.StorageVol{}, err
+	}
+	b.mu.RLock()
+	l := b.l
+	b.mu.RUnlock()
+	if l == nil {
+		return libvirt.StorageVol{}, errNoConn
+	}
+	// Direct name lookup is the fast path.
+	if v, err := l.StorageVolLookupByName(pool, volumeID); err == nil {
+		return v, nil
+	}
+	// Otherwise match by Key (libvirt's volume id is the path) across the pool.
+	vols, _, lerr := l.StoragePoolListAllVolumes(pool, 1, 0)
+	if lerr != nil {
+		b.fail(lerr)
+		return libvirt.StorageVol{}, mapLibvirtErr(lerr)
+	}
+	for _, v := range vols {
+		if v.Key == volumeID || v.Name == volumeID {
+			return v, nil
+		}
+	}
+	return libvirt.StorageVol{}, vp.ErrNotFound
+}
+
+// uploadISO creates a raw volume of the given size and streams the ISO bytes into
+// it via the official libvirt vol-upload stream API (StorageVolUpload, which takes
+// an io.Reader and pumps it over a libvirt Stream).
+func (b *liveBackend) uploadISO(storageID, name string, size int64, r io.Reader) (*vp.Volume, error) {
+	pool, err := b.poolHandle(storageID)
+	if err != nil {
+		return nil, err
+	}
+	b.mu.RLock()
+	l := b.l
+	b.mu.RUnlock()
+	if l == nil {
+		return nil, errNoConn
+	}
+	if size <= 0 {
+		return nil, vp.ErrInvalidSpec
+	}
+	xmlDesc := renderVolumeXML(name, "raw", uint64(size))
+	vol, err := l.StorageVolCreateXML(pool, xmlDesc, 0)
+	if err != nil {
+		b.fail(err)
+		return nil, mapLibvirtErr(err)
+	}
+	// Official streaming upload: go-libvirt's StorageVolUpload reads from r and
+	// drives the libvirt Stream protocol (virStreamSend) under the hood.
+	if err := l.StorageVolUpload(vol, r, 0, uint64(size), 0); err != nil {
+		b.fail(err)
+		_ = l.StorageVolDelete(vol, libvirt.StorageVolDeleteNormal)
+		return nil, mapLibvirtErr(err)
+	}
+	gb := float64(size) / bytesPerGB
+	return &vp.Volume{
+		ID:         vol.Key,
+		Name:       vol.Name,
+		StorageID:  storageID,
+		Format:     vp.DiskRaw,
+		CapacityGB: gb,
+		AllocGB:    gb,
+		IsISO:      true,
+		Path:       vol.Key,
+	}, nil
+}
+
+// --- extension XML rendering / parsing helpers ---
+
+// renderNetworkXML builds libvirt <network> XML from a NetworkSpec. Supports nat
+// (with optional managed IP range + DHCP), bridge (host bridge passthrough), and
+// isolated networks.
+func renderNetworkXML(spec vp.NetworkSpec) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "<network>\n")
+	fmt.Fprintf(&sb, "  <name>%s</name>\n", xmlEscape(spec.Name))
+	switch strings.ToLower(spec.Type) {
+	case "bridge":
+		// Bridged to an existing host bridge: forward mode='bridge', no managed IP.
+		fmt.Fprintf(&sb, "  <forward mode='bridge'/>\n")
+		if spec.Bridge != "" {
+			fmt.Fprintf(&sb, "  <bridge name='%s'/>\n", xmlEscape(spec.Bridge))
+		}
+	case "isolated", "":
+		// No <forward>: a host-private isolated network.
+		bridge := spec.Bridge
+		if bridge == "" {
+			bridge = "virbr-" + sanitizeBridge(spec.Name)
+		}
+		fmt.Fprintf(&sb, "  <bridge name='%s' stp='on' delay='0'/>\n", xmlEscape(bridge))
+		appendNetworkIP(&sb, spec.CIDR)
+	default: // nat / route / managed
+		mode := strings.ToLower(spec.Type)
+		if mode != "route" {
+			mode = "nat"
+		}
+		fmt.Fprintf(&sb, "  <forward mode='%s'/>\n", mode)
+		bridge := spec.Bridge
+		if bridge == "" {
+			bridge = "virbr-" + sanitizeBridge(spec.Name)
+		}
+		fmt.Fprintf(&sb, "  <bridge name='%s' stp='on' delay='0'/>\n", xmlEscape(bridge))
+		appendNetworkIP(&sb, spec.CIDR)
+	}
+	fmt.Fprintf(&sb, "</network>\n")
+	return sb.String()
+}
+
+// appendNetworkIP renders an <ip>/<dhcp> block for a managed network if a CIDR is
+// given (e.g. 192.168.50.0/24 -> address 192.168.50.1, /24, DHCP .2-.254).
+func appendNetworkIP(sb *strings.Builder, cidr string) {
+	if cidr == "" {
+		return
+	}
+	ip, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return
+	}
+	ip4 := ipnet.IP.To4()
+	if ip4 == nil {
+		return
+	}
+	_ = ip
+	prefix, _ := ipnet.Mask.Size()
+	gw := make(net.IP, len(ip4))
+	copy(gw, ip4)
+	gw[3]++ // .1 as the gateway
+	dhcpStart := make(net.IP, len(ip4))
+	copy(dhcpStart, ip4)
+	dhcpStart[3] += 2
+	dhcpEnd := make(net.IP, len(ip4))
+	copy(dhcpEnd, ip4)
+	dhcpEnd[3] = 254
+	fmt.Fprintf(sb, "  <ip address='%s' prefix='%d'>\n", gw.String(), prefix)
+	fmt.Fprintf(sb, "    <dhcp>\n")
+	fmt.Fprintf(sb, "      <range start='%s' end='%s'/>\n", dhcpStart.String(), dhcpEnd.String())
+	fmt.Fprintf(sb, "    </dhcp>\n")
+	fmt.Fprintf(sb, "  </ip>\n")
+}
+
+// renderVolumeXML builds a libvirt <volume> for StorageVolCreateXML.
+func renderVolumeXML(name, format string, sizeBytes uint64) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "<volume>\n")
+	fmt.Fprintf(&sb, "  <name>%s</name>\n", xmlEscape(name))
+	fmt.Fprintf(&sb, "  <capacity unit='bytes'>%d</capacity>\n", sizeBytes)
+	fmt.Fprintf(&sb, "  <allocation unit='bytes'>0</allocation>\n")
+	fmt.Fprintf(&sb, "  <target>\n")
+	fmt.Fprintf(&sb, "    <format type='%s'/>\n", xmlEscape(format))
+	fmt.Fprintf(&sb, "  </target>\n")
+	fmt.Fprintf(&sb, "</volume>\n")
+	return sb.String()
+}
+
+// volFormatFromXML reads <volume><target><format type='...'>.
+func volFormatFromXML(raw string) string {
+	var vx struct {
+		Target struct {
+			Format struct {
+				Type string `xml:"type,attr"`
+			} `xml:"format"`
+		} `xml:"target"`
+	}
+	if err := xml.Unmarshal([]byte(raw), &vx); err != nil {
+		return ""
+	}
+	return vx.Target.Format.Type
+}
+
+// volPathFromXML reads <volume><target><path>.
+func volPathFromXML(raw string) string {
+	var vx struct {
+		Target struct {
+			Path string `xml:"path"`
+		} `xml:"target"`
+	}
+	if err := xml.Unmarshal([]byte(raw), &vx); err != nil {
+		return ""
+	}
+	return vx.Target.Path
+}
+
+// isISOName reports whether a volume name/path looks like an ISO image.
+func isISOName(name string) bool {
+	return strings.EqualFold(filepath.Ext(name), ".iso")
+}
+
+// sanitizeBridge derives a short, valid bridge-name fragment from a network name.
+func sanitizeBridge(name string) string {
+	var sb strings.Builder
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			sb.WriteRune(r)
+		}
+		if sb.Len() >= 8 {
+			break
+		}
+	}
+	if sb.Len() == 0 {
+		return "net0"
+	}
+	return sb.String()
+}
+
+// atoiSafe parses a base-10 int, returning 0 on any error or for libvirt's "-1"
+// (autoport-not-yet-assigned) sentinel.
+func atoiSafe(s string) int {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "-1" {
+		return 0
+	}
+	n := 0
+	neg := false
+	for i, r := range s {
+		if i == 0 && r == '-' {
+			neg = true
+			continue
+		}
+		if r < '0' || r > '9' {
+			return 0
+		}
+		n = n*10 + int(r-'0')
+	}
+	if neg {
+		return 0
+	}
+	return n
+}
+
+// parseUUID parses a canonical 8-4-4-4-12 UUID string into a libvirt.UUID.
+func parseUUID(s string) (libvirt.UUID, error) {
+	var u libvirt.UUID
+	hex := strings.ReplaceAll(s, "-", "")
+	if len(hex) != 32 {
+		return u, fmt.Errorf("kvm: bad uuid %q", s)
+	}
+	for i := 0; i < 16; i++ {
+		hi, err1 := hexVal(hex[i*2])
+		lo, err2 := hexVal(hex[i*2+1])
+		if err1 != nil || err2 != nil {
+			return u, fmt.Errorf("kvm: bad uuid %q", s)
+		}
+		u[i] = hi<<4 | lo
+	}
+	return u, nil
+}
+
+func hexVal(c byte) (byte, error) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', nil
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, nil
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, nil
+	default:
+		return 0, fmt.Errorf("bad hex %q", c)
+	}
+}
 
 // --- domain XML parsing/rendering (official libvirt domain XML format) ---
 

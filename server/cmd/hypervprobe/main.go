@@ -23,6 +23,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	vp "github.com/gtek-it/castor/server/internal/vprovider"
@@ -34,9 +35,21 @@ func main() {
 
 	fmt.Println("== UniHV Hyper-V live probe (real WMI root\\virtualization\\v2 via go-ole/COM) ==")
 
-	p, err := hyperv.NewLive("hyperv-local", "")
+	// REMOTE vs LOCAL: env UNIHV_HV_HOST selects the WMI server (empty = local "."),
+	// UNIHV_HV_USER / UNIHV_HV_PASS supply DCOM credentials for a remote host. With no
+	// host set this probes the LOCAL Hyper-V (integrated auth, no credentials).
+	host := os.Getenv("UNIHV_HV_HOST")
+	user := os.Getenv("UNIHV_HV_USER")
+	pass := os.Getenv("UNIHV_HV_PASS")
+	if host == "" {
+		fmt.Println("\n[Connect] LOCAL host (computerName=\".\", integrated auth)")
+	} else {
+		fmt.Printf("\n[Connect] REMOTE host %q via DCOM ConnectServer (user=%q)\n", host, user)
+	}
+
+	p, err := hyperv.NewLiveRemote("hyperv-probe", host, user, pass)
 	if err != nil {
-		fmt.Println("NewLive FAILED:", err)
+		fmt.Println("NewLiveRemote FAILED:", err)
 		os.Exit(1)
 	}
 	defer p.Close()
@@ -133,4 +146,142 @@ func main() {
 	}
 
 	fmt.Println("\nOK: real WMI Msvm_* create/list/remove round-trip succeeded via go-ole COM.")
+
+	// ---------------------------------------------------------------------------
+	// EXTENSION FEATURES: console endpoint, virtual switch write, VHD storage.
+	// ---------------------------------------------------------------------------
+	fmt.Println("\n== EXTENSION FEATURES (console / network write / storage write) ==")
+
+	// (E1) Console endpoint (RDP/VMConnect). Requires a VM; reuse an existing one or
+	// spin up a throwaway VM purely to resolve its console endpoint, then remove it.
+	if cp, ok := interface{}(p).(vp.ConsoleProvider); ok {
+		vms, _ := p.ListVMs(ctx, vp.ListOptions{})
+		var vmID, vmName, tempID string
+		if len(vms) > 0 {
+			vmID, vmName = vms[0].ID, vms[0].Name
+		} else {
+			const cname = "unihv-probe-console"
+			if _, err := p.CreateVM(ctx, vp.VMSpec{Name: cname, VCPUs: 1, MemoryMB: 512, Firmware: vp.FirmwareUEFI}); err == nil {
+				time.Sleep(1200 * time.Millisecond)
+				now, _ := p.ListVMs(ctx, vp.ListOptions{})
+				for _, v := range now {
+					if v.Name == cname {
+						vmID, vmName, tempID = v.ID, v.Name, v.ID
+					}
+				}
+			}
+		}
+		if vmID != "" {
+			ep, err := cp.Console(ctx, vmID)
+			if err != nil {
+				fmt.Println("[Console] FAILED:", err)
+			} else {
+				fmt.Printf("[Console] vm=%q -> kind=%s host=%q port=%d (hand to VMConnect/RDP client)\n",
+					vmName, ep.Kind, ep.Host, ep.Port)
+			}
+		} else {
+			fmt.Println("[Console] could not resolve a VM to query (skipped)")
+		}
+		if tempID != "" {
+			_, _ = p.DeleteVM(ctx, tempID, vp.DeleteOptions{Force: true})
+			time.Sleep(800 * time.Millisecond)
+		}
+	}
+
+	// (E2) Virtual switch create + list + delete via Msvm_VirtualEthernetSwitchManagementService.
+	nw, nwOK := interface{}(p).(vp.NetworkWriter)
+	if nwOK {
+		const swName = "unihv-probe-switch"
+		fmt.Printf("\n[CreateNetwork] DefineSystem private switch %q via WMI ...\n", swName)
+		if _, err := nw.CreateNetwork(ctx, vp.NetworkSpec{Name: swName, Type: "isolated"}); err != nil {
+			fmt.Println("CreateNetwork FAILED:", err)
+			os.Exit(1)
+		}
+		nets, _ := p.ListNetworks(ctx)
+		var swID string
+		for _, n := range nets {
+			if n.Name == swName {
+				swID = n.ID
+			}
+		}
+		fmt.Printf("[ListNetworks] %d switch(es); created present=%v id=%q\n", len(nets), swID != "", swID)
+		if swID == "" {
+			fmt.Println("PROOF FAILED: created switch not visible via WMI")
+			os.Exit(1)
+		}
+		fmt.Printf("[DeleteNetwork] DestroySystem switch %q via WMI ...\n", swID)
+		if _, err := nw.DeleteNetwork(ctx, swID); err != nil {
+			fmt.Println("DeleteNetwork FAILED:", err)
+			os.Exit(1)
+		}
+		nets2, _ := p.ListNetworks(ctx)
+		still := false
+		for _, n := range nets2 {
+			if n.Name == swName {
+				still = true
+			}
+		}
+		fmt.Printf("[ListNetworks:after-delete] %d switch(es); created present=%v\n", len(nets2), still)
+		if still {
+			fmt.Println("PROOF FAILED: switch still present after DestroySystem")
+			os.Exit(1)
+		}
+		fmt.Println("PROOF: real WMI virtual-switch create/list/delete round-trip succeeded.")
+	}
+
+	// (E3) VHD create + list + delete via Msvm_ImageManagementService.
+	sp, spOK := interface{}(p).(vp.StorageProvider)
+	if spOK {
+		dir := os.Getenv("UNIHV_HV_VHDDIR")
+		if dir == "" {
+			dir = os.TempDir() // local FS dir on the host; works for VHD create
+		}
+		const vhdName = "unihv-probe-disk.vhdx"
+		full := dir
+		if !strings.HasSuffix(full, "\\") && !strings.HasSuffix(full, "/") {
+			full += "\\"
+		}
+		full += vhdName
+		fmt.Printf("\n[CreateVolume] CreateVirtualHardDisk %q (4GB dynamic VHDX) via WMI ...\n", full)
+		if _, err := sp.CreateVolume(ctx, vp.VolumeSpec{Name: vhdName, StorageID: dir, CapacityGB: 4, Format: vp.DiskVHDX}); err != nil {
+			fmt.Println("CreateVolume FAILED:", err)
+			os.Exit(1)
+		}
+		vols, err := sp.ListVolumes(ctx, dir)
+		if err != nil {
+			fmt.Println("ListVolumes FAILED:", err)
+			os.Exit(1)
+		}
+		found := false
+		for _, v := range vols {
+			if strings.EqualFold(v.Name, vhdName) {
+				found = true
+				fmt.Printf("[ListVolumes] found %q capGB=%.1f allocGB=%.3f isIso=%v\n", v.Name, v.CapacityGB, v.AllocGB, v.IsISO)
+			}
+		}
+		if !found {
+			fmt.Println("PROOF FAILED: created VHD not visible via ListVolumes")
+			os.Exit(1)
+		}
+		fmt.Printf("[DeleteVolume] removing %q ...\n", full)
+		if _, err := sp.DeleteVolume(ctx, dir, full); err != nil {
+			fmt.Println("DeleteVolume FAILED:", err)
+			os.Exit(1)
+		}
+		vols2, _ := sp.ListVolumes(ctx, dir)
+		still := false
+		for _, v := range vols2 {
+			if strings.EqualFold(v.Name, vhdName) {
+				still = true
+			}
+		}
+		fmt.Printf("[ListVolumes:after-delete] created present=%v\n", still)
+		if still {
+			fmt.Println("PROOF FAILED: VHD still present after delete")
+			os.Exit(1)
+		}
+		fmt.Println("PROOF: real WMI VHD create/list/delete round-trip succeeded.")
+	}
+
+	fmt.Println("\nOK: extension features (console + switch + VHD) exercised against real WMI.")
 }

@@ -68,6 +68,28 @@ type libvirtBackend interface {
 	clusterName() string
 }
 
+// extBackend is the OPTIONAL extension seam a libvirtBackend may also satisfy to
+// expose the official-libvirt console / network-write / storage-write surface
+// (extended.go: ConsoleProvider, NetworkWriter, StorageProvider). The real
+// liveBackend implements it; the in-memory simBackend does not, so the default
+// (sim-backed) kvm provider does NOT advertise the extension capability bits and
+// the Provider extension methods return ErrUnsupported. These methods DO return
+// errors (unlike the core seam) because they map libvirt RPC failures to the
+// contract sentinels directly.
+type extBackend interface {
+	// console: parse <graphics> from the domain XML (DomainGetXMLDesc).
+	console(uuid string) (*vp.ConsoleEndpoint, error)
+	// network write: NetworkDefineXML + NetworkCreate + NetworkSetAutostart /
+	// NetworkLookupBy* + NetworkDestroy + NetworkUndefine.
+	createNetwork(spec vp.NetworkSpec) error
+	deleteNetwork(id string) error
+	// storage write: StoragePool* + StorageVol* (+ StorageVolUpload stream).
+	listVolumes(storageID string) ([]vp.Volume, error)
+	createVolume(spec vp.VolumeSpec) error
+	deleteVolume(storageID, volumeID string) error
+	uploadISO(storageID, name string, size int64, r io.Reader) (*vp.Volume, error)
+}
+
 // Provider is the KVM/libvirt HypervisorProvider. The core is CGO-free; the
 // libvirt-specific bits live behind the libvirtBackend seam.
 type Provider struct {
@@ -625,5 +647,130 @@ func cloneLabels(in map[string]string) map[string]string {
 func itoa(i int) string      { return strconv.Itoa(i) }
 func unixUTC(s int64) time.Time { return time.Unix(s, 0).UTC() }
 
+// ext returns the backend's extension surface if it implements one (i.e. the live
+// libvirt backend); the sim backend does not, so callers fall back to ErrUnsupported.
+func (p *Provider) ext() (extBackend, bool) {
+	e, ok := p.backend.(extBackend)
+	return e, ok
+}
+
+// --- extension: graphical console (ConsoleProvider) ---
+
+// Console returns the VM's graphical console endpoint, read from the live domain
+// XML's <graphics type='vnc'|'spice'> element (the official libvirt way to expose
+// a console). Requires CapConsole and a live backend.
+func (p *Provider) Console(ctx context.Context, vmID string) (*vp.ConsoleEndpoint, error) {
+	if !p.caps.Has(vp.CapConsole) {
+		return nil, vp.ErrUnsupported
+	}
+	e, ok := p.ext()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if _, ok := p.backend.getDomain(vmID); !ok {
+		return nil, vp.ErrNotFound
+	}
+	return e.console(vmID)
+}
+
+// --- extension: network write (NetworkWriter) ---
+
+func (p *Provider) CreateNetwork(ctx context.Context, spec vp.NetworkSpec) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapNetworkWrite) {
+		return nil, vp.ErrUnsupported
+	}
+	e, ok := p.ext()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if strings.TrimSpace(spec.Name) == "" {
+		return nil, vp.ErrInvalidSpec
+	}
+	if err := e.createNetwork(spec); err != nil {
+		return nil, err
+	}
+	return p.finishTask("createNetwork", spec.Name), nil
+}
+
+func (p *Provider) DeleteNetwork(ctx context.Context, networkID string) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapNetworkWrite) {
+		return nil, vp.ErrUnsupported
+	}
+	e, ok := p.ext()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if err := e.deleteNetwork(networkID); err != nil {
+		return nil, err
+	}
+	return p.finishTask("deleteNetwork", networkID), nil
+}
+
+// --- extension: storage / ISO write (StorageProvider) ---
+
+func (p *Provider) ListVolumes(ctx context.Context, storageID string) ([]vp.Volume, error) {
+	if !p.caps.Has(vp.CapListStorage) {
+		return nil, vp.ErrUnsupported
+	}
+	e, ok := p.ext()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	return e.listVolumes(storageID)
+}
+
+func (p *Provider) CreateVolume(ctx context.Context, spec vp.VolumeSpec) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapStorageWrite) {
+		return nil, vp.ErrUnsupported
+	}
+	e, ok := p.ext()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if strings.TrimSpace(spec.Name) == "" || spec.CapacityGB <= 0 {
+		return nil, vp.ErrInvalidSpec
+	}
+	if err := e.createVolume(spec); err != nil {
+		return nil, err
+	}
+	return p.finishTask("createVolume", spec.Name), nil
+}
+
+func (p *Provider) DeleteVolume(ctx context.Context, storageID, volumeID string) (*vp.Task, error) {
+	if !p.caps.Has(vp.CapStorageWrite) {
+		return nil, vp.ErrUnsupported
+	}
+	e, ok := p.ext()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if err := e.deleteVolume(storageID, volumeID); err != nil {
+		return nil, err
+	}
+	return p.finishTask("deleteVolume", volumeID), nil
+}
+
+func (p *Provider) UploadISO(ctx context.Context, storageID, name string, size int64, r io.Reader) (*vp.Volume, error) {
+	if !p.caps.Has(vp.CapStorageWrite) {
+		return nil, vp.ErrUnsupported
+	}
+	e, ok := p.ext()
+	if !ok {
+		return nil, vp.ErrUnsupported
+	}
+	if strings.TrimSpace(name) == "" {
+		return nil, vp.ErrInvalidSpec
+	}
+	return e.uploadISO(storageID, name, size, r)
+}
+
 // compile-time assertion: *Provider satisfies the contract.
 var _ vp.HypervisorProvider = (*Provider)(nil)
+
+// *Provider also satisfies the extension contracts; whether a given instance
+// actually services them depends on the backend (live vs sim) + capability bits.
+var (
+	_ vp.ConsoleProvider = (*Provider)(nil)
+	_ vp.NetworkWriter   = (*Provider)(nil)
+	_ vp.StorageProvider = (*Provider)(nil)
+)
