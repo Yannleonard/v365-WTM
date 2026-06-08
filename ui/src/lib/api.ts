@@ -114,6 +114,10 @@ import type {
   VMMigrateRequest,
   VMReconfigureRequest,
   VMSpec,
+  VMNetworkCreateRequest,
+  Volume,
+  VolumeCreateRequest,
+  ConsoleEndpoint,
   VMPowerOp,
   V2VRequest,
   V2VPreflightResult,
@@ -324,6 +328,64 @@ async function downloadFile(path: string, fallbackName: string): Promise<void> {
   a.remove();
   // Revoke after the click has a chance to start the download.
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// uploadIso PUTs/POSTs a raw binary body (an ISO image) with the session cookie
+// + CSRF header, reporting upload progress through onProgress. It uses
+// XMLHttpRequest (fetch cannot report request-upload progress) and parses a JSON
+// error envelope into an ApiError on a non-2xx, mirroring request()/downloadFile.
+function uploadIso(
+  path: string,
+  file: File | Blob,
+  onProgress?: (fraction: number) => void,
+): Promise<Volume> {
+  return new Promise<Volume>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${API_BASE}${path}`, true);
+    xhr.withCredentials = true;
+    xhr.responseType = "text";
+    xhr.setRequestHeader("Accept", "application/json");
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.setRequestHeader("X-Castor-CSRF", csrfToken);
+
+    if (onProgress && xhr.upload) {
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) onProgress(e.total > 0 ? e.loaded / e.total : 0);
+      };
+    }
+
+    xhr.onerror = () => reject(new ApiError(0, "network_error", "Network request failed.", ""));
+    xhr.onload = () => {
+      const status = xhr.status;
+      const requestId = xhr.getResponseHeader("x-request-id") || "";
+      const text = xhr.responseText || "";
+      if (status >= 200 && status < 300) {
+        try {
+          resolve(text ? (JSON.parse(text) as Volume) : ({} as Volume));
+        } catch {
+          reject(new ApiError(status, "bad_response", "Malformed upload response.", requestId));
+        }
+        return;
+      }
+      let code = `http_${status}`;
+      let message = xhr.statusText || "Upload failed";
+      let reqId = requestId;
+      try {
+        const env = JSON.parse(text) as ApiErrorEnvelope;
+        if (env?.error) {
+          code = env.error.code || code;
+          message = env.error.message || message;
+          reqId = env.error.requestId || reqId;
+        }
+      } catch {
+        /* keep defaults */
+      }
+      if (status === 401 && !isAuthRoute()) redirect("/login");
+      reject(new ApiError(status, code, message, reqId));
+    };
+
+    xhr.send(file);
+  });
 }
 
 /* ============================ API surface ============================ */
@@ -711,6 +773,39 @@ export const api = {
     const { force, deleteDisks } = opts;
     return del<VMTask>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}${qs({ force, deleteDisks })}`);
   },
+
+  /* ---- virtual networks (per provider) ---- */
+  // List networks; create returns a Task (the new network materializes async);
+  // delete deregisters it. Create/delete are gated on the "network_write" cap.
+  vmNetworkCreate: (pid: string, body: VMNetworkCreateRequest) =>
+    post<VMTask>(`/vm/providers/${encId(pid)}/networks`, body),
+  vmNetworkDelete: (pid: string, networkId: string) =>
+    del<void>(`/vm/providers/${encId(pid)}/networks/${encId(networkId)}`),
+
+  /* ---- storage pools + volumes + ISO library (per provider) ---- */
+  // Volumes of one pool; create a disk (Task); delete a disk. ISO upload streams
+  // the file as the raw request body to /iso?name=<name> and returns the Volume.
+  vmVolumes: (pid: string, storageId: string) =>
+    get<Volume[]>(`/vm/providers/${encId(pid)}/storage/${encId(storageId)}/volumes`),
+  vmVolumeCreate: (pid: string, storageId: string, body: VolumeCreateRequest) =>
+    post<VMTask>(`/vm/providers/${encId(pid)}/storage/${encId(storageId)}/volumes`, body),
+  vmVolumeDelete: (pid: string, storageId: string, volumeId: string) =>
+    del<void>(`/vm/providers/${encId(pid)}/storage/${encId(storageId)}/volumes/${encId(volumeId)}`),
+  // ISO upload bypasses request() (raw binary body + upload progress). onProgress
+  // is invoked with a 0..1 fraction when the browser can report it.
+  vmIsoUpload: (
+    pid: string,
+    storageId: string,
+    name: string,
+    file: File | Blob,
+    onProgress?: (fraction: number) => void,
+  ) => uploadIso(`/vm/providers/${encId(pid)}/storage/${encId(storageId)}/iso?name=${encodeURIComponent(name)}`, file, onProgress),
+
+  /* ---- graphical console ---- */
+  // Resolve a one-shot console endpoint (vnc/spice/rdp). Gated on the "console"
+  // cap; the returned password (when present) is single-use.
+  vmConsole: (pid: string, vmId: string) =>
+    get<ConsoleEndpoint>(`/vm/providers/${encId(pid)}/vms/${encId(vmId)}/console`),
 
   /* ---- V2V cross-hypervisor migration ---- */
   // Preflight validates a migration (ok:false + issues[] is a normal result,

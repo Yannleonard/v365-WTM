@@ -9,8 +9,11 @@ import {
   gateStats,
   gateExec,
   gateLogs,
+  gateVMNetworkWrite,
+  gateVMStorageWrite,
+  gateVMConsole,
 } from "./rbac";
-import type { Capability } from "./types";
+import type { Capability, VMCapability } from "./types";
 
 const DOCKER_CAPS: Capability[] = [
   "list",
@@ -100,5 +103,32 @@ describe("gateStats / gateExec / gateLogs", () => {
     expect(gateLogs(DOCKER_CAPS, ["docker.container.logs"]).allowed).toBe(true);
     expect(gateLogs(SWARM_CAPS, ["docker.container.logs"]).allowed).toBe(true);
     expect(gateLogs(KUBE_CAPS, ["docker.container.logs"]).allowed).toBe(true);
+  });
+});
+
+describe("VM infrastructure write gates", () => {
+  const FULL: VMCapability[] = ["create_vm", "delete_vm", "network_write", "storage_write", "console", "list_storage"];
+  const RO: VMCapability[] = ["readonly", "console"];
+
+  it("gateVMNetworkWrite needs cap + perm", () => {
+    expect(gateVMNetworkWrite(FULL, ["vm.network.write"]).allowed).toBe(true);
+    expect(gateVMNetworkWrite(FULL, []).allowed).toBe(false);
+    expect(gateVMNetworkWrite(["console"], ["vm.network.write"]).allowed).toBe(false);
+    expect(gateVMNetworkWrite(RO, ["*"]).allowed).toBe(false);
+  });
+
+  it("gateVMStorageWrite needs cap + perm", () => {
+    expect(gateVMStorageWrite(FULL, ["vm.storage.write"]).allowed).toBe(true);
+    expect(gateVMStorageWrite(FULL, []).allowed).toBe(false);
+    expect(gateVMStorageWrite(["console"], ["vm.storage.write"]).allowed).toBe(false);
+    expect(gateVMStorageWrite(RO, ["*"]).allowed).toBe(false);
+  });
+
+  it("gateVMConsole needs cap + perm (independent of read-only)", () => {
+    expect(gateVMConsole(FULL, ["vm.console"]).allowed).toBe(true);
+    expect(gateVMConsole(FULL, []).allowed).toBe(false);
+    expect(gateVMConsole(["network_write"], ["vm.console"]).allowed).toBe(false);
+    // console is allowed on an otherwise read-only provider when the cap is present
+    expect(gateVMConsole(RO, ["vm.console"]).allowed).toBe(true);
   });
 });

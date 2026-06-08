@@ -16,6 +16,9 @@ import { Workloads } from "./views/Workloads";
 import { WorkloadDetail } from "./views/WorkloadDetail";
 import { VirtualMachines } from "./views/VirtualMachines";
 import { VirtualMachineDetail } from "./views/VirtualMachineDetail";
+import { VMCreateWizard } from "./views/VMCreateWizard";
+import { VMNetworks } from "./views/VMNetworks";
+import { VMStorage } from "./views/VMStorage";
 import { VMClusters } from "./views/VMClusters";
 import { HypervisorConnections } from "./views/HypervisorConnections";
 import { Migration } from "./views/Migration";
@@ -66,10 +69,34 @@ export const router = createBrowserRouter([
         ),
       },
       {
+        path: "vms/new",
+        element: (
+          <RequirePerm anyOf={["vm.create", "*"]}>
+            <VMCreateWizard />
+          </RequirePerm>
+        ),
+      },
+      {
         path: "vms/:pid/:id",
         element: (
           <RequirePerm anyOf={["vm.read", "*"]}>
             <VirtualMachineDetail />
+          </RequirePerm>
+        ),
+      },
+      {
+        path: "vm-networks",
+        element: (
+          <RequirePerm anyOf={["vm.network.read", "vm.network.write", "vm.read", "*"]}>
+            <VMNetworks />
+          </RequirePerm>
+        ),
+      },
+      {
+        path: "vm-storage",
+        element: (
+          <RequirePerm anyOf={["vm.storage.read", "vm.storage.write", "vm.read", "*"]}>
+            <VMStorage />
           </RequirePerm>
         ),
       },

@@ -1268,6 +1268,53 @@ export interface VMNetwork {
   vlanId?: number;
 }
 
+// VMNetworkType is the accepted set for a created virtual network.
+export type VMNetworkType = "bridge" | "nat" | "vlan" | "isolated";
+
+// Body for POST /vm/providers/{pid}/networks (create a virtual network). bridge
+// is meaningful for type=bridge; vlan for type=vlan; cidr for nat/isolated.
+export interface VMNetworkCreateRequest {
+  name: string;
+  type: VMNetworkType;
+  bridge?: string;
+  vlan?: number;
+  cidr?: string;
+  hostId?: string;
+}
+
+// One storage volume / virtual disk in a pool (GET /storage/{id}/volumes).
+// isIso marks an uploaded ISO image (selectable as a boot medium in the wizard).
+export interface Volume {
+  id: string;
+  name: string;
+  storageId: string;
+  format?: string;
+  capacityGb: number;
+  allocGb?: number;
+  isIso: boolean;
+  path?: string;
+}
+
+// Body for POST /vm/providers/{pid}/storage/{storageID}/volumes (create a disk).
+export interface VolumeCreateRequest {
+  name: string;
+  capacityGb: number;
+  format: string;
+}
+
+// A graphical console endpoint for a VM (GET .../console). For vnc/spice the
+// host:port connect a remote-framebuffer client (a one-shot password may be
+// present); for rdp the host:port feed a generated .rdp file. tlsPort/path are
+// hypervisor-specific (e.g. a websocket bridge path).
+export interface ConsoleEndpoint {
+  kind: "vnc" | "spice" | "rdp";
+  host: string;
+  port: number;
+  password?: string;
+  tlsPort?: number;
+  path?: string;
+}
+
 // One metrics sample for a VM (timestamped CPU/memory/disk/net usage).
 export interface VMMetricSample {
   timestamp: string; // RFC3339
@@ -1325,19 +1372,36 @@ export interface VMReconfigureRequest {
   memoryMb?: number;
 }
 
-// Body for POST /vm/providers/{pid}/vms (create a VM; admin).
+// One disk in a VMSpec (wizard). capacityGb is required; format/storageId pick
+// the on-disk format + target pool; sourcePath clones from an existing image.
+export interface VMSpecDisk {
+  capacityGb: number;
+  format?: string;
+  storageId?: string;
+  sourcePath?: string;
+}
+
+// One NIC in a VMSpec (wizard). networkId references a GET /networks entry.
+export interface VMSpecNic {
+  networkId: string;
+  model?: string;
+  mac?: string;
+}
+
+// Body for POST /vm/providers/{pid}/vms (create a VM; admin). Mirrors the
+// backend VMSpec contract: structured disks[] + nics[] plus an optional boot ISO
+// (a volume path/id from the storage library).
 export interface VMSpec {
   name: string;
+  hostId?: string;
+  clusterId?: string;
   vcpus: number;
   memoryMb: number;
   guestOs?: string;
-  firmware?: string;
-  hostId?: string;
-  clusterId?: string;
-  storageId?: string;
-  diskGb?: number;
-  network?: string;
-  powerOn?: boolean;
+  firmware?: "bios" | "uefi";
+  disks: VMSpecDisk[];
+  nics: VMSpecNic[];
+  bootIso?: string;
 }
 
 // VM power operation tokens (path segment for the power endpoint).

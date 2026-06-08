@@ -53,6 +53,9 @@ import type {
   VMCluster,
   VMClusterTopology,
   VMMetricsResponse,
+  VMNetwork,
+  VMStorage,
+  Volume,
   V2VProgress,
 } from "./types";
 
@@ -117,6 +120,9 @@ export const qk = {
   vmMetrics: (pid: string, id: string) => ["vm", "metrics", pid, id] as const,
   vmClusters: (pid: string) => ["vm", "clusters", pid] as const,
   vmClusterTopology: (pid: string, cid: string) => ["vm", "topology", pid, cid] as const,
+  vmNetworks: (pid: string) => ["vm", "networks", pid] as const,
+  vmStorage: (pid: string) => ["vm", "storage", pid] as const,
+  vmVolumes: (pid: string, sid: string) => ["vm", "volumes", pid, sid] as const,
   v2vJobs: ["v2v", "jobs"] as const,
   v2vJob: (id: string) => ["v2v", "job", id] as const,
 };
@@ -596,6 +602,36 @@ export function useVMClusterTopology(pid: string, cid: string, enabled = true) {
     queryKey: qk.vmClusterTopology(pid, cid),
     queryFn: () => api.vmClusterTopology(pid, cid),
     enabled: enabled && !!pid && !!cid,
+  });
+}
+
+/** Virtual networks exposed by one VM provider. */
+export function useVMNetworks(pid: string, enabled = true) {
+  return useQuery<VMNetwork[]>({
+    queryKey: qk.vmNetworks(pid),
+    queryFn: () => api.vmNetworks(pid),
+    enabled: enabled && !!pid,
+    refetchInterval: POLL,
+  });
+}
+
+/** Storage pools / datastores exposed by one VM provider. */
+export function useVMStorage(pid: string, enabled = true) {
+  return useQuery<VMStorage[]>({
+    queryKey: qk.vmStorage(pid),
+    queryFn: () => api.vmStorage(pid),
+    enabled: enabled && !!pid,
+    refetchInterval: POLL,
+  });
+}
+
+/** Volumes (disks + ISOs) inside one storage pool of a VM provider. */
+export function useVMVolumes(pid: string, storageId: string, enabled = true) {
+  return useQuery<Volume[]>({
+    queryKey: qk.vmVolumes(pid, storageId),
+    queryFn: () => api.vmVolumes(pid, storageId),
+    enabled: enabled && !!pid && !!storageId,
+    refetchInterval: POLL,
   });
 }
 

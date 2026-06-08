@@ -22,8 +22,9 @@ import { ActionButton } from "../components/ActionButton";
 import { CapabilityGate } from "../components/CapabilityGate";
 import { DataTable, type Column } from "../components/DataTable";
 import { StatsChart } from "../components/StatsChart";
+import { VMConsoleModal } from "../components/VMConsoleModal";
 import { InspectTab } from "./workload/InspectTab";
-import { gateVMAction } from "../lib/rbac";
+import { gateVMAction, gateVMConsole } from "../lib/rbac";
 import { formatBytes, formatDateTime, shortId, timeAgo } from "../lib/format";
 import {
   IconRefresh,
@@ -35,6 +36,7 @@ import {
   IconEdit,
   IconMigrate,
   IconRestart,
+  IconTerminal,
 } from "../components/icons";
 import { toast, toastError } from "../lib/toast";
 import { api } from "../lib/api";
@@ -58,6 +60,7 @@ export function VirtualMachineDetail() {
 
   const actions = useVMActions();
   const [tab, setTab] = useState<TabKey>("overview");
+  const [consoleOpen, setConsoleOpen] = useState(false);
 
   if (query.isLoading) return <LoadingFill label="Loading virtual machine…" />;
 
@@ -146,6 +149,20 @@ export function VirtualMachineDetail() {
                 </ActionButton>
               )}
             </CapabilityGate>
+            <CapabilityGate gate={gateVMConsole(caps, permissions)}>
+              {(allowed, reason) => (
+                <ActionButton
+                  variant="ghost"
+                  disabled={!allowed}
+                  tooltip={allowed ? "Open the graphical console" : reason}
+                  aria-label="Open console"
+                  onClick={() => setConsoleOpen(true)}
+                >
+                  <IconTerminal size={16} />
+                  Console
+                </ActionButton>
+              )}
+            </CapabilityGate>
             <ActionButton variant="ghost" iconOnly tooltip="Refresh" aria-label="Refresh" onClick={() => query.refetch()}>
               <IconRefresh size={16} />
             </ActionButton>
@@ -180,6 +197,10 @@ export function VirtualMachineDetail() {
       </div>
 
       {actions.dialogs}
+
+      {consoleOpen ? (
+        <VMConsoleModal pid={pid} vmId={vmId} vmName={detail.name} onClose={() => setConsoleOpen(false)} />
+      ) : null}
     </div>
   );
 }

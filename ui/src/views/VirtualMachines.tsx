@@ -18,7 +18,8 @@ import { VMActionButtons } from "../components/VMActionButtons";
 import { ProtectedTag } from "../components/ProtectedTag";
 import { LoadingFill } from "../components/Spinner";
 import { ActionButton } from "../components/ActionButton";
-import { IconRefresh, IconSearch, IconVM } from "../components/icons";
+import { IconRefresh, IconSearch, IconVM, IconPlus } from "../components/icons";
+import { hasVMCap } from "../lib/rbac";
 import { formatBytes, shortId } from "../lib/format";
 import type { VM, VMState } from "../lib/types";
 
@@ -54,8 +55,12 @@ function HypervisorBadge({ kind }: { kind: string }) {
 
 export function VirtualMachines() {
   const navigate = useNavigate();
-  const { permissions } = useAuth();
+  const { permissions, can } = useAuth();
   const { capsForProvider, providers } = useVMCapabilityLookup();
+
+  // The "Create VM" button shows only when some provider advertises create_vm and
+  // the user can vm.create (the wizard re-checks both per the selected provider).
+  const canCreateVM = providers.some((p) => hasVMCap(p.capabilities, "create_vm")) && can("vm.create");
 
   const inventoryQ = useInventory();
   const vms = inventoryQ.data?.vms ?? EMPTY_VMS;
@@ -177,9 +182,17 @@ export function VirtualMachines() {
         title="Virtual Machines"
         subtitle="Every guest across your hypervisors, in one pane."
         actions={
-          <ActionButton variant="ghost" iconOnly tooltip="Refresh" onClick={() => inventoryQ.refetch()} aria-label="Refresh">
-            <IconRefresh size={16} />
-          </ActionButton>
+          <div className="row">
+            {canCreateVM ? (
+              <ActionButton variant="primary" onClick={() => navigate("/vms/new")}>
+                <IconPlus size={15} />
+                Create VM
+              </ActionButton>
+            ) : null}
+            <ActionButton variant="ghost" iconOnly tooltip="Refresh" onClick={() => inventoryQ.refetch()} aria-label="Refresh">
+              <IconRefresh size={16} />
+            </ActionButton>
+          </div>
         }
       />
 

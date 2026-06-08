@@ -291,6 +291,52 @@ export function gateVMAction(
   return { allowed: true, reason: "" };
 }
 
+/* ----- VM infrastructure write gates (networks / storage / console) ----- */
+//
+// These mutate dedicated VM-provider objects (virtual networks, storage volumes,
+// ISO library) or open the graphical console. Each combines a provider
+// capability token advertised by GET /vm/providers with the matching user
+// permission. A read-only provider disables every write. One write permission
+// covers both create AND delete in each domain, mirroring the backend router.
+
+/** Gate creating/deleting a virtual network (cap "network_write" + vm.network.write). */
+export function gateVMNetworkWrite(
+  caps: VMCapability[] | undefined,
+  permissions: string[] | undefined,
+): GateResult {
+  if (hasVMCap(caps, "readonly")) return { allowed: false, reason: "This hypervisor is read-only" };
+  if (!hasVMCap(caps, "network_write"))
+    return { allowed: false, reason: "Provider does not support network management" };
+  if (!can(permissions, "vm.network.write"))
+    return { allowed: false, reason: "You lack the vm.network.write permission" };
+  return { allowed: true, reason: "" };
+}
+
+/** Gate creating/deleting a storage volume or uploading an ISO (cap "storage_write" + vm.storage.write). */
+export function gateVMStorageWrite(
+  caps: VMCapability[] | undefined,
+  permissions: string[] | undefined,
+): GateResult {
+  if (hasVMCap(caps, "readonly")) return { allowed: false, reason: "This hypervisor is read-only" };
+  if (!hasVMCap(caps, "storage_write"))
+    return { allowed: false, reason: "Provider does not support storage management" };
+  if (!can(permissions, "vm.storage.write"))
+    return { allowed: false, reason: "You lack the vm.storage.write permission" };
+  return { allowed: true, reason: "" };
+}
+
+/** Gate opening the graphical console (cap "console" + vm.console). */
+export function gateVMConsole(
+  caps: VMCapability[] | undefined,
+  permissions: string[] | undefined,
+): GateResult {
+  if (!hasVMCap(caps, "console"))
+    return { allowed: false, reason: "Provider does not expose a console" };
+  if (!can(permissions, "vm.console"))
+    return { allowed: false, reason: "You lack the vm.console permission" };
+  return { allowed: true, reason: "" };
+}
+
 function labelKind(kind: OrchestratorKind): string {
   switch (kind) {
     case "docker":
