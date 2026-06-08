@@ -15,6 +15,7 @@ require (
 	github.com/go-ldap/ldap/v3 v3.4.6
 	github.com/go-ole/go-ole v1.3.0
 	github.com/pquerna/otp v1.4.0
+	github.com/vmware/govmomi v0.54.1
 	golang.org/x/crypto v0.52.0
 	golang.org/x/oauth2 v0.36.0
 	gopkg.in/yaml.v3 v3.0.1
